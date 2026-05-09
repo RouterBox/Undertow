@@ -1,0 +1,8 @@
+obsidian-vault/
+.claude/
+deploy/
+scripts/deploy-splash.sh
+.playwright-mcp/
+splash-hero.png
+*-before.jpg
+*-after.jpg

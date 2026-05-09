@@ -1,0 +1,33 @@
+{
+  "name": "undertow-service",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "monitor": "node flash-monitor.js",
+    "spider": "curl -X POST http://localhost:3030/undertow/spider",
+    "wiki-sync": "curl -X POST http://localhost:3030/undertow/wiki-sync",
+    "ingest-history": "node ingest-history.js",
+    "ingest-history:dry": "node ingest-history.js --dry-run"
+  },
+  "keywords": [
+    "ai",
+    "memory",
+    "neo4j",
+    "claude",
+    "subconscious",
+    "ambient"
+  ],
+  "author": "RouterBox",
+  "license": "MIT",
+  "description": "Undertow: Agentic Subconscious — ambient memory for AI agents",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.95.1",
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1",
+    "neo4j-driver": "^6.0.1"
+  }
+}

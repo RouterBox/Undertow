@@ -1,0 +1,5 @@
+node_modules/
+.env
+logs/
+.ingest-history-state.json
+.undertow-enabled

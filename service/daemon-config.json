@@ -1,0 +1,43 @@
+{
+  "daemons": {
+    "spider": {
+      "enabled": true,
+      "schedule": "session-end",
+      "pruneEnabled": true,
+      "pruneThreshold": 5,
+      "pruneMinAge": 30,
+      "similarityThreshold": 0.6,
+      "maxNewEdgesPerRun": 50,
+      "precomputeGDS": true
+    },
+    "wonder": {
+      "enabled": true,
+      "model": "claude-sonnet-4-6",
+      "maxCandidates": 10,
+      "stalenessMinutes": 10
+    },
+    "prowler": {
+      "enabled": true,
+      "maxSearchesPerSession": 10,
+      "onlyDuringExploration": true,
+      "adjacentTopicsOnly": true,
+      "perplexityModel": "sonar"
+    },
+    "janitor": {
+      "enabled": true,
+      "dryRun": false,
+      "schedule": "session-end"
+    },
+    "tapestry": {
+      "enabled": true,
+      "vaultPath": "./obsidian-vault",
+      "syncOnSessionEnd": true,
+      "generateClusters": true,
+      "minNeuronScore": 10
+    }
+  },
+  "global": {
+    "maxDaemonConcurrency": 3,
+    "logDaemonActivity": true
+  }
+}

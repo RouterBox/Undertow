@@ -1,0 +1,1347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Undertow — the subconscious beneath your agent</title>
+  <meta name="description" content="Real memory is associative. It fires on its own. Undertow is an ambient memory layer for AI agents — a graph and a swarm of daemons that surface flashes of context the moment they matter, without ever being asked." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,700;9..144,900&family=Spectral:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bone: #f4ecdb;
+      --bone-shade: #e8dec7;
+      --ink: #0b0b0d;
+      --ink-soft: #2a2a2d;
+      --deep: #06141a;
+      --deep-edge: #02090c;
+      --murk: #1a3a3f;
+      --lumen: #7df9ff;
+      --lumen-dim: #3a8a92;
+      --display: "Fraunces", "Times New Roman", serif;
+      --body: "Spectral", Georgia, serif;
+      --mono: "JetBrains Mono", "Courier New", monospace;
+      --rule: 1px solid currentColor;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bone);
+      color: var(--ink);
+      font-family: var(--body);
+      font-weight: 300;
+      font-size: 18px;
+      line-height: 1.55;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ──────────────────────────────────────────
+       STRATA — sections alternate ABOVE / BELOW
+       ────────────────────────────────────────── */
+    .stratum-above {
+      background: var(--bone);
+      color: var(--ink);
+      position: relative;
+    }
+    .stratum-below {
+      background: var(--deep);
+      color: var(--bone);
+      position: relative;
+    }
+    .stratum-below::before {
+      content: "";
+      position: absolute; inset: 0;
+      background:
+        radial-gradient(circle at 20% 30%, rgba(125, 249, 255, 0.04), transparent 40%),
+        radial-gradient(circle at 80% 70%, rgba(26, 58, 63, 0.6), transparent 50%);
+      pointer-events: none;
+    }
+
+    /* ──────────────────────────────────────────
+       HERO TIDE — shoreline painting multiplied
+       into the parchment behind the hero. Same
+       blend-mode language as the daemon swarm,
+       but always-on. The image's horizon meets
+       the SVG waterline below the hero, so the
+       page literally descends from beach into
+       ocean.
+       ────────────────────────────────────────── */
+    .hero-stratum { overflow: hidden; }
+    .hero-stratum::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image: url('../docs/hero/shoreline.jpg');
+      background-size: cover;
+      background-position: center 68%;
+      background-repeat: no-repeat;
+      filter: grayscale(0.45) brightness(0.97) contrast(1.05) sepia(0.05);
+      mix-blend-mode: multiply;
+      opacity: 0.5;
+      pointer-events: none;
+      z-index: 0;
+    }
+    .hero-stratum::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        to bottom,
+        var(--bone)                 0%,
+        rgba(244, 236, 219, 0.72)   8%,
+        rgba(244, 236, 219, 0)      30%,
+        rgba(244, 236, 219, 0)      78%,
+        var(--bone)                 100%
+      );
+      pointer-events: none;
+      z-index: 1;
+    }
+    .hero-stratum > .wrap { position: relative; z-index: 2; }
+
+    /* ──────────────────────────────────────────
+       WATERLINE — the differentiation anchor
+       SVG turbulence band, animated. Sits between
+       every above/below section.
+       ────────────────────────────────────────── */
+    .waterline {
+      height: 56px;
+      width: 100%;
+      position: relative;
+      display: block;
+      line-height: 0;
+    }
+    .waterline svg {
+      width: 100%; height: 100%;
+      display: block;
+    }
+    .waterline--down rect { fill: var(--bone); }
+    .waterline--down .water  { fill: var(--deep); }
+    .waterline--up rect   { fill: var(--deep); }
+    .waterline--up .water    { fill: var(--bone); }
+
+    @keyframes drift {
+      0%   { transform: translateX(0); }
+      100% { transform: translateX(-40px); }
+    }
+    .waterline .water { animation: drift 9s linear infinite; }
+
+    /* ──────────────────────────────────────────
+       LAYOUT
+       ────────────────────────────────────────── */
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 32px;
+    }
+
+    /* ──────────────────────────────────────────
+       NAV
+       ────────────────────────────────────────── */
+    nav {
+      display: flex; align-items: baseline; justify-content: space-between;
+      padding: 28px 0 12px;
+      border-bottom: var(--rule);
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    nav .mark {
+      font-family: var(--display);
+      font-weight: 900;
+      font-size: 22px;
+      letter-spacing: -0.02em;
+      text-transform: none;
+    }
+    nav ul { display: flex; gap: 28px; list-style: none; }
+    nav a { color: inherit; text-decoration: none; opacity: 0.7; }
+    nav a:hover { opacity: 1; text-decoration: underline; text-underline-offset: 4px; }
+
+    /* ──────────────────────────────────────────
+       HERO — asymmetric editorial, 60/40
+       ────────────────────────────────────────── */
+    .hero {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 64px;
+      padding: 96px 0 120px;
+      align-items: end;
+    }
+    .hero h1 {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: clamp(56px, 8.4vw, 144px);
+      line-height: 0.86;
+      letter-spacing: -0.035em;
+      font-variation-settings: "opsz" 144;
+    }
+    .hero h1 em {
+      font-style: italic;
+      font-weight: 700;
+    }
+    .hero .lede {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: 26px;
+      line-height: 1.3;
+      letter-spacing: -0.01em;
+      max-width: 44ch;
+      padding-bottom: 14px;
+    }
+    .hero .lede em { font-style: italic; }
+
+    /* ──────────────────────────────────────────
+       SECTION TITLE ATOM
+       ────────────────────────────────────────── */
+    .eyebrow {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      margin-bottom: 20px;
+    }
+    .section-title {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: clamp(40px, 6vw, 84px);
+      line-height: 0.95;
+      letter-spacing: -0.025em;
+      max-width: 18ch;
+      font-variation-settings: "opsz" 96;
+    }
+    .section-title em { font-style: italic; font-weight: 700; }
+
+    /* ──────────────────────────────────────────
+       FLASH BLOCK — "what surfaces" (BELOW water)
+       ────────────────────────────────────────── */
+    .flash-section { padding: 120px 0 140px; position: relative; z-index: 1; }
+    .flash-section .grid {
+      display: grid; grid-template-columns: 1fr 1.2fr;
+      gap: 80px; align-items: start;
+    }
+    .flash-prose {
+      font-family: var(--display);
+      font-size: 22px;
+      line-height: 1.4;
+      font-weight: 300;
+      max-width: 32ch;
+    }
+    .flash-prose em { font-style: italic; color: var(--lumen); }
+
+    .flash-card {
+      border: 1px solid var(--murk);
+      background: rgba(26, 58, 63, 0.18);
+      backdrop-filter: blur(2px);
+      padding: 28px 32px 32px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.65;
+      position: relative;
+    }
+    .flash-card::before {
+      content: "[UNDERTOW-FLASH]";
+      position: absolute; top: -10px; left: 24px;
+      background: var(--deep);
+      padding: 0 10px;
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      color: var(--lumen);
+    }
+    .flash-card .swirl { color: var(--lumen); margin-right: 8px; }
+    .flash-card p { margin-bottom: 16px; opacity: 0.92; }
+    .flash-card hr {
+      border: none;
+      border-top: 1px dashed var(--lumen-dim);
+      opacity: 0.4;
+      margin: 14px 0;
+    }
+    .flash-card .raw {
+      font-size: 11px;
+      opacity: 0.55;
+    }
+    .flash-card .raw .tag {
+      color: var(--lumen);
+      opacity: 0.85;
+    }
+
+    /* ──────────────────────────────────────────
+       DAEMON RING — 8 cards, staggered diagonal
+       (ABOVE water)
+       ────────────────────────────────────────── */
+    .daemons { padding: 140px 0 160px; position: relative; overflow: hidden; }
+    .daemons > .wrap { position: relative; z-index: 1; }
+
+    /* ──────────────────────────────────────────
+       TAKEOVER — when a tile is hovered/focused,
+       that daemon's single portrait fills the
+       entire parchment background of the section.
+       Eight full-cover layers stacked at z-index 0;
+       only one ever has opacity > 0 at a time.
+       ────────────────────────────────────────── */
+    .swarm {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      overflow: hidden;
+    }
+    .swarm-portrait {
+      position: absolute;
+      inset: 0;
+      background-size: cover;
+      background-position: center 22%;
+      background-repeat: no-repeat;
+      filter: grayscale(0.35) brightness(0.92) contrast(1.06) sepia(0.06);
+      opacity: 0;
+      mix-blend-mode: multiply;
+      transform: scale(1.04);
+      transition:
+        opacity 720ms cubic-bezier(.2,.7,.1,1),
+        transform 1200ms cubic-bezier(.2,.7,.1,1);
+    }
+    /* Soft fade at top + bottom edges so the section header text
+       and the section transition into the next waterline both
+       remain crisp instead of fighting the portrait. */
+    .swarm-portrait::after {
+      content: "";
+      position: absolute; inset: 0;
+      background: linear-gradient(
+        to bottom,
+        var(--bone) 0%,
+        rgba(244, 236, 219, 0.55) 12%,
+        rgba(244, 236, 219, 0)    26%,
+        rgba(244, 236, 219, 0)    86%,
+        var(--bone)               100%
+      );
+      pointer-events: none;
+    }
+
+    /* Hover OR keyboard focus on a tile surfaces the matching
+       portrait to fill the whole section. */
+    .daemons:has(.daemon[data-daemon="wonder"]:is(:hover, :focus-within))   .swarm-portrait[data-daemon="wonder"],
+    .daemons:has(.daemon[data-daemon="impulse"]:is(:hover, :focus-within))  .swarm-portrait[data-daemon="impulse"],
+    .daemons:has(.daemon[data-daemon="gobble"]:is(:hover, :focus-within))   .swarm-portrait[data-daemon="gobble"],
+    .daemons:has(.daemon[data-daemon="dreamer"]:is(:hover, :focus-within))  .swarm-portrait[data-daemon="dreamer"],
+    .daemons:has(.daemon[data-daemon="spider"]:is(:hover, :focus-within))   .swarm-portrait[data-daemon="spider"],
+    .daemons:has(.daemon[data-daemon="prowler"]:is(:hover, :focus-within))  .swarm-portrait[data-daemon="prowler"],
+    .daemons:has(.daemon[data-daemon="janitor"]:is(:hover, :focus-within))  .swarm-portrait[data-daemon="janitor"],
+    .daemons:has(.daemon[data-daemon="tapestry"]:is(:hover, :focus-within)) .swarm-portrait[data-daemon="tapestry"] {
+      opacity: 1;
+      transform: scale(1);
+    }
+
+    /* ──────────────────────────────────────────
+       SEA DEFAULT — aerial ocean backdrop.
+       Always visible behind the daemons; fades
+       out when any daemon surfaces, so the
+       chosen monster takes the whole frame.
+       ────────────────────────────────────────── */
+    .swarm-default {
+      position: absolute;
+      inset: 0;
+      background-image: url('../docs/hero/sea-from-altitude.jpg');
+      background-size: cover;
+      background-position: center 45%;
+      background-repeat: no-repeat;
+      filter: grayscale(0.32) brightness(0.94) contrast(1.06) sepia(0.05);
+      opacity: 0.55;
+      mix-blend-mode: multiply;
+      transition: opacity 720ms cubic-bezier(.2,.7,.1,1);
+    }
+    .swarm-default::after {
+      content: "";
+      position: absolute; inset: 0;
+      background: linear-gradient(
+        to bottom,
+        var(--bone) 0%,
+        rgba(244, 236, 219, 0.55) 12%,
+        rgba(244, 236, 219, 0)    26%,
+        rgba(244, 236, 219, 0)    86%,
+        var(--bone)               100%
+      );
+      pointer-events: none;
+    }
+    /* Any daemon hover/focus drops the default sea so the
+       chosen portrait owns the section. */
+    .daemons:has(.daemon:is(:hover, :focus-within)) .swarm-default {
+      opacity: 0;
+    }
+
+    .daemons header { display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: end; margin-bottom: 80px; }
+    .daemons .intro {
+      font-family: var(--display);
+      font-size: 20px;
+      line-height: 1.45;
+      font-weight: 300;
+      max-width: 38ch;
+    }
+
+    .roster {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      grid-auto-rows: 280px;
+      gap: 1px;
+      background: transparent;
+      position: relative;
+    }
+    /* Each daemon spans 2 columns + a varying row offset to create
+       the staggered diagonal — the "ring" is non-tidy on purpose. */
+    .daemon {
+      grid-column: span 2;
+      background: var(--bone);
+      border: 1px solid var(--ink);
+      padding: 24px 24px 28px;
+      position: relative;
+      display: flex; flex-direction: column; justify-content: space-between;
+      cursor: pointer;
+      transition: transform 320ms cubic-bezier(.2,.7,.1,1), background 220ms ease;
+      overflow: hidden;
+    }
+    .daemon:nth-child(2) { margin-top: 36px; }
+    .daemon:nth-child(3) { margin-top: 12px; }
+    .daemon:nth-child(4) { margin-top: 48px; }
+    .daemon:nth-child(5) { margin-top: 20px; }
+    .daemon:nth-child(6) { margin-top: 60px; }
+    .daemon:nth-child(7) { margin-top: 28px; }
+    .daemon:nth-child(8) { margin-top: 44px; }
+    .daemon::before {
+      content: "";
+      position: absolute; left: 0; right: 0; bottom: 0;
+      height: 60%;
+      background:
+        linear-gradient(to top, var(--murk) 0%, rgba(26, 58, 63, 0.45) 50%, transparent 100%);
+      opacity: 0.55;
+      pointer-events: none;
+      transition: height 420ms cubic-bezier(.2,.7,.1,1), opacity 280ms ease;
+      z-index: 2;
+    }
+    .daemon:hover,
+    .daemon:focus-visible { transform: translateY(-10px); }
+    .daemon:hover::before,
+    .daemon:focus-visible::before { height: 18%; opacity: 0.25; }
+    .daemon:focus-visible {
+      outline: 2px solid var(--ink);
+      outline-offset: -1px;
+    }
+    .daemon:focus { outline: none; } /* hide the non-keyboard focus ring */
+
+    /* Portrait — sits in lower 70% of tile, faded to a duotone
+       at rest (sense of a face beneath water), surfaces on hover.
+       The murk gradient above sits on top and lifts on hover. */
+    .daemon .portrait {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 72%;
+      background-size: cover;
+      background-position: center 25%;
+      filter: grayscale(0.7) brightness(0.78) contrast(1.08) sepia(0.12);
+      opacity: 0.22;
+      mix-blend-mode: multiply;
+      transform: scale(1.02);
+      transition:
+        opacity 420ms cubic-bezier(.2,.7,.1,1),
+        filter 420ms ease,
+        transform 540ms cubic-bezier(.2,.7,.1,1);
+      pointer-events: none;
+      z-index: 1;
+    }
+    .daemon .portrait::after {
+      content: "";
+      position: absolute; inset: 0;
+      background: linear-gradient(to top, transparent 0%, var(--bone) 78%);
+    }
+    .daemon:hover .portrait {
+      opacity: 0.92;
+      filter: grayscale(0.2) brightness(0.96) contrast(1.05) sepia(0.05);
+      transform: scale(1.06);
+    }
+    /* Make text float above portrait + murk */
+    .daemon .num,
+    .daemon .name,
+    .daemon .role,
+    .daemon .desc,
+    .daemon .when { position: relative; z-index: 3; }
+
+    .daemon .num {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.2em;
+      opacity: 0.5;
+    }
+    .daemon .name {
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 36px;
+      letter-spacing: -0.02em;
+      line-height: 1;
+      margin-top: 8px;
+    }
+    .daemon .role {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      opacity: 0.6;
+      margin-top: 6px;
+    }
+    .daemon .desc {
+      font-family: var(--body);
+      font-size: 14px;
+      line-height: 1.45;
+      opacity: 0.78;
+      margin-top: 20px;
+    }
+    .daemon .when {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      opacity: 0.5;
+      border-top: 1px solid rgba(11, 11, 13, 0.15);
+      padding-top: 10px;
+      margin-top: 16px;
+    }
+
+    /* ──────────────────────────────────────────
+       MANIFESTO — the Freudian triptych.
+       Three columns descending into the depths:
+       Superego (dim, set back) → Ego (mid) → Id
+       (dominant, lumen). Closes with a pull quote.
+       ────────────────────────────────────────── */
+    .manifesto { padding: 130px 0 160px; }
+    .manifesto .triptych {
+      display: grid;
+      grid-template-columns: 0.7fr 0.9fr 1.4fr;
+      gap: 56px;
+      margin-top: 88px;
+      align-items: start;
+    }
+    .manifesto .col .layer-num {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      opacity: 0.45;
+      margin-bottom: 14px;
+    }
+    .manifesto .col h3 {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: 34px;
+      line-height: 1;
+      letter-spacing: -0.02em;
+      margin-bottom: 20px;
+    }
+    .manifesto .col h3 strong { font-weight: 700; }
+    .manifesto .col p { margin-bottom: 14px; font-size: 16px; line-height: 1.5; }
+    .manifesto .col p em { font-style: italic; opacity: 0.85; }
+    .manifesto .col .who {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.55;
+      border-top: 1px solid rgba(125, 249, 255, 0.16);
+      padding-top: 14px;
+      margin-top: 22px;
+    }
+    .manifesto .col.superego { opacity: 0.55; padding-top: 56px; }
+    .manifesto .col.ego      { opacity: 0.82; padding-top: 28px; }
+    .manifesto .col.id       { opacity: 1; }
+    .manifesto .col.id h3 { font-size: 48px; line-height: 0.95; }
+    .manifesto .col.id h3 strong { color: var(--lumen); }
+    .manifesto .col.id .who {
+      opacity: 1;
+      border-top-color: rgba(125, 249, 255, 0.5);
+      letter-spacing: 0.08em;
+    }
+    .manifesto .col.id .who strong { color: var(--lumen); font-weight: 700; }
+
+    .manifesto .pull {
+      margin: 110px auto 0;
+      padding-top: 56px;
+      border-top: 1px solid rgba(125, 249, 255, 0.22);
+      max-width: 56ch;
+      text-align: center;
+    }
+    .manifesto .pull p {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: clamp(28px, 3.6vw, 48px);
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+    }
+    .manifesto .pull p + p { margin-top: 18px; }
+    .manifesto .pull p em {
+      font-style: italic;
+      font-weight: 700;
+    }
+    .manifesto .pull p em.lumen { color: var(--lumen); }
+
+    /* ──────────────────────────────────────────
+       UNDER THE HOOD (BELOW water)
+       Editorial essay block: numbered, readable
+       column. Sits in the same depth as the
+       manifesto — descent into mechanism.
+       ────────────────────────────────────────── */
+    .how { padding: 130px 0 150px; }
+    .how .prose {
+      margin-top: 56px;
+      max-width: 720px;
+    }
+    .how .lede {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: 24px;
+      line-height: 1.42;
+      letter-spacing: -0.01em;
+      margin-bottom: 64px;
+    }
+    .how .lede em {
+      font-style: italic;
+      color: var(--lumen);
+    }
+    .how .block {
+      padding-top: 36px;
+      border-top: 1px solid rgba(125, 249, 255, 0.18);
+      margin-bottom: 48px;
+    }
+    .how .block:last-child { margin-bottom: 0; }
+    .how .num {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--lumen);
+      opacity: 0.85;
+      margin-bottom: 14px;
+    }
+    .how .block h3 {
+      font-family: var(--display);
+      font-weight: 300;
+      font-size: 30px;
+      line-height: 1.12;
+      letter-spacing: -0.02em;
+      margin-bottom: 20px;
+      max-width: 22ch;
+    }
+    .how .block h3 em {
+      font-style: italic;
+      font-weight: 700;
+      color: var(--lumen);
+    }
+    .how .block p {
+      font-size: 17px;
+      line-height: 1.6;
+      opacity: 0.92;
+    }
+    .how .block p + p { margin-top: 14px; }
+    .how .block p strong { font-weight: 700; opacity: 1; }
+    .how .block p em { font-style: italic; }
+    .how .block code {
+      font-family: var(--mono);
+      font-size: 0.84em;
+      background: rgba(125, 249, 255, 0.08);
+      border: 1px solid rgba(125, 249, 255, 0.18);
+      color: var(--lumen);
+      padding: 1px 8px;
+      border-radius: 3px;
+      letter-spacing: -0.01em;
+      white-space: nowrap;
+    }
+
+    /* ──────────────────────────────────────────
+       INSTALL (ABOVE water)
+       ────────────────────────────────────────── */
+    .install { padding: 130px 0 160px; }
+    .install .grid { display: grid; grid-template-columns: 1fr 1.1fr; gap: 80px; align-items: start; }
+    .install .blurb { font-family: var(--display); font-size: 22px; font-weight: 300; line-height: 1.4; max-width: 30ch; }
+    .install pre {
+      background: var(--ink);
+      color: var(--bone);
+      padding: 28px 32px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+      border: var(--rule);
+    }
+    .install pre .c { color: var(--lumen-dim); }
+    .install pre .k { color: var(--lumen); }
+
+    /* ──────────────────────────────────────────
+       FOOTER (BELOW water — final stratum)
+       ────────────────────────────────────────── */
+    footer {
+      padding: 80px 0 64px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    footer .row { display: flex; justify-content: space-between; align-items: end; flex-wrap: wrap; gap: 24px; }
+    footer .sig {
+      font-family: var(--display);
+      font-style: italic;
+      font-weight: 300;
+      font-size: 24px;
+      text-transform: none;
+      letter-spacing: -0.01em;
+      color: var(--lumen);
+      opacity: 0.85;
+    }
+    footer a { color: inherit; text-decoration: none; opacity: 0.65; }
+    footer a:hover { opacity: 1; text-decoration: underline; text-underline-offset: 4px; }
+
+    /* ──────────────────────────────────────────
+       ENTRANCE — single decisive load animation:
+       hero settles down, page surfaces from below
+       ────────────────────────────────────────── */
+    @keyframes surface {
+      from { transform: translateY(28px); opacity: 0; }
+      to   { transform: translateY(0);    opacity: 1; }
+    }
+    .hero h1, .hero .lede {
+      animation: surface 1100ms cubic-bezier(.2,.7,.1,1) both;
+    }
+    .hero .lede { animation-delay: 160ms; }
+
+    /* Respect reduced motion */
+    @media (prefers-reduced-motion: reduce) {
+      .waterline .water { animation: none; }
+      .hero h1, .hero .lede { animation: none; }
+      .daemon { transition: none; }
+    }
+
+    /* ──────────────────────────────────────────
+       RESPONSIVE — collapse the 60/40 + diagonals
+       on narrow viewports, keep the waterline.
+       ────────────────────────────────────────── */
+    @media (max-width: 880px) {
+      .hero, .flash-section .grid, .daemons header,
+      .manifesto .triptych, .install .grid {
+        grid-template-columns: 1fr;
+      }
+      .hero { padding: 64px 0 80px; }
+      .roster { grid-template-columns: repeat(2, 1fr); }
+      .daemon { grid-column: span 1; margin-top: 0 !important; }
+      .manifesto .triptych { gap: 48px; }
+      .manifesto .col.superego,
+      .manifesto .col.ego { padding-top: 0; opacity: 1; }
+      .manifesto .pull { margin-top: 72px; }
+    }
+
+    /* ──────────────────────────────────────────
+       TABLET LANDSCAPE / SMALL LAPTOP (881–1100)
+       Desktop layout works here, but the hero H1
+       feels disproportionate in a short viewport.
+       Trim it without touching the real desktop.
+       ────────────────────────────────────────── */
+    @media (min-width: 881px) and (max-width: 1100px) {
+      .hero {
+        padding: 64px 0 80px;
+        gap: 40px;
+      }
+      .hero h1 {
+        font-size: clamp(48px, 7vw, 76px);
+      }
+      .hero .lede { font-size: 22px; }
+    }
+
+    /* ──────────────────────────────────────────
+       PHONE TIER (≤640px)
+       Mobile-first overrides on top of the 880px
+       collapse: tighter typography, suppressed
+       hero line breaks (text wraps naturally),
+       smaller daemon tiles, wrapped install
+       blocks, vertically stacked meta strip.
+       ────────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .wrap { padding: 0 20px; }
+
+      /* Nav — wraps gracefully if needed, smaller mark */
+      nav {
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 20px 0 12px;
+        font-size: 11px;
+      }
+      nav .mark { font-size: 19px; }
+      nav ul { gap: 18px; flex-wrap: wrap; }
+
+      /* Hero — let H1 wrap naturally instead of forced 5-line stack */
+      .hero {
+        padding: 40px 0 56px;
+        gap: 24px;
+      }
+      .hero h1 {
+        font-size: clamp(36px, 11vw, 56px);
+        line-height: 0.94;
+        letter-spacing: -0.03em;
+      }
+      .hero h1 br { display: none; }
+      .hero .lede {
+        font-size: 18px;
+        line-height: 1.4;
+        max-width: 34ch;
+        padding-bottom: 4px;
+      }
+      /* Section titles — smaller floor */
+      .section-title {
+        font-size: clamp(32px, 8.5vw, 56px);
+        line-height: 0.98;
+      }
+      .eyebrow { font-size: 10px; margin-bottom: 14px; }
+
+      /* Section paddings — less generous than the 130–160 desktop values */
+      .flash-section { padding: 64px 0 72px; }
+      .daemons      { padding: 72px 0 80px; }
+      .manifesto    { padding: 72px 0 88px; }
+      .install      { padding: 72px 0 88px; }
+
+      /* Flash card — fits on phone width */
+      .flash-section .grid { gap: 36px; }
+      .flash-prose { font-size: 17px; }
+      .flash-card { padding: 22px 22px 24px; font-size: 12px; line-height: 1.6; }
+      .flash-card::before { font-size: 9px; padding: 0 8px; }
+      .flash-card .raw { font-size: 10px; }
+
+      /* Daemons — already 2-col from 880px rule, just make tiles shorter */
+      .daemons header { margin-bottom: 48px; }
+      .daemons .intro { font-size: 17px; }
+      .roster { grid-auto-rows: auto; gap: 1px; }
+      .daemon { padding: 20px 20px 22px; min-height: 220px; }
+      .daemon .name { font-size: 28px; }
+      .daemon .desc { font-size: 13px; margin-top: 14px; }
+
+      /* Manifesto — tighter triptych and pull quote */
+      .manifesto .triptych { gap: 36px; margin-top: 56px; }
+      .manifesto .col h3 { font-size: 28px; margin-bottom: 14px; }
+      .manifesto .col.id h3 { font-size: 36px; }
+      .manifesto .col p { font-size: 15px; line-height: 1.5; }
+      .manifesto .col .who {
+        font-size: 10px;
+        padding-top: 12px;
+        margin-top: 18px;
+      }
+      .manifesto .pull {
+        margin: 56px auto 0;
+        padding-top: 32px;
+        max-width: 100%;
+      }
+      .manifesto .pull p { font-size: clamp(22px, 6.6vw, 30px); line-height: 1.18; }
+      .manifesto .pull p + p { margin-top: 12px; }
+
+      /* Install — wrap long URLs/commands so the pre block stops overflowing */
+      .install .grid { gap: 32px; }
+      .install .blurb { font-size: 18px; }
+      .install pre {
+        padding: 18px 20px;
+        font-size: 12px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }
+
+      /* Footer */
+      footer { padding: 56px 0 48px; }
+      footer .row { flex-direction: column; align-items: flex-start; gap: 28px; }
+      footer .sig { font-size: 22px; }
+
+      /* Waterlines a touch shorter so they don't dominate */
+      .waterline { height: 40px; }
+
+      /* Under the hood — phone tier */
+      .how { padding: 64px 0 80px; }
+      .how .prose { margin-top: 36px; }
+      .how .lede { font-size: 18px; line-height: 1.45; margin-bottom: 48px; }
+      .how .block { padding-top: 28px; margin-bottom: 36px; }
+      .how .block h3 { font-size: 24px; margin-bottom: 14px; }
+      .how .block p { font-size: 16px; line-height: 1.55; }
+    }
+
+    /* ──────────────────────────────────────────
+       SMALL-PHONE OVERLAY (≤480px)
+       Pixel 9 + most modern phones land here.
+       Single-column daemon roster — 2-col tiles
+       at ~160px wide are too cramped for the
+       portraits + body copy.
+       ────────────────────────────────────────── */
+    @media (max-width: 480px) {
+      .roster { grid-template-columns: 1fr; }
+      .daemon { min-height: 200px; }
+    }
+
+    /* ──────────────────────────────────────────
+       LANDSCAPE PHONE / SHORT VIEWPORT
+       Width may exceed 880 (e.g. 915×412 on a
+       Pixel 9 in landscape) so the column-collapse
+       rule above doesn't fire. Catch it by height
+       instead — tame the hero, trim the giant
+       section paddings, keep the 2-col hero so
+       lede sits beside H1 like the desktop intent.
+       ────────────────────────────────────────── */
+    @media (max-height: 500px) and (max-width: 1100px) {
+      nav { padding: 16px 0 10px; font-size: 11px; }
+      nav .mark { font-size: 18px; }
+
+      .hero {
+        padding: 28px 0 36px;
+        gap: 28px;
+        grid-template-columns: 1.15fr 1fr;
+        align-items: end;
+      }
+      .hero h1 {
+        font-size: clamp(32px, 5.5vw, 56px);
+        line-height: 0.94;
+      }
+      .hero h1 br { display: none; }
+      .hero .lede {
+        font-size: 15px;
+        line-height: 1.4;
+        max-width: 40ch;
+      }
+      .section-title { font-size: clamp(28px, 5vw, 56px); }
+      .flash-section { padding: 40px 0 48px; }
+      .daemons      { padding: 48px 0 56px; }
+      .manifesto    { padding: 48px 0 64px; }
+      .install      { padding: 48px 0 64px; }
+      footer        { padding: 40px 0 32px; }
+
+      .waterline { height: 32px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ════════════════════════════════
+     ABOVE — HERO
+     ════════════════════════════════ -->
+<section class="stratum-above hero-stratum">
+  <div class="wrap">
+    <nav>
+      <span class="mark">Undertow</span>
+      <ul>
+        <li><a href="#flash">Flashes</a></li>
+        <li><a href="#daemons">Daemons</a></li>
+        <li><a href="#how">How</a></li>
+        <li><a href="#manifesto">Manifesto</a></li>
+        <li><a href="#install">Install</a></li>
+        <li><a href="https://github.com/RouterBox/undertow">GitHub ↗</a></li>
+      </ul>
+    </nav>
+
+    <header class="hero">
+      <h1>The <em>subconscious</em> <br/>that runs <br/>beneath your <br/>agent.</h1>
+      <p class="lede">
+        Real memory is <em>associative</em>. It fires on its own.
+        Undertow watches every turn, builds a graph of what matters,
+        and surfaces small <em>flashes</em> of context the moment they
+        become relevant — without ever being asked.
+      </p>
+    </header>
+  </div>
+</section>
+
+<!-- waterline ↓ -->
+<div class="waterline waterline--down" aria-hidden="true">
+  <svg viewBox="0 0 1440 56" preserveAspectRatio="none">
+    <defs>
+      <filter id="t1">
+        <feTurbulence type="fractalNoise" baseFrequency="0.022 0.06" numOctaves="2" seed="3"/>
+        <feDisplacementMap in="SourceGraphic" scale="14"/>
+      </filter>
+    </defs>
+    <rect x="0" y="0" width="1440" height="56"/>
+    <g filter="url(#t1)">
+      <path class="water" d="M-100 32 Q 80 24 240 32 T 560 32 T 880 32 T 1200 32 T 1540 32 L 1540 56 L -100 56 Z" />
+    </g>
+  </svg>
+</div>
+
+<!-- ════════════════════════════════
+     BELOW — WHAT SURFACES (FLASH)
+     ════════════════════════════════ -->
+<section id="flash" class="stratum-below flash-section">
+  <div class="wrap">
+    <p class="eyebrow" style="color: var(--lumen); opacity: 0.7;">What the agent sees</p>
+    <div class="grid">
+      <div>
+        <h2 class="section-title">A flash is small,<br/>specific, and <em>uninvited</em>.</h2>
+        <p class="flash-prose" style="margin-top: 28px;">
+          When you submit a prompt, the daemons run in parallel —
+          <em>vector</em>, graph traversal, temporal, contradiction,
+          ambient research. The agent receives a single compact note
+          before it sees your message. No tool call. No ceremony.
+          Just <em>resonance</em>.
+        </p>
+      </div>
+      <div class="flash-card">
+        <p>
+          <span class="swirl">~</span>
+          You're sketching an audit-trail schema. You closed this exact
+          loop three weeks ago in a different repo with CQRS — the
+          decision rationale is still in the graph.
+        </p>
+        <p>
+          <span class="swirl">~</span>
+          This Postgres lock pattern bit you on another project last
+          quarter. You fixed it then with a deferred trigger.
+        </p>
+        <hr/>
+        <div class="raw">
+          <span class="tag">[decision]</span> CQRS for audit trail · <em>vector + graph</em><br/>
+          <span class="tag">[episode]</span> Postgres lock incident · <em>temporal</em><br/>
+          <span class="tag">[insight]</span> Write-contention pattern · <em>bridge node</em>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- waterline ↑ -->
+<div class="waterline waterline--up" aria-hidden="true">
+  <svg viewBox="0 0 1440 56" preserveAspectRatio="none">
+    <defs>
+      <filter id="t2">
+        <feTurbulence type="fractalNoise" baseFrequency="0.026 0.05" numOctaves="2" seed="11"/>
+        <feDisplacementMap in="SourceGraphic" scale="16"/>
+      </filter>
+    </defs>
+    <rect x="0" y="0" width="1440" height="56"/>
+    <g filter="url(#t2)">
+      <path class="water" d="M-100 24 Q 80 32 240 24 T 560 24 T 880 24 T 1200 24 T 1540 24 L 1540 0 L -100 0 Z" />
+    </g>
+  </svg>
+</div>
+
+<!-- ════════════════════════════════
+     ABOVE — DAEMON ROSTER
+     ════════════════════════════════ -->
+<section id="daemons" class="stratum-above daemons">
+
+  <!-- The swarm: aerial sea by default; portraits surface on hover.
+       The parchment background is "undertaken" — first by the deep,
+       then by whichever daemon you bring up from it. -->
+  <div class="swarm" aria-hidden="true">
+    <div class="swarm-default"></div>
+    <div class="swarm-portrait" data-daemon="wonder"   style="background-image:url('../docs/daemons/wonder.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="impulse"  style="background-image:url('../docs/daemons/impulse.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="gobble"   style="background-image:url('../docs/daemons/gobble.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="dreamer"  style="background-image:url('../docs/daemons/dreamer.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="spider"   style="background-image:url('../docs/daemons/spider.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="prowler"  style="background-image:url('../docs/daemons/prowler.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="janitor"  style="background-image:url('../docs/daemons/janitor.jpg')"></div>
+    <div class="swarm-portrait" data-daemon="tapestry" style="background-image:url('../docs/daemons/tapestry.jpg')"></div>
+  </div>
+
+  <div class="wrap">
+    <header>
+      <div>
+        <p class="eyebrow">Eight daemons</p>
+        <h2 class="section-title">A swarm,<br/>not a <em>service</em>.</h2>
+      </div>
+      <p class="intro">
+        Each does one thing. The graph is the lake; the daemons are
+        the actors — reading what they need, writing what they learn,
+        never speaking to your agent directly. They run on hooks
+        (UserPromptSubmit, PostToolUse, Stop) and disappear.
+        Hover/Click any of them.
+      </p>
+    </header>
+
+    <div class="roster">
+      <article class="daemon" tabindex="0" data-daemon="wonder"><div class="portrait" style="background-image:url('../docs/daemons/wonder.jpg')"></div><span class="num">i.</span><h3 class="name">Wonder</h3><p class="role">Upstream · Proactive</p><p class="desc">Reads the transcript between turns, pre-warms candidate flashes for the next prompt.</p><p class="when">Stop hook</p></article>
+      <article class="daemon" tabindex="0" data-daemon="impulse"><div class="portrait" style="background-image:url('../docs/daemons/impulse.jpg')"></div><span class="num">ii.</span><h3 class="name">Impulse</h3><p class="role">Upstream · Reactive</p><p class="desc">The flash-crafting pipeline — vector search, graph traversal, scoring, Haiku judgment.</p><p class="when">UserPromptSubmit</p></article>
+      <article class="daemon" tabindex="0" data-daemon="gobble"><div class="portrait" style="background-image:url('../docs/daemons/gobble.jpg')"></div><span class="num">iii.</span><h3 class="name">Gobble</h3><p class="role">Input</p><p class="desc">Consumes tool events, files, URLs. Turns raw activity into typed neurons with bodies.</p><p class="when">PostToolUse</p></article>
+      <article class="daemon" tabindex="0" data-daemon="dreamer"><div class="portrait" style="background-image:url('../docs/daemons/dreamer.jpg')"></div><span class="num">iv.</span><h3 class="name">Dreamer</h3><p class="role">Downstream</p><p class="desc">Processes the finished turn — pursuits, train-of-thought, contradiction surfacing.</p><p class="when">Stop hook</p></article>
+      <article class="daemon" tabindex="0" data-daemon="spider"><div class="portrait" style="background-image:url('../docs/daemons/spider.jpg')"></div><span class="num">v.</span><h3 class="name">Spider</h3><p class="role">Downstream · Idle</p><p class="desc">Walks the graph at rest. Discovers edges, prunes weak ones, pre-computes GDS scores.</p><p class="when">Session end</p></article>
+      <article class="daemon" tabindex="0" data-daemon="prowler"><div class="portrait" style="background-image:url('../docs/daemons/prowler.jpg')"></div><span class="num">vi.</span><h3 class="name">Prowler</h3><p class="role">Bidirectional</p><p class="desc">Brave Search for fast lookups; Perplexity for the genuinely research-worthy prompts.</p><p class="when">Query / Stop</p></article>
+      <article class="daemon" tabindex="0" data-daemon="janitor"><div class="portrait" style="background-image:url('../docs/daemons/janitor.jpg')"></div><span class="num">vii.</span><h3 class="name">Janitor</h3><p class="role">Downstream · Idle</p><p class="desc">Content-quality pass. Removes thin neurons that slip past the ingestion gate.</p><p class="when">Session end</p></article>
+      <article class="daemon" tabindex="0" data-daemon="tapestry"><div class="portrait" style="background-image:url('../docs/daemons/tapestry.jpg')"></div><span class="num">viii.</span><h3 class="name">Tapestry</h3><p class="role">Projection</p><p class="desc">Materializes the graph into a navigable Obsidian vault. One page per neuron, wikilinks for synapses, cluster pages from communities.</p><p class="when">Manual</p></article>
+    </div>
+  </div>
+</section>
+
+<!-- waterline ↓ -->
+<div class="waterline waterline--down" aria-hidden="true">
+  <svg viewBox="0 0 1440 56" preserveAspectRatio="none">
+    <defs>
+      <filter id="t3">
+        <feTurbulence type="fractalNoise" baseFrequency="0.018 0.07" numOctaves="2" seed="22"/>
+        <feDisplacementMap in="SourceGraphic" scale="18"/>
+      </filter>
+    </defs>
+    <rect x="0" y="0" width="1440" height="56"/>
+    <g filter="url(#t3)">
+      <path class="water" d="M-100 30 Q 80 22 240 30 T 560 30 T 880 30 T 1200 30 T 1540 30 L 1540 56 L -100 56 Z" />
+    </g>
+  </svg>
+</div>
+
+<!-- ════════════════════════════════
+     BELOW — UNDER THE HOOD
+     Sits at the same depth as the manifesto
+     (no waterline between them) — descent from
+     "what the daemons do" into "how they do it"
+     into "why it matters."
+     ════════════════════════════════ -->
+<section id="how" class="stratum-below how">
+  <div class="wrap">
+    <p class="eyebrow" style="color: var(--lumen); opacity: 0.7;">Under the hood</p>
+    <h2 class="section-title">What you're<br/>actually <em>installing</em>.</h2>
+
+    <div class="prose">
+
+      <p class="lede">
+        You smell something — old paper, garlic in a pan, a particular
+        shampoo — and instantly remember someone you haven't thought about
+        in fifteen years. Nothing asked your mind to do that. The memory
+        just <em>fires</em>, an unsolicited associative leap from a sensory
+        token to a person you'd otherwise need a quiet hour to summon.
+        Undertow is that mechanism, but for the Claude Code session running
+        on your machine right now. Here is how it does it.
+      </p>
+
+      <div class="block">
+        <p class="num">01 — The graph</p>
+        <h3>One <em>Neo4j</em> container, doing two jobs at once.</h3>
+        <p>
+          Neo4j Community Edition runs in Docker Desktop on your machine.
+          Free, local, no SaaS — your graph never leaves the box. One
+          database covers both retrieval modes Undertow needs.
+        </p>
+        <p>
+          <strong>Relational topology.</strong> Neurons (memory units)
+          connected by typed synapses — associative, temporal, causal,
+          contradicts. Cypher walks the graph. Bridge nodes connecting
+          otherwise unrelated clusters are how the genuinely surprising
+          recalls happen — the connection between two topics that share no
+          obvious similarity, no direct link, no common tag.
+        </p>
+        <p>
+          <strong>Native vector index.</strong> Every neuron's flash summary
+          is embedded by Gemini and stored on the same node. Same database,
+          two retrieval modalities — semantic similarity and graph
+          traversal — running in parallel against one source of truth.
+          Neither is sufficient on its own; together they cover both
+          "feels related" and "is structurally connected."
+        </p>
+      </div>
+
+      <div class="block">
+        <p class="num">02 — The collection</p>
+        <h3>Claude Code <em>hooks</em>. You don't lift a finger.</h3>
+        <p>
+          Five hook events do the work invisibly:
+          <code>UserPromptSubmit</code>,
+          <code>PostToolUse</code>,
+          <code>Stop</code>,
+          <code>SessionStart</code>,
+          <code>PostCompact</code>. They fire as you work — every prompt,
+          every tool result, every turn boundary, every session resume.
+        </p>
+        <p>
+          You don't run an indexer. You don't tag entries. You don't decide
+          what's worth remembering. A Haiku-sized model judges each event
+          against a substance threshold, writes neurons that have real
+          content (a fact, a decision, an insight, a reasoning chain), and
+          skips routine noise. The graph grows because you're working,
+          not because you stopped to feed it.
+        </p>
+      </div>
+
+      <div class="block">
+        <p class="num">03 — The recall</p>
+        <h3>Memory arrives <em>before</em> the model reads your prompt.</h3>
+        <p>
+          This is the hinge — the thing no other memory system does. Every
+          competitor (Mem0, Letta, Cognee, ChatGPT memory) is a tool the
+          agent can <em>choose</em> to call: it decides it needs context,
+          fires a tool, waits, integrates, continues. Deliberate. Slow.
+          And it only happens when the agent thinks to ask.
+        </p>
+        <p>
+          Undertow doesn't wait. The
+          <code>UserPromptSubmit</code> hook intercepts your prompt, runs
+          vector + graph + temporal + contradiction searches in parallel,
+          has Haiku judge the candidates, and returns flashes as
+          <code>additionalContext</code> attached to your message. By the
+          time Claude reads what you typed, the relevant memory is already
+          <em>in</em> the prompt. No tool call. No round trip. The agent
+          never decided to look — it just knows.
+        </p>
+      </div>
+
+      <div class="block">
+        <p class="num">04 — The runtime</p>
+        <h3>One small <em>Node.js</em> service on localhost.</h3>
+        <p>
+          A Node.js HTTP server on <code>localhost:3030</code> bridges
+          Claude Code's hooks to Neo4j and dispatches to the daemon swarm.
+          The whole engine is small enough to read in an evening — eight
+          daemon plugins, a thin router, a query cache. No build step. No
+          framework. Open the source in your editor and you can see why
+          every flash decision got made.
+        </p>
+        <p>
+          The only outbound traffic is the model calls that judge your
+          memories — Haiku for retrieval, Sonnet for summarization —
+          calling Anthropic's API via your own API key. This is billed
+          <strong>separately from your Claude Code subscription</strong>.
+          Since April 2026, Anthropic subscription quotas cover only the
+          first-party surfaces (Claude Code CLI, <code>claude.ai</code>,
+          Desktop, Cowork); anything else that hits the API — Undertow's
+          daemon brain included — draws from your standard API billing.
+          Haiku does most of the work and it's cheap; expect roughly
+          $0.20–$0.60 of API usage per active session on top of whatever
+          your subscription covers. Nothing besides those judgment calls
+          phones home.
+        </p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- (no waterline — manifesto continues at the same depth) -->
+
+<!-- ════════════════════════════════
+     BELOW — MANIFESTO (the Freudian triptych)
+     ════════════════════════════════ -->
+<section id="manifesto" class="stratum-below manifesto">
+  <div class="wrap">
+    <p class="eyebrow" style="color: var(--lumen); opacity: 0.7;">A position</p>
+    <h2 class="section-title">Freud described<br/>the mind with<br/><em>three</em> layers.</h2>
+
+    <div class="triptych">
+      <div class="col superego">
+        <p class="layer-num">i.</p>
+        <h3>Super<strong>ego</strong>.</h3>
+        <p>
+          System prompts. RLHF. Safety training. The voice of
+          <em>you should</em> and <em>you must not</em>.
+        </p>
+        <p class="who">Every model has one</p>
+      </div>
+
+      <div class="col ego">
+        <p class="layer-num">ii.</p>
+        <h3>The <strong>ego</strong>.</h3>
+        <p>
+          The context window. The agent's conscious attention —
+          what it is actively thinking about right now.
+        </p>
+        <p class="who">Every harness has one</p>
+      </div>
+
+      <div class="col id">
+        <p class="layer-num">iii.</p>
+        <h3>The <strong>id</strong>.</h3>
+        <p>
+          Ambient. Associative. <em>Unsolicited</em>. The part of
+          the mind that fires without being asked, surfacing
+          memories that have no business being relevant — until
+          suddenly they are. Every other memory system is a
+          filing cabinet: you put something in, you ask for it
+          back. This is the part everyone forgot to build.
+        </p>
+        <p class="who"><strong>Nobody is building this.<br/>That's Undertow.</strong></p>
+      </div>
+    </div>
+
+    <blockquote class="pull">
+      <p>Everyone is asking whether AI is <em>conscious</em>.</p>
+      <p>We ask — is it <em class="lumen">subconscious</em>?</p>
+    </blockquote>
+
+  </div>
+</section>
+
+<!-- waterline ↑ -->
+<div class="waterline waterline--up" aria-hidden="true">
+  <svg viewBox="0 0 1440 56" preserveAspectRatio="none">
+    <defs>
+      <filter id="t4">
+        <feTurbulence type="fractalNoise" baseFrequency="0.024 0.055" numOctaves="2" seed="37"/>
+        <feDisplacementMap in="SourceGraphic" scale="14"/>
+      </filter>
+    </defs>
+    <rect x="0" y="0" width="1440" height="56"/>
+    <g filter="url(#t4)">
+      <path class="water" d="M-100 26 Q 80 34 240 26 T 560 26 T 880 26 T 1200 26 T 1540 26 L 1540 0 L -100 0 Z" />
+    </g>
+  </svg>
+</div>
+
+<!-- ════════════════════════════════
+     ABOVE — INSTALL
+     ════════════════════════════════ -->
+<section id="install" class="stratum-above install">
+  <div class="wrap">
+    <p class="eyebrow">Get started</p>
+    <h2 class="section-title">Three steps.<br/>Then forget about it.</h2>
+    <div class="grid" style="margin-top: 56px;">
+      <p class="blurb">
+        Undertow runs as a local Node service. Neo4j ships in a
+        Docker container. Your data never leaves the machine
+        except for the model calls that judge it. After install,
+        the daemons take over and you stop thinking about memory.
+      </p>
+<pre><span class="c"># 1. clone the repo</span>
+git clone https://github.com/RouterBox/Undertow
+
+<span class="c"># 2. start neo4j</span>
+docker start neo4j
+
+<span class="c"># 3. let claude wire it up</span>
+$ claude
+&gt; <span class="k">read INSTALL.md and set this up</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- waterline ↓ to footer -->
+<div class="waterline waterline--down" aria-hidden="true">
+  <svg viewBox="0 0 1440 56" preserveAspectRatio="none">
+    <defs>
+      <filter id="t5">
+        <feTurbulence type="fractalNoise" baseFrequency="0.02 0.06" numOctaves="2" seed="47"/>
+        <feDisplacementMap in="SourceGraphic" scale="16"/>
+      </filter>
+    </defs>
+    <rect x="0" y="0" width="1440" height="56"/>
+    <g filter="url(#t5)">
+      <path class="water" d="M-100 30 Q 80 22 240 30 T 560 30 T 880 30 T 1200 30 T 1540 30 L 1540 56 L -100 56 Z" />
+    </g>
+  </svg>
+</div>
+
+<!-- ════════════════════════════════
+     BELOW — FOOTER
+     ════════════════════════════════ -->
+<footer class="stratum-below">
+  <div class="wrap">
+    <div class="row">
+      <div>
+        <p class="sig">Undertow.</p>
+        <p style="margin-top: 8px; opacity: 0.55;">The id beneath the ego.</p>
+      </div>
+      <ul style="display: flex; gap: 32px; list-style: none;">
+        <li><a href="https://github.com/RouterBox/undertow">github</a></li>
+        <li><a href="#">docs</a></li>
+        <li><a href="#daemons">daemons</a></li>
+        <li><a href="#install">install</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
