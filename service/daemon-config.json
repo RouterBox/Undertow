@@ -8,7 +8,10 @@
       "pruneMinAge": 30,
       "similarityThreshold": 0.6,
       "maxNewEdgesPerRun": 50,
-      "precomputeGDS": true
+      "precomputeGDS": true,
+      "sweepBatchSize": 25,
+      "sweepRandomPasses": 2,
+      "maxSweepEdges": 2000
     },
     "wonder": {
       "enabled": true,

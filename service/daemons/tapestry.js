@@ -46,6 +46,7 @@ export default {
     // Ensure directories
     await mkdir(join(vaultPath, 'neurons'), { recursive: true });
     await mkdir(join(vaultPath, 'clusters'), { recursive: true });
+    await mkdir(join(vaultPath, 'projects'), { recursive: true });
     await mkdir(join(vaultPath, 'meta'), { recursive: true });
 
     const minScore = daemonConfig.minNeuronScore || 10;
@@ -66,7 +67,8 @@ export default {
              n.created_at AS created, n.last_surfaced AS lastSurfaced,
              n.source AS source, n.community_id AS communityId,
              n.pagerank AS pagerank, n.bridge_score AS bridgeScore,
-             n.source_url AS sourceUrl, n.source_path AS sourcePath
+             n.source_url AS sourceUrl, n.source_path AS sourcePath,
+             n.project AS project
       ORDER BY liveScore DESC
     `, { minScore }).catch(() => []);
 
@@ -121,6 +123,7 @@ export default {
       if (n.sourceUrl) page += ` | [URL](${n.sourceUrl})`;
       if (n.sourcePath) page += ` | \`${n.sourcePath}\``;
       if (n.source) page += '\n';
+      if (n.project) page += `**Project:** [[Project - ${sanitizeName(n.project)}]]\n`;
 
       page += '\n---\n\n';
 
@@ -144,6 +147,14 @@ export default {
     }
 
     // --- Generate cluster pages ---
+    // Clear stale cluster/project pages so re-runs don't leave orphans behind.
+    for (const dir of ['clusters', 'projects']) {
+      const existing = await readdir(join(vaultPath, dir)).catch(() => []);
+      for (const f of existing) {
+        if (f.endsWith('.md')) await unlink(join(vaultPath, dir, f)).catch(() => {});
+      }
+    }
+
     let communities = {};
     if (daemonConfig.generateClusters) {
       for (const n of neurons) {
@@ -181,13 +192,7 @@ export default {
       }
     }
 
-    // --- Generate index ---
-    let index = '# Undertow Knowledge Graph\n\n';
-    index += `*Generated: ${new Date().toISOString().split('T')[0]}*\n\n`;
-    index += `**Neurons:** ${neurons.length} | **Synapses:** ${synapses.length}\n\n`;
-    index += '## All Neurons\n\n';
-
-    // Group by type
+    // Group by type (used by stats + index summary)
     const byType = {};
     for (const n of neurons) {
       const t = n.type || 'unknown';
@@ -195,13 +200,53 @@ export default {
       byType[t].push(n);
     }
 
-    for (const [type, members] of Object.entries(byType).sort()) {
-      index += `### ${type} (${members.length})\n\n`;
-      for (const m of members) {
-        index += `- [[${sanitizeName(m.name)}]] — ${m.flash || 'no summary'}\n`;
-      }
-      index += '\n';
+    // --- Generate per-project MOC pages (centers of gravity, not one big index) ---
+    const projectGroups = {};
+    for (const n of neurons) {
+      if (!n.project) continue;
+      (projectGroups[n.project] = projectGroups[n.project] || []).push(n);
     }
+    const prVal = (n) => (typeof n.pagerank === 'number' ? n.pagerank : (n.pagerank?.low ?? 0));
+    for (const [project, members] of Object.entries(projectGroups)) {
+      members.sort((a, b) => prVal(b) - prVal(a));
+      let page = `# Project — ${project}\n\n`;
+      page += `**Neurons:** ${members.length}\n\n`;
+      page += `> Map of content for everything Undertow remembers about \`${project}\`.\n\n`;
+      // Type breakdown within project
+      const pByType = {};
+      for (const m of members) (pByType[m.type || 'unknown'] = pByType[m.type || 'unknown'] || []).push(m);
+      for (const [type, ms] of Object.entries(pByType).sort()) {
+        page += `## ${type} (${ms.length})\n\n`;
+        for (const m of ms) {
+          const pr = prVal(m).toFixed(3);
+          page += `- [[${sanitizeName(m.name)}]] — ${m.flash || 'no summary'} _(PR ${pr})_\n`;
+        }
+        page += '\n';
+      }
+      await writeFile(join(vaultPath, 'projects', `Project - ${sanitizeName(project)}.md`), page);
+      filesWritten++;
+    }
+
+    // --- Generate index (navigational hub only — links projects + top neurons, not all 738) ---
+    const untaggedCount = neurons.filter(n => !n.project).length;
+    const topByPagerank = [...neurons].sort((a, b) => prVal(b) - prVal(a)).slice(0, 25);
+    let index = '# Undertow Knowledge Graph\n\n';
+    index += `*Generated: ${new Date().toISOString().split('T')[0]}*\n\n`;
+    index += `**Neurons:** ${neurons.length} | **Synapses:** ${synapses.length} | **Communities:** `;
+    index += `${Object.keys(communities || {}).length} | **Untagged neurons:** ${untaggedCount}\n\n`;
+    index += '## Projects\n\n';
+    for (const [project, members] of Object.entries(projectGroups).sort((a, b) => b[1].length - a[1].length)) {
+      index += `- [[Project - ${sanitizeName(project)}]] — ${members.length} neurons\n`;
+    }
+    index += '\n## Top neurons (by PageRank)\n\n';
+    for (const m of topByPagerank) {
+      index += `- [[${sanitizeName(m.name)}]] — ${m.flash || 'no summary'}\n`;
+    }
+    index += '\n## By type\n\n';
+    for (const [type, members] of Object.entries(byType).sort()) {
+      index += `- **${type}**: ${members.length}\n`;
+    }
+    index += '\nNeuron pages live in `neurons/`, clusters in `clusters/`, project maps in `projects/`.\n';
 
     await writeFile(join(vaultPath, 'index.md'), index);
     filesWritten++;
@@ -214,6 +259,13 @@ export default {
     stats += `| Synapses | ${synapses.length} |\n`;
     stats += `| Neuron types | ${Object.keys(byType).join(', ')} |\n`;
     stats += `| Communities | ${Object.keys(communities || {}).length} |\n`;
+    stats += `| Projects | ${Object.keys(projectGroups).length} |\n`;
+    stats += `| Untagged neurons | ${untaggedCount} |\n\n`;
+    stats += `## Neurons per project\n\n| Project | Neurons |\n|---|---|\n`;
+    for (const [project, members] of Object.entries(projectGroups).sort((a, b) => b[1].length - a[1].length)) {
+      stats += `| ${project} | ${members.length} |\n`;
+    }
+    if (untaggedCount > 0) stats += `| _(untagged)_ | ${untaggedCount} |\n`;
 
     await writeFile(join(vaultPath, 'meta', 'graph-stats.md'), stats);
     filesWritten++;

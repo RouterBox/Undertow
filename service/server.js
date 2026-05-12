@@ -758,16 +758,20 @@ app.post('/undertow/chase', async (req, res) => {
 });
 
 // POST /undertow/spider — Run spider daemon (batch edge discovery + pruning + GDS)
+// Body { mode: "full" } runs the full-graph Haiku edge-discovery sweep instead.
 app.post('/undertow/spider', async (req, res) => {
   if (!undertowEnabled) return res.json({ status: 'disabled' });
   if (!isDaemonEnabled('spider')) return res.json({ status: 'daemon disabled' });
 
+  const fullSweep = req.body && req.body.mode === 'full';
+
   // Respond with accepted, process async
-  res.json({ status: 'started' });
+  res.json({ status: 'started', mode: fullSweep ? 'full' : 'incremental' });
 
   try {
-    const result = await spider.run({ runCypher, callAnthropic, config: getDaemonConfig('spider'), log });
-    log('spider', 'info', 'spider run complete', { detail: JSON.stringify(result) });
+    const args = { runCypher, callAnthropic, config: getDaemonConfig('spider'), log };
+    const result = fullSweep ? await spider.runFullSweep(args) : await spider.run(args);
+    log('spider', 'info', `spider ${fullSweep ? 'full sweep' : 'run'} complete`, { detail: JSON.stringify(result) });
   } catch (e) {
     log('spider', 'error', `spider failed: ${e.message}`);
   }
