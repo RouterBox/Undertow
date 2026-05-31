@@ -701,8 +701,15 @@ app.post('/undertow/correct', async (req, res) => {
         `MATCH (n:Neuron {name: $name}) SET ${setClauses.join(', ')} RETURN n.name`,
         params
       );
-      log('correct', 'info', `UPDATED: ${neuron}`, { detail: `reason: ${reason}, changes: ${flash_summary ? 'flash' : ''} ${body !== undefined ? 'body' : ''} ${tier ? 'tier' : ''}`.trim() });
-      return res.json({ status: 'updated', neuron, reason, previous: node.flash });
+      // Re-embed when the flash_summary changed — otherwise vector search keeps
+      // matching the stale text and a corrected neuron resurfaces on the old terms.
+      let reEmbedded = false;
+      if (flash_summary) {
+        await embedNeuron(neuron, flash_summary);
+        reEmbedded = embeddingsAvailable();
+      }
+      log('correct', 'info', `UPDATED: ${neuron}`, { detail: `reason: ${reason}, changes: ${flash_summary ? 'flash' : ''} ${body !== undefined ? 'body' : ''} ${tier ? 'tier' : ''}${reEmbedded ? ' (re-embedded)' : ''}`.trim() });
+      return res.json({ status: 'updated', neuron, reason, previous: node.flash, reEmbedded });
     }
 
     res.status(400).json({ error: `unknown action: ${action}. Use update, delete, or demote.` });
