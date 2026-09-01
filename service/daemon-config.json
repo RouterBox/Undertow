@@ -31,6 +31,17 @@
       "dryRun": false,
       "schedule": "session-end"
     },
+    "keeper": {
+      "enabled": true,
+      "promoteAfterTurns": 3,
+      "minCadenceSeconds": 5,
+      "ledgerTTLHours": 48,
+      "habituationHours": 6,
+      "habituationMaxPrompts": 30,
+      "cwdRules": [
+        { "pattern": "agentbox-worktrees", "tier": "drone" }
+      ]
+    },
     "tapestry": {
       "enabled": true,
       "vaultPath": "./obsidian-vault",

@@ -8,6 +8,7 @@
  */
 
 import { getDaemonConfig } from './loader.js';
+import { nsPredicate } from '../namespaces.js';
 
 // Patterns that identify garbage neurons
 const GARBAGE_PATTERNS = {
@@ -36,13 +37,14 @@ export default {
   description: 'Content-quality cleanup — removes junk neurons based on content patterns, not scores',
   defaultEnabled: true,
 
-  async run({ runCypher, log }) {
+  async run({ runCypher, log, namespace = null }) {
     const daemonConfig = getDaemonConfig('janitor');
     if (!daemonConfig.enabled) {
       log('janitor', 'info', 'janitor disabled');
       return { cleaned: 0 };
     }
 
+    const ns = namespace;
     const startTime = Date.now();
     let cleaned = 0;
     const dryRun = daemonConfig.dryRun || false;
@@ -50,11 +52,12 @@ export default {
     // --- Pattern 1: Self-referential neurons (name === flash_summary) ---
     const selfRef = await runCypher(`
       MATCH (n:Neuron)
-      WHERE n.name = n.flash_summary
+      WHERE ${nsPredicate('n')}
+      AND n.name = n.flash_summary
       AND (n.body IS NULL OR n.body = '')
       RETURN n.name AS name, n.node_type AS type, n.base_score AS score,
              size([(n)-[:SYNAPSE]-() | 1]) AS connections
-    `).catch(() => []);
+    `, { ns }).catch(() => []);
 
     for (const n of selfRef) {
       const conns = typeof n.connections === 'object' ? n.connections.low : n.connections;
@@ -62,7 +65,7 @@ export default {
       if (dryRun) {
         log('janitor', 'info', `[DRY RUN] would clean self-referential: ${n.name}`);
       } else {
-        await runCypher('MATCH (n:Neuron {name: $name}) DETACH DELETE n', { name: n.name }).catch(e => log('error', 'warn', e.message));
+        await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} DETACH DELETE n`, { name: n.name, ns }).catch(e => log('error', 'warn', e.message));
         log('janitor', 'info', `cleaned self-referential: ${n.name}`);
       }
       cleaned++;
@@ -71,10 +74,11 @@ export default {
     // --- Pattern 2: Action/status label neurons ---
     const allNeurons = await runCypher(`
       MATCH (n:Neuron)
-      WHERE (n.body IS NULL OR n.body = '')
+      WHERE ${nsPredicate('n')}
+      AND (n.body IS NULL OR n.body = '')
       RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type,
              size([(n)-[:SYNAPSE]-() | 1]) AS connections
-    `).catch(() => []);
+    `, { ns }).catch(() => []);
 
     for (const n of allNeurons) {
       const conns = typeof n.connections === 'object' ? n.connections.low : n.connections;
@@ -94,7 +98,7 @@ export default {
           const reason = isActionLabel ? 'action label' : isMetadata ? 'metadata' : isTooShort ? 'too short' : 'garbage research';
           log('janitor', 'info', `[DRY RUN] would clean ${reason}: ${name}`);
         } else {
-          await runCypher('MATCH (n:Neuron {name: $name}) DETACH DELETE n', { name: n.name }).catch(e => log('error', 'warn', e.message));
+          await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} DETACH DELETE n`, { name: n.name, ns }).catch(e => log('error', 'warn', e.message));
           const reason = isActionLabel ? 'action label' : isMetadata ? 'metadata' : isTooShort ? 'too short' : 'garbage research';
           log('janitor', 'info', `cleaned ${reason}: ${name}`);
         }

@@ -114,10 +114,10 @@ Maximum 5 search queries. Focus on what would be USEFUL, not what was MENTIONED.
         if (!embedding) continue;
 
         const results = await runCypher(`
-          CALL db.index.vector.queryNodes('neuron_embedding', 5, $embedding)
+          CALL db.index.vector.queryNodes('neuron_embedding', 15, $embedding)
           YIELD node, score
           WITH node AS n, score AS vectorScore
-          WHERE vectorScore > 0.3
+          WHERE vectorScore > 0.3 AND n.namespace IS NULL AND n.superseded IS NULL
           RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type,
                  n.body AS body, n.project AS project, vectorScore AS score
           ORDER BY score DESC LIMIT 5

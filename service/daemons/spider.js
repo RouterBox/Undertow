@@ -8,6 +8,7 @@
  */
 
 import { getDaemonConfig } from './loader.js';
+import { nsPredicate } from '../namespaces.js';
 
 function chunk(arr, size) {
   const out = [];
@@ -31,18 +32,22 @@ function truncate(s, n) {
 
 const SWEEP_EDGE_TYPES = ['causal', 'temporal', 'elaborates', 'contradicts', 'contains', 'prerequisite', 'associative'];
 
-async function recomputeGDS(runCypher, log) {
-  const countResult = await runCypher('MATCH (n:Neuron) RETURN count(n) AS count').catch(() => [{ count: 0 }]);
+async function recomputeGDS(runCypher, log, ns = null) {
+  const countResult = await runCypher(`MATCH (n:Neuron) WHERE ${nsPredicate('n')} RETURN count(n) AS count`, { ns }).catch(() => [{ count: 0 }]);
   const nodeCount = countResult[0]?.count?.low ?? countResult[0]?.count ?? 0;
   if (nodeCount < 10) {
     log('spider', 'info', `skipping GDS: only ${nodeCount} neurons`);
     return;
   }
   await runCypher(`CALL gds.graph.drop('undertow-graph', false)`).catch(() => {});
+  // Cypher projection so only this namespace's sub-graph gets scored —
+  // GDS scores must not flow across namespace boundaries.
   await runCypher(`
-    CALL gds.graph.project('undertow-graph', 'Neuron',
-      { SYNAPSE: { orientation: 'UNDIRECTED', properties: ['weight'] } })
-  `).catch(e => log('spider', 'warn', `GDS projection failed: ${e.message}`));
+    CALL gds.graph.project.cypher('undertow-graph',
+      'MATCH (n:Neuron) WHERE ($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns RETURN id(n) AS id',
+      'MATCH (a:Neuron)-[s:SYNAPSE]-(b:Neuron) WHERE ((($ns IS NULL AND a.namespace IS NULL) OR a.namespace = $ns) AND (($ns IS NULL AND b.namespace IS NULL) OR b.namespace = $ns)) RETURN id(a) AS source, id(b) AS target, s.weight AS weight',
+      { parameters: { ns: $ns } })
+  `, { ns }).catch(e => log('spider', 'warn', `GDS projection failed: ${e.message}`));
   await runCypher(`CALL gds.pageRank.write('undertow-graph', { writeProperty: 'pagerank', maxIterations: 20 })`)
     .catch(e => log('spider', 'warn', `PageRank failed: ${e.message}`));
   await runCypher(`CALL gds.betweenness.write('undertow-graph', { writeProperty: 'bridge_score' })`)
@@ -66,18 +71,20 @@ export default {
    * passes (one project-grouped, N random-shuffled) so cross-project bridges
    * get a chance too.
    */
-  async runFullSweep({ runCypher, callAnthropic, config, log }) {
+  async runFullSweep({ runCypher, callAnthropic, config, log, namespace = null }) {
     const daemonConfig = getDaemonConfig('spider');
     const batchSize = daemonConfig.sweepBatchSize || 25;
     const randomPasses = daemonConfig.sweepRandomPasses ?? 2;
     const maxEdges = daemonConfig.maxSweepEdges || 800;
     const startTime = Date.now();
+    const ns = namespace;
 
     const neurons = await runCypher(`
       MATCH (n:Neuron)
+      WHERE ${nsPredicate('n')}
       RETURN elementId(n) AS eid, n.name AS name, n.node_type AS type,
              n.flash_summary AS flash, n.body AS body, n.project AS project
-    `).catch(err => {
+    `, { ns }).catch(err => {
       log('spider', 'error', `sweep fetch failed: ${err.message}`);
       return [];
     });
@@ -182,7 +189,7 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
     log('spider', 'info', `sweep edge discovery done: ${edgesCreated} edges from ${haikuCalls} Haiku calls`);
 
     // Recompute GDS on the denser graph.
-    if (daemonConfig.precomputeGDS) await recomputeGDS(runCypher, log);
+    if (daemonConfig.precomputeGDS) await recomputeGDS(runCypher, log, ns);
 
     const elapsed = Date.now() - startTime;
     log('spider', 'info', `full sweep complete in ${elapsed}ms`, {
@@ -191,13 +198,14 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
     return { mode: 'full', neurons: neurons.length, batches: batchesDone, haikuCalls, edgesCreated, elapsed };
   },
 
-  async run({ runCypher, callAnthropic, config, log }) {
+  async run({ runCypher, callAnthropic, config, log, namespace = null }) {
     const daemonConfig = getDaemonConfig('spider');
     if (!daemonConfig.enabled) {
       log('spider', 'info', 'spider daemon disabled');
       return { processed: 0, created: 0, pruned: 0 };
     }
 
+    const ns = namespace;
     const startTime = Date.now();
     let edgesCreated = 0;
     let neuronsPruned = 0;
@@ -209,11 +217,12 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
     // Find neurons that haven't been spidered yet, or were created since last run
     const unspidered = await runCypher(`
       MATCH (n:Neuron)
-      WHERE n.spidered IS NULL OR n.spidered = false
+      WHERE (n.spidered IS NULL OR n.spidered = false)
+      AND ${nsPredicate('n')}
       RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type
       ORDER BY n.created_at DESC
       LIMIT 20
-    `).catch(err => {
+    `, { ns }).catch(err => {
       log('spider', 'error', `unspidered query failed: ${err.message}`);
       return [];
     });
@@ -224,8 +233,10 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
         // Find neurons with overlapping keywords that aren't already connected
         const candidates = await runCypher(`
           MATCH (source:Neuron {name: $name})
+          WHERE ${nsPredicate('source')}
           MATCH (candidate:Neuron)
           WHERE candidate.name <> source.name
+          AND ${nsPredicate('candidate')}
           AND NOT (source)-[:SYNAPSE]-(candidate)
           // Keyword overlap: split flash summaries into words and find matches
           WITH source, candidate,
@@ -238,7 +249,7 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
                  candidate.node_type AS type, overlap
           ORDER BY overlap DESC
           LIMIT 5
-        `, { name: neuron.name }).catch(err => {
+        `, { name: neuron.name, ns }).catch(err => {
           log('spider', 'error', `candidates query failed for ${neuron.name}: ${err.message}`);
           return [];
         });
@@ -276,14 +287,17 @@ Which of these candidates should be connected to the source? Only include meanin
 
                 await runCypher(`
                   MATCH (src:Neuron {name: $src})
+                  WHERE ${nsPredicate('src')}
                   MATCH (tgt:Neuron {name: $tgt})
-                  WHERE NOT (src)-[:SYNAPSE]-(tgt)
+                  WHERE ${nsPredicate('tgt')}
+                  AND NOT (src)-[:SYNAPSE]-(tgt)
                   CREATE (src)-[:SYNAPSE {
                     weight: $weight, edge_type: $edgeType,
                     context: $context, created_at: datetime(),
                     source: 'spider'
                   }]->(tgt)
                 `, {
+                  ns,
                   src: neuron.name, tgt: conn.target,
                   weight: conn.weight || 0.5,
                   edgeType: conn.edge_type || 'associative',
@@ -297,8 +311,8 @@ Which of these candidates should be connected to the source? Only include meanin
 
         // Mark as spidered
         await runCypher(
-          'MATCH (n:Neuron {name: $name}) SET n.spidered = true, n.spidered_at = datetime()',
-          { name: neuron.name }
+          `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} SET n.spidered = true, n.spidered_at = datetime()`,
+          { name: neuron.name, ns }
         ).catch(e => log('error', 'warn', e.message));
         neuronsProcessed++;
       }
@@ -316,7 +330,8 @@ Which of these candidates should be connected to the source? Only include meanin
       // Find neurons that have completely decayed and were never useful
       const forgotten = await runCypher(`
         MATCH (n:Neuron)
-        WHERE n.tier = 'T3_archive'
+        WHERE ${nsPredicate('n')}
+        AND n.tier = 'T3_archive'
         AND n.times_pursued = 0
         AND n.times_surfaced > 0
         AND n.base_score < $threshold
@@ -328,7 +343,7 @@ Which of these candidates should be connected to the source? Only include meanin
                connectionCount, n.created_at AS created
         ORDER BY n.base_score ASC
         LIMIT 10
-      `, { threshold, minAge: minAgeDays }).catch(err => {
+      `, { threshold, minAge: minAgeDays, ns }).catch(err => {
         log('spider', 'error', `forgotten query failed: ${err.message}`);
         return [];
       });
@@ -337,8 +352,9 @@ Which of these candidates should be connected to the source? Only include meanin
         // Delete the neuron and its synapses
         await runCypher(`
           MATCH (n:Neuron {name: $name})
+          WHERE ${nsPredicate('n')}
           DETACH DELETE n
-        `, { name: node.name }).catch(e => log('error', 'warn', e.message));
+        `, { name: node.name, ns }).catch(e => log('error', 'warn', e.message));
 
         log('spider', 'info', `pruned: ${node.name} (score: ${node.score}, connections: ${node.connectionCount})`);
         neuronsPruned++;
@@ -350,59 +366,7 @@ Which of these candidates should be connected to the source? Only include meanin
     // --- Phase 3: GDS Score Pre-computation ---
     if (daemonConfig.precomputeGDS) {
       log('spider', 'info', 'phase 3: pre-computing GDS scores');
-
-      // Check if we have enough nodes for GDS to be meaningful
-      const countResult = await runCypher('MATCH (n:Neuron) RETURN count(n) AS count').catch(() => [{ count: 0 }]);
-      const nodeCount = countResult[0]?.count?.low ?? countResult[0]?.count ?? 0;
-
-      if (nodeCount >= 10) {
-        try {
-          // Drop existing projection if it exists
-          await runCypher(`CALL gds.graph.drop('undertow-graph', false)`).catch(e => log('error', 'warn', e.message));
-
-          // Create graph projection
-          await runCypher(`
-            CALL gds.graph.project(
-              'undertow-graph',
-              'Neuron',
-              { SYNAPSE: { orientation: 'UNDIRECTED', properties: ['weight'] } }
-            )
-          `).catch(e => {
-            log('spider', 'warn', `GDS projection failed: ${e.message}`);
-          });
-
-          // PageRank
-          await runCypher(`
-            CALL gds.pageRank.write('undertow-graph', {
-              writeProperty: 'pagerank',
-              maxIterations: 20
-            })
-          `).catch(e => log('spider', 'warn', `PageRank failed: ${e.message}`));
-
-          // Betweenness centrality (bridge scores)
-          await runCypher(`
-            CALL gds.betweenness.write('undertow-graph', {
-              writeProperty: 'bridge_score'
-            })
-          `).catch(e => log('spider', 'warn', `Betweenness failed: ${e.message}`));
-
-          // Community detection (Louvain)
-          await runCypher(`
-            CALL gds.louvain.write('undertow-graph', {
-              writeProperty: 'community_id'
-            })
-          `).catch(e => log('spider', 'warn', `Louvain failed: ${e.message}`));
-
-          // Cleanup projection
-          await runCypher(`CALL gds.graph.drop('undertow-graph', false)`).catch(e => log('error', 'warn', e.message));
-
-          log('spider', 'info', 'GDS scores computed: pagerank, bridge_score, community_id');
-        } catch (e) {
-          log('spider', 'warn', `GDS computation failed: ${e.message}. GDS plugin may not be installed.`);
-        }
-      } else {
-        log('spider', 'info', `skipping GDS: only ${nodeCount} neurons (need 10+)`);
-      }
+      await recomputeGDS(runCypher, log, ns);
     }
 
     const elapsed = Date.now() - startTime;

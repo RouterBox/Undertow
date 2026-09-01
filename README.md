@@ -39,6 +39,8 @@ Nobody is building this for AI agents. Every competitor — Mem0, Letta, Cognee,
 
 **Undertow is the part of the brain that fires without being asked.**
 
+And it holds its own on the filing-cabinet tests too: **74.2% on LoCoMo** under a conservative grounding-required protocol — the same band as Zep and Letta's independently-credible numbers. Full results and methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ---
 
 ## How It's Different

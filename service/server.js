@@ -21,12 +21,24 @@ import { getEmbedding, isAvailable as embeddingsAvailable } from './embeddings.j
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT } from './daemons/gobble.js';
 import { handleSummarize, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
+import keeper from './daemons/keeper.js';
+import { sanitizeNamespace } from './namespaces.js';
+import { supersedeNeuron } from './supersede.js';
 
-// Embed a neuron's flash_summary and store the vector (fire-and-forget)
+// Embed a neuron's full text (name + flash + body) and store the vector.
+// Full-text embedding outperforms summary-only by ~14 points Recall@8
+// (eval 2026-09-01); the flashSummary arg remains as a fallback.
 async function embedNeuron(name, flashSummary) {
   if (!embeddingsAvailable()) return;
   try {
-    const embedding = await getEmbedding(flashSummary);
+    const rows = await runCypher(
+      'MATCH (n:Neuron {name: $name}) RETURN n.flash_summary AS flash, n.body AS body LIMIT 1',
+      { name }
+    );
+    const flash = rows[0]?.flash || flashSummary || '';
+    const body = rows[0]?.body || '';
+    const text = `${name}. ${flash} ${body}`.slice(0, 1500);
+    const embedding = await getEmbedding(text);
     if (embedding) {
       await runCypher(
         'MATCH (n:Neuron {name: $name}) SET n.embedding = $embedding',
@@ -129,7 +141,13 @@ async function log(endpoint, level, message, data = {}) {
 
 // --- Clients ---
 const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+// Identity-linked ("All workspaces") API keys require the workspace to act in.
+const anthropic = new Anthropic({
+  apiKey: ANTHROPIC_API_KEY,
+  defaultHeaders: process.env.ANTHROPIC_WORKSPACE_ID
+    ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID }
+    : undefined
+});
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
@@ -213,6 +231,22 @@ app.post('/undertow/mode/:mode', (req, res) => {
 // POST /undertow/query — UserPromptSubmit hook
 app.post('/undertow/query', async (req, res) => {
   if (!undertowEnabled) return res.json({});
+  req.body.namespace = sanitizeNamespace(req.body.namespace);
+  // Keeper gate: only conscious sessions get the involuntary flash pipeline,
+  // and habituated (repeated loop-tick) prompts get nothing even then.
+  const gate = keeper.recordPrompt(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier, req.body.prompt);
+  const sid = String(req.body.session_id || 'default').slice(0, 8);
+  if (gate.habituated) {
+    keeper.countFastPath();
+    log('keeper', 'info', `habituated: repeated prompt from ${sid} — flash suppressed`);
+    return res.json({});
+  }
+  if (gate.tier !== 'conscious') {
+    keeper.countFastPath();
+    log('keeper', 'info', `gated: ${gate.tier} session ${sid} — no flash pipeline`);
+    return res.json({});
+  }
+  if (gate.promoted) log('keeper', 'info', 'session promoted to conscious — flashes begin this turn');
   try {
     const session = getSession(req.body.session_id || 'default');
     const { responseJson } = await handleQuery({
@@ -241,6 +275,14 @@ app.post('/undertow/ingest', async (req, res) => {
   // Respond immediately, process async
   res.json({});
   if (!undertowEnabled) return;
+  // Keeper gate: only conscious sessions form live memories; observers write
+  // to quarantine; drones/candidates form nothing.
+  const ingestTier = keeper.tierOf(req.body.session_id || 'default');
+  if (ingestTier !== 'conscious' && ingestTier !== 'observer') {
+    keeper.countFastPath();
+    log('keeper', 'info', `gated: ${ingestTier} session ${String(req.body.session_id || 'default').slice(0, 8)} — ingest dropped`);
+    return;
+  }
   log('hook', 'info', 'PostToolUse');
 
   try {
@@ -251,7 +293,9 @@ app.post('/undertow/ingest', async (req, res) => {
       embedNeuron,
       getSession,
       randomUUID,
-      log
+      log,
+      // Observer quarantine wins; otherwise a client-declared namespace scopes the write.
+      writeNamespace: ingestTier === 'observer' ? 'quarantine' : sanitizeNamespace(req.body.namespace)
     });
   } catch (e) {
     log('ingest', 'error', e.message);
@@ -262,9 +306,15 @@ app.post('/undertow/ingest', async (req, res) => {
 app.post('/undertow/summarize', async (req, res) => {
   res.json({});
   if (!undertowEnabled) { log('toggle', 'info', 'Undertow DISABLED'); return; }
+  if (!keeper.isConscious(req.body.session_id || 'default')) {
+    keeper.countFastPath();
+    log('keeper', 'info', `gated: ${keeper.tierOf(req.body.session_id || 'default')} session ${String(req.body.session_id || 'default').slice(0, 8)} — summarize skipped`);
+    return;
+  }
   log('hook', 'info', 'Stop');
 
   try {
+    req.body.namespace = sanitizeNamespace(req.body.namespace);
     const session = getSession(req.body.session_id || 'default');
     await handleSummarize({
       req_body: req.body,
@@ -289,8 +339,17 @@ app.post('/undertow/summarize', async (req, res) => {
 // POST /undertow/session-start — SessionStart hook
 app.post('/undertow/session-start', async (req, res) => {
   if (!undertowEnabled) return res.json({});
+  // Keeper: register the session; candidates get no context injection until
+  // they earn attachment (or a cwd rule / explicit tier declares them).
+  const entry = keeper.register(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier);
+  if (entry.tier !== 'conscious') {
+    keeper.countFastPath();
+    log('keeper', 'info', `registered: ${entry.tier} session ${String(req.body.session_id || 'default').slice(0, 8)} — watching, no injection yet`);
+    return res.json({});
+  }
   log('hook', 'info', 'SessionStart');
   try {
+    req.body.namespace = sanitizeNamespace(req.body.namespace);
     const session = getSession(req.body.session_id || 'default');
     const { responseJson } = await handleSessionStart({
       req_body: req.body,
@@ -308,8 +367,10 @@ app.post('/undertow/session-start', async (req, res) => {
 
 // POST /undertow/rehydrate — PostCompact hook
 app.post('/undertow/rehydrate', async (req, res) => {
+  if (!keeper.isConscious(req.body.session_id || 'default')) { keeper.countFastPath(); return res.json({}); }
   log('hook', 'info', 'PostCompact');
   try {
+    req.body.namespace = sanitizeNamespace(req.body.namespace);
     const session = getSession(req.body.session_id || 'default');
     const { responseJson } = await handleRehydrate({
       req_body: req.body,
@@ -681,35 +742,27 @@ app.post('/undertow/correct', async (req, res) => {
     }
 
     if (action === 'update') {
-      const setClauses = ['n.last_surfaced = datetime()', 'n.updated_at = datetime()'];
-      const params = { name: neuron };
-
-      if (flash_summary) {
-        setClauses.push('n.flash_summary = $flash');
-        params.flash = flash_summary;
-      }
-      if (body !== undefined) {
-        setClauses.push('n.body = $body');
-        params.body = body;
-      }
+      // Supersession, not overwrite: the old version is archived and linked
+      // via SUPERSEDES so "what was it before" stays answerable.
+      const superseded = await supersedeNeuron({
+        runCypher, randomUUID, log,
+        name: neuron, ns: null,
+        flash: flash_summary, body: body !== undefined ? body : undefined,
+        reason
+      });
+      if (!superseded) return res.json({ status: 'not_found', neuron });
       if (tier) {
-        setClauses.push('n.tier = $tier');
-        params.tier = tier;
+        await runCypher(`MATCH (n:Neuron {name: $name}) WHERE n.namespace IS NULL AND n.superseded IS NULL SET n.tier = $tier`, { name: neuron, tier });
       }
-
-      await runCypher(
-        `MATCH (n:Neuron {name: $name}) SET ${setClauses.join(', ')} RETURN n.name`,
-        params
-      );
-      // Re-embed when the flash_summary changed — otherwise vector search keeps
-      // matching the stale text and a corrected neuron resurfaces on the old terms.
+      // Re-embed the new version — otherwise vector search keeps matching the
+      // stale text and the corrected neuron resurfaces on the old terms.
       let reEmbedded = false;
       if (flash_summary) {
         await embedNeuron(neuron, flash_summary);
         reEmbedded = embeddingsAvailable();
       }
-      log('correct', 'info', `UPDATED: ${neuron}`, { detail: `reason: ${reason}, changes: ${flash_summary ? 'flash' : ''} ${body !== undefined ? 'body' : ''} ${tier ? 'tier' : ''}${reEmbedded ? ' (re-embedded)' : ''}`.trim() });
-      return res.json({ status: 'updated', neuron, reason, previous: node.flash, reEmbedded });
+      log('correct', 'info', `SUPERSEDED: ${neuron}`, { detail: `reason: ${reason}, changes: ${flash_summary ? 'flash' : ''} ${body !== undefined ? 'body' : ''} ${tier ? 'tier' : ''}${reEmbedded ? ' (re-embedded)' : ''}`.trim() });
+      return res.json({ status: 'superseded', neuron, reason, previous: node.flash, reEmbedded });
     }
 
     res.status(400).json({ error: `unknown action: ${action}. Use update, delete, or demote.` });
@@ -725,7 +778,7 @@ app.post('/undertow/janitor', async (req, res) => {
   if (!isDaemonEnabled('janitor')) return res.json({ status: 'daemon disabled' });
 
   try {
-    const result = await janitor.run({ runCypher, log });
+    const result = await janitor.run({ runCypher, log, namespace: sanitizeNamespace(req.body && req.body.namespace) });
     res.json({ status: 'ok', ...result });
   } catch (e) {
     log('janitor', 'error', e.message);
@@ -771,12 +824,13 @@ app.post('/undertow/spider', async (req, res) => {
   if (!isDaemonEnabled('spider')) return res.json({ status: 'daemon disabled' });
 
   const fullSweep = req.body && req.body.mode === 'full';
+  const spiderNs = sanitizeNamespace(req.body && req.body.namespace);
 
   // Respond with accepted, process async
-  res.json({ status: 'started', mode: fullSweep ? 'full' : 'incremental' });
+  res.json({ status: 'started', mode: fullSweep ? 'full' : 'incremental', namespace: spiderNs || 'live' });
 
   try {
-    const args = { runCypher, callAnthropic, config: getDaemonConfig('spider'), log };
+    const args = { runCypher, callAnthropic, config: getDaemonConfig('spider'), log, namespace: spiderNs };
     const result = fullSweep ? await spider.runFullSweep(args) : await spider.run(args);
     log('spider', 'info', `spider ${fullSweep ? 'full sweep' : 'run'} complete`, { detail: JSON.stringify(result) });
   } catch (e) {
@@ -1024,6 +1078,21 @@ app.post('/undertow/wiki-sync', async (req, res) => {
   }
 });
 
+// GET /undertow/keeper — Keeper ledger snapshot (sessions by tier, fast-path stats)
+app.get('/undertow/keeper', (req, res) => {
+  res.json(keeper.snapshot());
+});
+
+// POST /undertow/keeper — Manual tier override: {"session_id": "...", "tier": "conscious|observer|drone|off|candidate"}
+app.post('/undertow/keeper', (req, res) => {
+  const { session_id, tier } = req.body || {};
+  if (!session_id || !tier) return res.status(400).json({ error: 'session_id and tier required' });
+  const ok = keeper.setTier(session_id, tier);
+  if (!ok) return res.status(400).json({ error: 'invalid tier' });
+  log('keeper', 'info', `manual override: ${String(session_id).slice(0, 8)} → ${tier}`);
+  res.json({ ok: true, session_id, tier });
+});
+
 // GET /undertow/daemon-config — View current daemon configuration
 app.get('/undertow/daemon-config', async (req, res) => {
   const config = await loadConfig();
@@ -1166,6 +1235,7 @@ app.listen(PORT, async () => {
   try {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
+    keeper.init({ log, daemonConfig: daemonCfg.daemons?.keeper });
     const enabledDaemons = Object.entries(daemonCfg.daemons || {})
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);

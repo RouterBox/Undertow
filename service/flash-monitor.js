@@ -16,7 +16,7 @@ const RED = '\x1b[38;2;255;0;0m';
 const MAGENTA = '\x1b[35m';
 const PEACH = '\x1b[38;2;255;171;145m';
 const WHITE = '\x1b[37m';
-const BLUE = '\x1b[34m';
+const BLUE = '\x1b[38;2;100;181;246m'; // light blue — dark ANSI 34 was unreadable on black terminals
 
 let lastSize = 0;
 let flashCount = 0;
@@ -74,6 +74,15 @@ function formatEntry(entry) {
 
   if (entry.endpoint === 'query' && entry.message.startsWith('diversity boost')) {
     return `${YELLOW}  ⚖ ${entry.message}${RESET}\n`;
+  }
+
+  // ─── KEEPER — session gating, habituation, promotions ───
+  if (entry.endpoint === 'keeper') {
+    const icon = entry.message.startsWith('habituated') ? '🔁'
+      : entry.message.includes('promoted') ? '👁'
+      : entry.message.startsWith('registered') ? '🕯'
+      : '🚪';
+    return `${BLUE}  ${icon} keeper: ${entry.message}${RESET}\n`;
   }
 
   // ═══ CONTEXT INJECTION — the full text injected into the agent ═══

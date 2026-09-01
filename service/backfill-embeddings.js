@@ -70,13 +70,14 @@ async function main() {
     const batch = await runCypher(`
       MATCH (n:Neuron)
       WHERE n.embedding IS NULL
-      RETURN n.name AS name, n.flash_summary AS flash
+      RETURN n.name AS name, n.flash_summary AS flash, coalesce(n.body,'') AS body
       LIMIT $limit
     `, { limit: neo4j.int(batchSize) });
 
     if (batch.length === 0) break;
 
-    const texts = batch.map(n => n.flash || n.name);
+    // Full text (name + flash + body) — matches embedNeuron in server.js
+    const texts = batch.map(n => `${n.name}. ${n.flash || ''} ${n.body}`.slice(0, 1500));
     console.log(`  Embedding batch ${Math.floor(processed / batchSize) + 1}: ${batch.length} neurons...`);
 
     const embeddings = await getEmbeddings(texts);

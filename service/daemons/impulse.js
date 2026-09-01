@@ -2,6 +2,8 @@
 // Extracted from server.js — no behavior changes
 
 import neo4j from 'neo4j-driver';
+import { lexicalSearch } from './lexical.js';
+import { nsPredicate, livePredicate } from '../namespaces.js';
 
 // --- Project helpers ---
 
@@ -89,8 +91,14 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
   const { prompt, session_id, cwd } = req_body;
   if (!prompt) return { responseJson: {} };
 
+  // Namespace isolation: a client-declared namespace scopes every read below.
+  // Sticky on the session so later turns without the field stay in-world.
+  const ns = req_body.namespace ?? session.namespace ?? null;
+  if (ns) session.namespace = ns;
+  const cacheScope = `${cwd || ''}::${ns || ''}`;
+
   // Check cache first — same prompt within 60s gets the same response (handles retry storms)
-  const cached = getCachedQuery(prompt, cwd);
+  const cached = getCachedQuery(prompt, cacheScope);
   if (cached) {
     log('query', 'info', `cache hit (${Date.now() - startTime}ms)`);
     return { responseJson: cached };
@@ -141,9 +149,10 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
     // Vector daemon (primary) or keyword daemon (fallback)
     promptEmbedding
       ? runCypher(`
-          CALL db.index.vector.queryNodes('neuron_embedding', 10, $embedding)
+          CALL db.index.vector.queryNodes('neuron_embedding', 25, $embedding)
           YIELD node, score
           WITH node AS n, score AS vectorScore
+          WHERE ${livePredicate('n')}
           WITH n, vectorScore,
                // Topology-aware decay: bridge nodes decay slower
                (CASE n.tier
@@ -158,13 +167,14 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
           RETURN n.uid AS uid, n.name AS name, n.flash_summary AS flash, n.node_type AS type,
                  vectorScore * (liveDecay / 100.0) AS score,
                  'vector' AS daemon, n.community_id AS community_id,
-                 n.project AS project
+                 n.project AS project, toString(n.event_date) AS event_date
           ORDER BY score DESC LIMIT 8
-        `, { embedding: promptEmbedding }).catch(e => { log('query', 'warn', `vector search failed: ${e.message}`); return []; })
+        `, { embedding: promptEmbedding, ns }).catch(e => { log('query', 'warn', `vector search failed: ${e.message}`); return []; })
       : runCypher(`
         UNWIND $keywords AS keyword
         MATCH (n:Neuron)
         WHERE toLower(n.flash_summary) CONTAINS keyword
+        AND ${livePredicate('n')}
         WITH n, count(DISTINCT keyword) AS hits
         WITH n, hits,
              CASE n.tier
@@ -180,7 +190,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
                toFloat(hits) / $keywordCount * (liveDecay / 100.0) AS score,
                'keyword' AS daemon
         ORDER BY score DESC LIMIT 5
-      `, { keywords, keywordCount: neo4j.int(keywords.length) }).catch(e => { log('query', 'error', 'keyword search failed', { detail: e.message }); return []; }),
+      `, { keywords, keywordCount: neo4j.int(keywords.length), ns }).catch(e => { log('query', 'error', 'keyword search failed', { detail: e.message }); return []; }),
 
     // Graph daemon: 2-hop from active topics with decay
     session.activeTopics.length > 0
@@ -188,6 +198,8 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
           UNWIND $topics AS topicName
           MATCH (start:Neuron {name: topicName})-[s:SYNAPSE*1..2]-(related:Neuron)
           WHERE related.name <> topicName
+          AND ${livePredicate('start')}
+          AND ${livePredicate('related')}
           AND ALL(r IN s WHERE r.weight > 0.3)
           WITH DISTINCT related,
                reduce(w = 1.0, r IN s | w * r.weight) AS pathWeight,
@@ -205,13 +217,13 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
                  pathWeight * (liveDecay / 100.0) AS score,
                  'graph' AS daemon
           ORDER BY score DESC LIMIT 5
-        `, { topics: session.activeTopics.slice(0, 5) }).catch(() => [])
+        `, { topics: session.activeTopics.slice(0, 5), ns }).catch(() => [])
       : Promise.resolve([]),
 
     // Temporal daemon: recent episodes with decay
     runCypher(`
         MATCH (n:Neuron)
-        WHERE n.node_type = 'episode'
+        WHERE n.node_type = 'episode' AND ${livePredicate('n')}
         WITH n,
              CASE n.tier
                WHEN 'T1_index' THEN 0.005
@@ -222,9 +234,10 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
         WITH n, n.base_score * exp(-lambda * daysSince) AS liveDecay
         WHERE liveDecay > 15
         RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type,
-               liveDecay / 100.0 AS score, 'temporal' AS daemon
+               liveDecay / 100.0 AS score, 'temporal' AS daemon,
+               toString(n.event_date) AS event_date
         ORDER BY n.last_surfaced DESC LIMIT 3
-      `).catch(() => []),
+      `, { ns }).catch(() => []),
 
     // Contradiction daemon: find facts that might conflict with the prompt
     keywords.length > 2
@@ -232,19 +245,99 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
           UNWIND $keywords AS keyword
           MATCH (n:Neuron)
           WHERE n.node_type IN ['fact', 'insight', 'decision']
+          AND ${livePredicate('n')}
           AND toLower(n.flash_summary) CONTAINS keyword
           WITH n, count(DISTINCT keyword) AS hits
           WHERE hits >= 1
           RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type,
                  0.5 AS score, 'contradiction' AS daemon
           ORDER BY hits DESC LIMIT 3
-        `, { keywords }).catch(() => [])
+        `, { keywords, ns }).catch(() => [])
       : Promise.resolve([])
   ]);
 
+  // Lexical daemon: BM25 over full neuron text — the hybrid half of retrieval
+  // (eval 2026-09-01: lexical beat summary-only vectors on literal queries)
+  let lexicalResults = [];
+  try {
+    lexicalResults = await lexicalSearch({ prompt, runCypher, ns });
+    if (lexicalResults.length) log('query', 'info', `lexical hits: ${lexicalResults.length}`);
+  } catch (e) {
+    log('query', 'warn', `lexical daemon error: ${e.message}`);
+  }
+
+  // Query-seeded graph expansion (added 2026-09-01): expand one hop through
+  // SYNAPSE edges from THIS turn's strongest vector/lexical hits, so chained
+  // associations ride along with direct matches. (The existing graph daemon
+  // expands from session.activeTopics — topic continuity; this one expands
+  // from the current query — multi-hop association.)
+  let expansionResults = [];
+  const seedNames = [...keywordResults, ...lexicalResults].slice(0, 6).map((r) => r.name).filter(Boolean);
+  if (seedNames.length) {
+    expansionResults = await runCypher(`
+      UNWIND $seeds AS s
+      MATCH (seed:Neuron {name: s})-[e:SYNAPSE]-(related:Neuron)
+      WHERE ${livePredicate('seed')} AND ${livePredicate('related')} AND e.weight > 0.3 AND NOT related.name IN $seeds
+      WITH DISTINCT related, max(e.weight) AS w,
+           CASE related.tier WHEN 'T1_index' THEN 0.005 WHEN 'T2_working' THEN 0.02 ELSE 0.05 END AS lambda,
+           duration.between(related.last_surfaced, datetime()).days AS daysSince
+      WITH related, w, related.base_score * exp(-lambda * daysSince) AS liveDecay
+      WHERE liveDecay > 10
+      RETURN related.name AS name, related.flash_summary AS flash, related.node_type AS type,
+             w * 0.8 * (liveDecay / 100.0) AS score, 'graph-query' AS daemon,
+             related.community_id AS community_id, related.project AS project
+      ORDER BY score DESC LIMIT 5
+    `, { seeds: seedNames, ns }).catch(() => []);
+    if (expansionResults.length) log('query', 'info', `graph expansion: +${expansionResults.length} from ${seedNames.length} seeds`);
+  }
+
+  // Multi-hop query decomposition (Wave 1, 2026-09-01): compound prompts get
+  // split into sub-queries so the retrieval union covers each hop separately.
+  // Simple prompts skip the extra Haiku call entirely — zero added latency
+  // for the common case.
+  let subqueryResults = [];
+  const impulseConfig = getDaemonConfig('impulse') || {};
+  const looksCompound = prompt.length > 100 && prompt.split(/\s+/).length > 15 &&
+    /\b(and|then|after|before|because|who|which|while)\b|,/i.test(prompt);
+  if (impulseConfig.decomposeQueries !== false && looksCompound) {
+    try {
+      const d = await callAnthropic(QUERY_MODEL,
+        'Split the user prompt into 1-3 short search queries, each targeting ONE distinct fact needed to answer it. Return ONLY JSON: {"queries": ["..."]}. If the prompt is a single simple question, return it alone.',
+        prompt.substring(0, 600), 200);
+      const dText = d?.response?.content?.[0]?.text || '{}';
+      const dMatch = dText.match(/\{[\s\S]*\}/);
+      const extras = ((dMatch ? JSON.parse(dMatch[0]) : {}).queries || [])
+        .filter((q) => typeof q === 'string' && q.length > 3).slice(0, 3);
+      if (extras.length > 1) {
+        log('query', 'info', `decomposed into ${extras.length} sub-queries`);
+        for (const sq of extras) {
+          const sqEmb = embeddingsAvailable() ? await getEmbedding(sq.substring(0, 300)).catch(() => null) : null;
+          if (sqEmb) {
+            const rows = await runCypher(`
+              CALL db.index.vector.queryNodes('neuron_embedding', 10, $embedding)
+              YIELD node, score
+              WITH node AS n, score AS vectorScore
+              WHERE ${livePredicate('n')} AND vectorScore > 0.5
+              RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type,
+                     vectorScore * 0.7 AS score, 'subquery' AS daemon,
+                     n.community_id AS community_id, n.project AS project
+              ORDER BY score DESC LIMIT 4
+            `, { embedding: sqEmb, ns }).catch(() => []);
+            subqueryResults.push(...rows);
+          }
+          const lexRows = await lexicalSearch({ prompt: sq, runCypher, ns, k: 4 }).catch(() => []);
+          subqueryResults.push(...lexRows.map((r) => ({ ...r, daemon: 'subquery', score: (r.score || 0) * 0.7 })));
+        }
+      }
+    } catch (e) {
+      log('query', 'warn', `decomposition failed: ${e.message}`);
+    }
+  }
+
   // Opus daemon: serve pre-warmed flashes (prepared between turns)
+  // Wonder pre-warms from the live graph only — skip it for namespaced sessions.
   let wonderResults = [];
-  if (isDaemonEnabled('wonder')) {
+  if (!ns && isDaemonEnabled('wonder')) {
     try {
       wonderResults = await wonder.query({ prompt, session, sessionId: session_id, cwd, log });
     } catch (e) {
@@ -266,7 +359,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
   }
 
   // Combine and deduplicate results — wonder first (pre-warmed), then reactive daemons
-  const allResults = [...wonderResults, ...keywordResults, ...graphResults, ...temporalResults, ...contradictionResults, ...researchResults];
+  const allResults = [...wonderResults, ...keywordResults, ...lexicalResults, ...subqueryResults, ...expansionResults, ...graphResults, ...temporalResults, ...contradictionResults, ...researchResults];
   const seen = new Set();
   const unique = allResults.filter(r => {
     if (seen.has(r.name)) return false;
@@ -357,7 +450,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
     });
 
     const rawResult = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: flashBlock } };
-    setCachedQuery(prompt, cwd, rawResult);
+    setCachedQuery(prompt, cacheScope, rawResult);
     return { responseJson: rawResult, session };
   }
 
@@ -368,7 +461,7 @@ Working directory: ${cwd || 'unknown'}
 Active topics: ${session.activeTopics.join(', ') || 'none'}
 
 Candidate memories from graph search:
-${unique.map(r => `- [${r.type}] ${r.name}: ${r.flash}`).join('\n')}
+${unique.map(r => `- [${r.type}] ${r.name}: ${r.flash}${r.event_date ? ` (on ${r.event_date})` : ''}`).join('\n')}
 
 Evaluate these candidates. Which are worth surfacing? Craft flash summaries for the relevant ones. Return JSON.`);
   if (!queryResult) return { responseJson: {}, session };
@@ -437,12 +530,12 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
     log('injection', 'info', 'CONTEXT INJECTED', { detail: flashBlock });
 
     const haikuResult = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: flashBlock } };
-    setCachedQuery(prompt, cwd, haikuResult);
+    setCachedQuery(prompt, cacheScope, haikuResult);
     return { responseJson: haikuResult, session };
   }
 
   log('query', 'info', 'no flashes to inject');
-  setCachedQuery(prompt, cwd, {}); // Cache empty results too — don't re-run for nothing
+  setCachedQuery(prompt, cacheScope, {}); // Cache empty results too — don't re-run for nothing
   return { responseJson: {}, session };
 }
 

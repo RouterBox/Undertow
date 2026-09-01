@@ -80,6 +80,15 @@ async function saveState(state) {
 
 // --- Find session files ---
 
+// Project directory names to exclude (case-insensitive substring match).
+// These are work repos that should never be ingested into the personal memory graph.
+const EXCLUDED_PROJECT_PATTERNS = ['united', 'cls.', 'gershwin'];
+
+function isExcludedProject(projectName) {
+  const lower = projectName.toLowerCase();
+  return EXCLUDED_PROJECT_PATTERNS.some(pattern => lower.includes(pattern));
+}
+
 async function findSessions() {
   const claudeDir = join(homedir(), '.claude', 'projects');
   const sessions = [];
@@ -87,6 +96,10 @@ async function findSessions() {
   try {
     const projects = await readdir(claudeDir);
     for (const project of projects) {
+      if (isExcludedProject(project)) {
+        console.log(`  Skipping excluded project: ${project}`);
+        continue;
+      }
       const projectDir = join(claudeDir, project);
       try {
         const files = await readdir(projectDir);
@@ -130,7 +143,7 @@ async function processSession(session) {
   for (const line of lines) {
     try {
       const msg = JSON.parse(line);
-      if (msg.type === 'human' || msg.role === 'user') {
+      if (msg.type === 'user' || msg.message?.role === 'user') {
         if (currentTurn.user && currentTurn.assistant) {
           turns.push({ ...currentTurn });
           currentTurn = { user: '', assistant: '', tools: [] };
@@ -268,7 +281,7 @@ async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
   const maxSessions = parseInt(args[args.indexOf('--max-sessions') + 1]) || 15;
-  const specificSession = args[args.indexOf('--session') + 1];
+  const specificSession = args.includes('--session') ? args[args.indexOf('--session') + 1] : undefined;
 
   console.log('Undertow Historical Ingestion');
   console.log('============================\n');

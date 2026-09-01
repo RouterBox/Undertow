@@ -2,6 +2,8 @@
 // Extracted from server.js — no behavior changes
 
 import { readFile } from 'fs/promises';
+import { nsPredicate, livePredicate } from '../namespaces.js';
+import { supersedeNeuron } from '../supersede.js';
 
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
 const SUMMARIZE_MODEL = 'claude-sonnet-4-6';
@@ -28,10 +30,10 @@ PURSUIT DETECTION:
 Return JSON:
 {
   "insights": [
-    {"name": "2-5 word label", "node_type": "fact|concept|decision|insight", "tier": "T2_working", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "connections": []}
+    {"name": "2-5 word label", "node_type": "fact|concept|decision|insight", "tier": "T2_working", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "event_date": "YYYY-MM-DD only when the remembered event has a clear date; omit otherwise", "connections": []}
   ],
   "updates": [
-    {"existing_name": "neuron to update", "flash_summary": "new summary", "body": "new body", "reason": "what changed"}
+    {"existing_name": "neuron to update", "flash_summary": "new summary", "body": "new body", "reason": "what changed", "event_date": "YYYY-MM-DD optional"}
   ],
   "train_of_thought": ["conceptual topic 1", "conceptual topic 2"],
   "flash_results": [
@@ -55,6 +57,11 @@ Only include memories that are likely relevant to the working directory or recen
 
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log }) {
   const { session_id, transcript_path, cwd } = req_body;
+
+  // Namespace isolation: writes and reinforcement stay inside the session's
+  // declared namespace (null = live graph).
+  const ns = req_body.namespace ?? session.namespace ?? null;
+  if (ns) session.namespace = ns;
 
   // Read transcript if available
   let transcript = '';
@@ -95,29 +102,23 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     return;
   }
 
-  // Process updates to existing neurons
+  // Process updates to existing neurons — supersession, not overwrite:
+  // the old version is archived and linked via SUPERSEDES.
   if (parsed.updates?.length) {
     for (const upd of parsed.updates) {
-      const setClauses = ['n.last_surfaced = datetime()', 'n.updated_at = datetime()'];
-      const params = { name: upd.existing_name };
-
-      if (upd.flash_summary) {
-        setClauses.push('n.flash_summary = $flash');
-        params.flash = upd.flash_summary;
-      }
-      if (upd.body) {
-        setClauses.push('n.body = $body');
-        params.body = upd.body;
-      }
-
-      await runCypher(
-        `MATCH (n:Neuron {name: $name}) SET ${setClauses.join(', ')} RETURN n.name`,
-        params
-      ).catch(e => log('error', 'warn', e.message));
-
-      log('summarize', 'info', `UPDATED: ${upd.existing_name}`, {
-        detail: `reason: ${upd.reason || 'not specified'}`
+      const superseded = await supersedeNeuron({
+        runCypher, callAnthropic, randomUUID, log,
+        name: upd.existing_name, ns,
+        flash: upd.flash_summary, body: upd.body,
+        eventDate: upd.event_date || null,
+        reason: upd.reason || 'updated at turn summarize'
       });
+      if (superseded) {
+        log('summarize', 'info', `SUPERSEDED: ${upd.existing_name}`, {
+          detail: `reason: ${upd.reason || 'not specified'}`
+        });
+        embedNeuron(upd.existing_name, upd.flash_summary || '').catch(e => log('error', 'warn', e.message));
+      }
     }
   }
 
@@ -125,22 +126,25 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   if (parsed.insights?.length) {
     for (const insight of parsed.insights) {
       const existing = await runCypher(
-        'MATCH (n:Neuron {name: $name}) RETURN n.name LIMIT 1',
-        { name: insight.name }
+        `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} RETURN n.name LIMIT 1`,
+        { name: insight.name, ns }
       );
       if (existing.length === 0) {
+        const eventDate = typeof insight.event_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(insight.event_date) ? insight.event_date : null;
         await runCypher(`
             CREATE (n:Neuron {
               uid: $uid, name: $name, node_type: $type, tier: $tier,
               flash_summary: $flash, body: $body,
               source: 'conversation', decay_score: 50, base_score: 50,
               times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
-              created_at: datetime(), last_surfaced: datetime()
+              created_at: datetime(), last_surfaced: datetime(),
+              namespace: $ns,
+              event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
             })
           `, {
           uid: randomUUID(), name: insight.name, type: insight.node_type || 'insight',
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
-          body: insight.body || ''
+          body: insight.body || '', ns, eventDate
         });
 
         // Create connections for insights
@@ -148,13 +152,15 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           for (const conn of insight.connections) {
             await runCypher(`
                 MATCH (src:Neuron {name: $src})
+                WHERE ${nsPredicate('src')}
                 MATCH (tgt:Neuron {name: $tgt})
+                WHERE ${nsPredicate('tgt')}
                 CREATE (src)-[:SYNAPSE {
                   weight: $weight, edge_type: $edgeType,
                   context: $context, created_at: datetime()
                 }]->(tgt)
               `, {
-              src: insight.name, tgt: conn.target_name,
+              src: insight.name, tgt: conn.target_name, ns,
               weight: conn.weight || 0.5, edgeType: conn.edge_type || 'associative',
               context: conn.context || ''
             }).catch(e => log('error', 'warn', e.message));
@@ -173,8 +179,8 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
       // Ensure topic neurons exist
       for (const topic of [topics[i], topics[i + 1]]) {
         const exists = await runCypher(
-          'MATCH (n:Neuron {name: $name}) RETURN n.name LIMIT 1',
-          { name: topic }
+          `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} RETURN n.name LIMIT 1`,
+          { name: topic, ns }
         );
         if (exists.length === 0) {
           await runCypher(`
@@ -183,21 +189,24 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
                 flash_summary: $name, body: '',
                 source: 'conversation', decay_score: 50, base_score: 50,
                 times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
-                created_at: datetime(), last_surfaced: datetime()
+                created_at: datetime(), last_surfaced: datetime(),
+                namespace: $ns
               })
-            `, { name: topic, uid: randomUUID() });
+            `, { name: topic, uid: randomUUID(), ns });
         }
       }
 
       // Create temporal synapse
       await runCypher(`
           MATCH (a:Neuron {name: $src})
+          WHERE ${nsPredicate('a')}
           MATCH (b:Neuron {name: $tgt})
+          WHERE ${nsPredicate('b')}
           CREATE (a)-[:SYNAPSE {
             weight: 0.5, edge_type: 'temporal',
             context: 'Train of thought progression', created_at: datetime()
           }]->(b)
-        `, { src: topics[i], tgt: topics[i + 1] }).catch(e => log('error', 'warn', e.message));
+        `, { src: topics[i], tgt: topics[i + 1], ns }).catch(e => log('error', 'warn', e.message));
     }
     log('summarize', 'info', `train: ${topics.join(' → ')}`);
   }
@@ -224,10 +233,11 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
 
           await runCypher(`
               MATCH (n:Neuron {name: $name})
+              WHERE ${nsPredicate('n')}
               SET n.times_pursued = n.times_pursued + 1,
                   n.base_score = CASE WHEN $reinforce THEN n.base_score + 10 ELSE n.base_score END,
                   n.last_surfaced = datetime()
-            `, { name: neuronName, reinforce: !alreadyReinforced }).catch(e => log('error', 'warn', e.message));
+            `, { name: neuronName, reinforce: !alreadyReinforced, ns }).catch(e => log('error', 'warn', e.message));
 
           // Per-daemon pursuit counter
           await runCypher(`
@@ -240,28 +250,32 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
             // Strengthen outbound synapses only (directional reinforcement)
             await runCypher(`
                 MATCH (n:Neuron {name: $name})-[s:SYNAPSE]->()
+                WHERE ${nsPredicate('n')}
                 SET s.weight = CASE WHEN s.weight + 0.05 > 0.95 THEN 0.95 ELSE s.weight + 0.05 END
-              `, { name: neuronName }).catch(e => log('error', 'warn', e.message));
+              `, { name: neuronName, ns }).catch(e => log('error', 'warn', e.message));
             session.pursuedThisSession.add(neuronName);
 
             // Interference suppression: neurons in the same community
             await runCypher(`
                 MATCH (pursued:Neuron {name: $name})
                 WHERE pursued.community_id IS NOT NULL
+                AND ${nsPredicate('pursued')}
                 MATCH (similar:Neuron)
                 WHERE similar.community_id = pursued.community_id
+                AND ${nsPredicate('similar')}
                 AND similar.name <> pursued.name
                 AND similar.name IN $otherNeurons
                 SET similar.base_score = CASE WHEN similar.base_score > 5 THEN similar.base_score - 2 ELSE similar.base_score END
-              `, { name: neuronName, otherNeurons: flashEntry.sourceNeurons }).catch(e => log('error', 'warn', e.message));
+              `, { name: neuronName, otherNeurons: flashEntry.sourceNeurons, ns }).catch(e => log('error', 'warn', e.message));
           }
         } else if (isInDomain) {
           // FAIR DISMISSAL: Only penalize if neuron is from the same project
           await runCypher(`
               MATCH (n:Neuron {name: $name})
+              WHERE ${nsPredicate('n')}
               SET n.times_dismissed = n.times_dismissed + 1,
                   n.last_surfaced = datetime()
-            `, { name: neuronName }).catch(e => log('error', 'warn', e.message));
+            `, { name: neuronName, ns }).catch(e => log('error', 'warn', e.message));
 
           // Per-daemon dismissal counter (same-domain only — cross-project skips
           // are intentionally not counted against the daemon)
@@ -274,8 +288,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           // Weaken related synapses (same-project dismissal only)
           await runCypher(`
               MATCH (n:Neuron {name: $name})-[s:SYNAPSE]-()
+              WHERE ${nsPredicate('n')}
               SET s.weight = CASE WHEN s.weight - 0.02 < 0.0 THEN 0.0 ELSE s.weight - 0.02 END
-            `, { name: neuronName }).catch(e => log('error', 'warn', e.message));
+            `, { name: neuronName, ns }).catch(e => log('error', 'warn', e.message));
         } else {
           // Cross-project dismissal — neutral skip, no penalty
           log('summarize', 'info', `pursuit: ○ skip (cross-project) "${neuronName.substring(0, 50)}"`, { detail: 'no penalty — wrong domain' });
@@ -300,7 +315,8 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   }
 
   // Opus daemon: prepare flashes for next turn using full transcript context
-  if (isDaemonEnabled('wonder')) {
+  // (live graph only — skip for namespaced sessions)
+  if (!ns && isDaemonEnabled('wonder')) {
     log('summarize', 'info', 'triggering wonder daemon');
     wonder.prepare({
       session, transcriptPath: transcript_path, cwd, sessionId: session_id,
@@ -314,20 +330,21 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   const spiderConfig = getDaemonConfig('spider');
   if (isDaemonEnabled('spider') && spiderConfig.schedule === 'session-end') {
     log('summarize', 'info', 'triggering spider daemon');
-    spider.run({ runCypher, callAnthropic, config: spiderConfig, log }).catch(e => {
+    spider.run({ runCypher, callAnthropic, config: spiderConfig, log, namespace: ns }).catch(e => {
       log('spider', 'error', `spider failed during summarize: ${e.message}`);
     });
   }
 
   // Janitor daemon — clean up garbage neurons
   if (isDaemonEnabled('janitor')) {
-    janitor.run({ runCypher, log }).catch(e => {
+    janitor.run({ runCypher, log, namespace: ns }).catch(e => {
       log('janitor', 'error', `janitor failed: ${e.message}`);
     });
   }
 
   // Perplexity deep research — feeds the graph with research on session topics
-  if (isDaemonEnabled('prowler') && session.activeTopics.length > 0) {
+  // (writes to the live graph — skip for namespaced sessions)
+  if (!ns && isDaemonEnabled('prowler') && session.activeTopics.length > 0) {
     log('summarize', 'info', 'triggering prowler daemon');
     prowler.deepResearch({ topics: session.activeTopics, runCypher, log }).catch(e => {
       log('prowler', 'error', `prowler failed: ${e.message}`);
@@ -339,14 +356,17 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
 
 async function handleSessionStart({ req_body, session, runCypher, callAnthropic, log }) {
   const { cwd } = req_body;
+  const ns = req_body.namespace ?? session.namespace ?? null;
+  if (ns) session.namespace = ns;
 
   // Load T1 neurons
   const t1Neurons = await runCypher(`
       MATCH (n:Neuron)
       WHERE n.tier = 'T1_index' AND n.decay_score > 20
+      AND ${livePredicate('n')}
       RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type
       ORDER BY n.decay_score DESC LIMIT 20
-    `);
+    `, { ns });
 
   if (t1Neurons.length === 0) {
     return { responseJson: {} };
@@ -378,14 +398,16 @@ async function handleRehydrate({ req_body, session, runCypher, log }) {
   if (session.activeTopics.length === 0) {
     return { responseJson: {} };
   }
+  const ns = req_body.namespace ?? session.namespace ?? null;
 
   const relevant = await runCypher(`
       UNWIND $topics AS topicName
       MATCH (n:Neuron)
-      WHERE n.name = topicName OR n.flash_summary CONTAINS topicName
+      WHERE (n.name = topicName OR n.flash_summary CONTAINS topicName)
+      AND ${livePredicate('n')}
       RETURN DISTINCT n.name AS name, n.flash_summary AS flash, n.decay_score AS score
       ORDER BY score DESC LIMIT 10
-    `, { topics: session.activeTopics });
+    `, { topics: session.activeTopics, ns });
 
   if (relevant.length === 0) {
     return { responseJson: {} };

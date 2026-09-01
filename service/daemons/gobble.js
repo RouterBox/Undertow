@@ -1,6 +1,8 @@
 // gobble.js — Gobble daemon (memory ingestion from tool events)
 // Extracted from server.js — no behavior changes
 
+import { supersedeNeuron } from '../supersede.js';
+
 const INGEST_SYSTEM_PROMPT = `You are Undertow's memory writer. You evaluate tool events from a Claude Code session and decide what's worth remembering in a persistent knowledge graph.
 
 You receive: tool_name, tool_input (partial), tool_response (partial).
@@ -48,7 +50,8 @@ CREATE — new memory that doesn't exist in the graph yet:
     "node_type": "fact" | "concept" | "decision" | "episode" | "insight" | "preference",
     "tier": "T1_index" | "T2_working" | "T3_archive",
     "flash_summary": "one sentence, <100 chars, useful out of context",
-    "body": "2-5 sentences of actual content — the reasoning, context, and details that make this worth remembering"
+    "body": "2-5 sentences of actual content — the reasoning, context, and details that make this worth remembering",
+    "event_date": "YYYY-MM-DD — ONLY when the remembered event/decision has a clear date in the content; omit otherwise"
   },
   "connections": [
     {"target_name": "existing neuron name", "edge_type": "associative|temporal|causal|contradicts|contains", "weight": 0.5, "context": "why connected"}
@@ -63,8 +66,11 @@ UPDATE — an existing fact/topic has CHANGED and the stored version is now wron
     "flash_summary": "new one-sentence summary reflecting the change",
     "body": "optional updated body content"
   },
-  "reason": "brief explanation of what changed and why the old version is wrong"
+  "reason": "brief explanation of what changed and why the old version is wrong",
+  "event_date": "YYYY-MM-DD — optional, date the change happened if stated"
 }
+
+(The old version is not lost: the system archives it and links the new fact to it, so "what was it before" stays answerable.)
 
 Use UPDATE when:
 - A project status changed (milestone completed, blocker resolved)
@@ -82,7 +88,7 @@ If in doubt, SKIP. A graph with 50 high-quality neurons beats one with 500 noisy
 
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
 
-async function handleIngest({ req_body, runCypher, callAnthropic, embedNeuron, getSession, randomUUID, log }) {
+async function handleIngest({ req_body, runCypher, callAnthropic, embedNeuron, getSession, randomUUID, log, writeNamespace = null }) {
   const body = req_body;
 
   // Claude Code hook payload uses different field names — normalize
@@ -143,33 +149,24 @@ Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
 
   if (parsed.action === 'skip') return;
 
-  // Handle UPDATE action
+  // Handle UPDATE action — supersession, not overwrite. The old version
+  // becomes an archived neuron linked by SUPERSEDES, so "what was it before"
+  // stays answerable and nothing is silently lost.
   if (parsed.action === 'update' && parsed.existing_name) {
     const updates = parsed.updates || {};
-    const setClauses = [];
-    const params = { name: parsed.existing_name };
-
-    if (updates.flash_summary) {
-      setClauses.push('n.flash_summary = $flash');
-      params.flash = updates.flash_summary;
-    }
-    if (updates.body) {
-      setClauses.push('n.body = $body');
-      params.body = updates.body;
-    }
-    setClauses.push('n.last_surfaced = datetime()');
-    setClauses.push('n.updated_at = datetime()');
-
-    if (setClauses.length > 0) {
-      await runCypher(
-        `MATCH (n:Neuron {name: $name}) SET ${setClauses.join(', ')} RETURN n.name`,
-        params
-      ).catch(e => log('error', 'warn', e.message));
-    }
-
-    log('ingest', 'info', `UPDATED: ${parsed.existing_name}`, {
-      detail: `reason: ${parsed.reason || 'not specified'}`
+    const superseded = await supersedeNeuron({
+      runCypher, randomUUID, log,
+      name: parsed.existing_name, ns: writeNamespace,
+      flash: updates.flash_summary, body: updates.body,
+      eventDate: parsed.event_date || null,
+      reason: parsed.reason || 'updated by ingestion'
     });
+    if (superseded) {
+      log('ingest', 'info', `SUPERSEDED: ${parsed.existing_name}`, {
+        detail: `reason: ${parsed.reason || 'not specified'}`
+      });
+      embedNeuron(parsed.existing_name, updates.flash_summary || '').catch(e => log('error', 'warn', e.message));
+    }
     return;
   }
 
@@ -179,20 +176,24 @@ Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
   if (parsed.action === 'create') {
     // Check for existing neuron with same name
     const existing = await runCypher(
-      'MATCH (n:Neuron {name: $name}) RETURN n.name AS name LIMIT 1',
-      { name: n.name }
+      `MATCH (n:Neuron {name: $name})
+       WHERE (n.namespace IS NULL AND $ns IS NULL) OR n.namespace = $ns
+       RETURN n.name AS name LIMIT 1`,
+      { name: n.name, ns: writeNamespace }
     );
 
     if (existing.length > 0) {
       // Update existing
       await runCypher(`
           MATCH (n:Neuron {name: $name})
+          WHERE (n.namespace IS NULL AND $ns IS NULL) OR n.namespace = $ns
           SET n.flash_summary = $flash, n.body = coalesce($body, n.body),
               n.last_surfaced = datetime()
-        `, { name: n.name, flash: n.flash_summary, body: n.body || '' });
+        `, { name: n.name, flash: n.flash_summary, body: n.body || '', ns: writeNamespace });
     } else {
       // Create new (auto-tag with current project)
       const sessionForProject = getSession(body.session_id || body.sessionId || 'default');
+      const eventDate = typeof n.event_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(n.event_date) ? n.event_date : null;
       await runCypher(`
           CREATE (n:Neuron {
             uid: $uid, name: $name, node_type: $type, tier: $tier,
@@ -200,12 +201,14 @@ Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
             source: 'conversation', decay_score: 50, base_score: 50,
             times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
             created_at: datetime(), last_surfaced: datetime(),
-            project: $project
+            project: $project, namespace: $ns,
+            event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
           })
         `, {
         uid: randomUUID(), name: n.name, type: n.node_type || 'fact', tier: n.tier || 'T2_working',
         flash: n.flash_summary, body: n.body || '',
-        project: sessionForProject.currentProject || 'general'
+        project: sessionForProject.currentProject || 'general',
+        ns: writeNamespace, eventDate
       });
     }
 

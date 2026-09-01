@@ -3,3 +3,6 @@ node_modules/
 logs/
 .ingest-history-state.json
 .undertow-enabled
+.env.bak-*
+*.log
+keeper-ledger.json
