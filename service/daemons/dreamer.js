@@ -53,6 +53,27 @@ Undertow context:
 
 Only include memories that are likely relevant to the working directory or recent activity. Skip generic/stale memories.`;
 
+// Ouroboros guard (2026-09-02): Undertow's own injected flashes are recorded
+// into session transcripts, so summarizing raw transcript text would let the
+// graph re-memorize its own output (memory echo). Strip injected blocks first.
+function stripUndertowInjections(text) {
+  const lines = String(text || '').split('\n');
+  const out = [];
+  let inBlock = false;
+  for (const line of lines) {
+    if (/^\s*\[UNDERTOW-(FLASH|SESSION-START|REHYDRATE)\]/.test(line)) { inBlock = true; continue; }
+    if (inBlock) {
+      if (/^(Haiku interpretation:|Raw neurons:|Neuron handles:|Undertow context:)/.test(line) ||
+          /^\s*[~\-]\s/.test(line) || /^\s{2,}\S/.test(line) || line.trim() === '') {
+        continue; // still inside the injected block
+      }
+      inBlock = false;
+    }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 // --- Summarize handler (Stop hook) ---
 
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log }) {
@@ -68,7 +89,7 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   if (transcript_path) {
     try {
       const raw = await readFile(transcript_path, 'utf8');
-      transcript = raw.slice(-2000);
+      transcript = stripUndertowInjections(raw).slice(-2000);
     } catch {
       transcript = '[transcript unavailable]';
     }

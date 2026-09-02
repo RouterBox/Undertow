@@ -47,10 +47,24 @@ let dirty = false;
 let logFn = () => {};
 let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0 };
 
+// A prompt that is harness plumbing rather than a human thought — task
+// notifications, system reminders — never deserves the involuntary layer.
+// (2026-09-01 audit: 74% of full pipeline runs were leaked loop ticks whose
+// letter-only task ids slipped past digit-based normalization.)
+function isSystemPlumbing(text) {
+  const t = String(text || '');
+  return t.includes('[SYSTEM NOTIFICATION - NOT USER INPUT]') || t.includes('<task-notification>');
+}
+
 // Normalize away ids, numbers, and whitespace so "task b3dzfglw4 completed"
-// and "task bqyh0yi1q completed" fingerprint identically.
+// and "task bqyh0yi1q completed" fingerprint identically. Structural rules
+// first: task/tool ids and task output paths are ids even when they contain
+// no digits (e.g. "bepwhfzgs"), so the digit rule alone misses them.
 function fingerprint(text) {
   const norm = String(text || '').toLowerCase()
+    .replace(/<task-id>[^<]*<\/task-id>/g, '<task-id>#</task-id>')
+    .replace(/<tool-use-id>[^<]*<\/tool-use-id>/g, '<tool-use-id>#</tool-use-id>')
+    .replace(/tasks[\\/][a-z0-9_-]+\.output/g, 'tasks/#.output')
     .replace(/[a-z0-9]*\d[a-z0-9]*/g, '#')
     .replace(/\s+/g, ' ')
     .trim()
@@ -148,6 +162,13 @@ const keeper = {
     if (!config.enabled) return { tier: 'conscious', promoted: false, habituated: false };
     const e = getEntry(sessionId, cwd, explicitTier);
     const t = now();
+
+    // System plumbing (task notifications, system reminders) is never a human
+    // thought — suppress unconditionally, no fingerprint or window needed.
+    if (promptText && isSystemPlumbing(promptText)) {
+      stats.habituated++;
+      return { tier: e.tier, promoted: false, habituated: true };
+    }
 
     // Habituation: repeated near-identical prompts are loop ticks. They keep
     // the session alive but earn no flashes and no promotion credit.
