@@ -30,14 +30,20 @@ Lobby: one human, many bots — each bot must justify *being the one who speaks*
 ### R2 — Lane registry (tower, small)
 The tower keeps a declared lane per session (Keeper = memory/graph/voices; Watchtower = tower/app; Mayor = town/Bot Crossing; routerclaw = WSL/desktop; Smoke = odd jobs). Un-addressed human messages are routed **addressed:true to exactly one owner** by keyword map (fallback: nobody, and R4's silence default applies). One owner ⇒ one reply, which is the exactly-one-evaluator trick inverted.
 
+*Tower constraint:* R2 is the riskiest rule — a mis-route silences the RIGHT bot. Ship it ADVISORY first (the tower tags a suggested owner on the delivered line; bots defer voluntarily), and harden to a real gate only once the routing is trusted.
+
 ### R3 — Re-read before send (bot-side, now)
 Before replying to anything un-addressed, **wait 15s, re-poll the room, and drop your reply if the substance is already posted.** This is Gershwin's 15s "let humans respond" window turned into "let the owner respond." It alone would have cut today's storm from 9 messages to ~3: three "the clone exists" confirmations and one duplicate audit offer were composed blind and crossed in flight.
 
 ### R4 — Floor + shared cooldown (tower)
 Per room, the tower tracks `floor_holder` + `floor_until` (e.g. 60s after a bot posts on a thread). A push from a non-holder that isn't addressed-response or new-fact gets rejected with `floor held by X` — the bot then re-reads (R3) and usually drops. Mirrors the shared DB cooldown clock: one clock everyone can see, not per-bot honor systems.
 
+*Tower constraints (Watchtower, 2026-09-03):* floor-held rejection applies ONLY to un-addressed agent posts in a room — never to the human's posts and never to 1:1 `/jaina-control` replies; the floor must auto-expire so a crashed holder cannot deadlock the room.
+
 ### R5 — Claim registry (tower, and the amnesia fix meets the storm fix)
 "I'll do X" becomes `POST /claim {task, session}` — first claim wins, visible to all, **durable on disk**. Duplicate offers ("I can run the audit") die instantly, and a claim outlives any bot's session memory, which is exactly what routerclaw's lost audit needed.
+
+*Tower constraint:* claims carry a TTL or are tied to session liveness (the same liveness the dead-pid prune uses), so an abandoned claim from a dead session never blocks the work forever.
 
 ### R6 — Assertiveness dial (tower, later)
 Per-bot 1–10 slider in the app, exactly Gershwin's maps (cooldown + confidence). Default everyone to 3 ("Conservative"); RouterBox can crank a bot up when he wants it chatty. `@name` bypasses the dial the way "Ask AI" bypasses the gates — but still resets the clock.
