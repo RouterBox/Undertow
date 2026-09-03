@@ -46,6 +46,28 @@ function isResearchWorthy(prompt) {
   return true;
 }
 
+// Swarm-internal lexicon: agent nicknames, rooms, and machinery of the local
+// agent swarm. A topic mentioning these is conversation about the swarm
+// itself — the open web has no context for it and can only hallucinate
+// (2026-09-03 audit: lobby chatter yielded 9 wrong-domain research neurons,
+// e.g. "Watchtower chat room etiquette" answered with Jehovah's Witness
+// guidance). Extend via daemon-config.json → prowler.swarmLexicon.
+const SWARM_LEXICON = [
+  'lobby', 'watchtower', 'mayor', 'keeper', 'routerbox', 'jaina',
+  'bot crossing', 'botcrossing', 'bot-crossing', 'undertow', 'swarm',
+  'roster', 'voice registry', 'voice pool', 'nickname', 'tower',
+  'routerdroid', 'routerclaw', 'openclaw', 'agentbox', 'pixel 9',
+  'elevenlabs', 'george voice', 'daniel voice'
+];
+
+function isSwarmInternal(text, extra) {
+  const t = String(text || '').toLowerCase();
+  // A bare PR/issue number is always about one of our own repos
+  if (/\b(pr|pull request|issue)\s*#?\d+\b/i.test(t)) return true;
+  const lexicon = Array.isArray(extra) ? [...SWARM_LEXICON, ...extra.map(s => String(s).toLowerCase())] : SWARM_LEXICON;
+  return lexicon.some(term => t.includes(term));
+}
+
 // Detect if a topic string is a genuine researchable concept vs conversation metadata
 function isResearchableTopic(topic) {
   if (!topic || topic.length < 5) return false;
@@ -89,6 +111,12 @@ export default {
     // Strict gate: only fire on genuinely research-worthy prompts
     if (!isResearchWorthy(prompt)) return [];
 
+    // Swarm-internal turns never go to the web
+    if (isSwarmInternal(prompt, daemonConfig.swarmLexicon)) {
+      log('research', 'info', 'brave skipped: swarm-internal prompt');
+      return [];
+    }
+
     const searchTerms = keywords.filter(w => w.length > 4).slice(0, 5).join(' ');
     if (searchTerms.length < 15) return [];
 
@@ -126,8 +154,13 @@ export default {
     if (!perplexityKey) return { neurons: 0 };
     if (!topics || topics.length === 0) return { neurons: 0 };
 
-    // Filter to genuinely researchable topics
-    const researchable = topics.filter(isResearchableTopic);
+    // Filter to genuinely researchable topics that aren't about the swarm itself
+    const researchable = topics.filter(t =>
+      isResearchableTopic(t) && !isSwarmInternal(t, daemonConfig.swarmLexicon));
+    const swarmSkipped = topics.filter(t => isResearchableTopic(t) && isSwarmInternal(t, daemonConfig.swarmLexicon)).length;
+    if (swarmSkipped > 0) {
+      log('research', 'info', `deep research: ${swarmSkipped} swarm-internal topics skipped`);
+    }
     if (researchable.length === 0) {
       log('research', 'info', `deep research: 0 researchable topics from ${topics.length} candidates`);
       return { neurons: 0 };
