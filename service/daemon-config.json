@@ -48,6 +48,11 @@
       "syncOnSessionEnd": true,
       "generateClusters": true,
       "minNeuronScore": 10
+    },
+    "vaultwatch": {
+      "enabled": false,
+      "watches": [],
+      "debounceMs": 2000
     }
   },
   "global": {

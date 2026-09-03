@@ -6,3 +6,4 @@ logs/
 .env.bak-*
 *.log
 keeper-ledger.json
+vault-ledger.json

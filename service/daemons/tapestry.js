@@ -9,6 +9,7 @@ import { mkdir, writeFile, readdir, unlink } from 'fs/promises';
 import { join, resolve, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { getDaemonConfig } from './loader.js';
 
 // Project root = two levels up from this file (service/daemons/tapestry.js)
@@ -54,6 +55,7 @@ export default {
     // --- Fetch all neurons ---
     const neurons = await runCypher(`
       MATCH (n:Neuron)
+      WHERE n.namespace IS NULL AND n.superseded IS NULL
       WITH n,
            CASE n.tier WHEN 'T1_index' THEN 0.005 WHEN 'T2_working' THEN 0.02 ELSE 0.05 END AS lambda,
            duration.between(n.last_surfaced, datetime()).days AS daysSince
@@ -73,10 +75,13 @@ export default {
     `, { minScore }).catch(() => []);
 
     log('tapestry', 'info', `generating vault for ${neurons.length} neurons`);
+    const manifestPages = [];
 
     // --- Fetch all synapses ---
     const synapses = await runCypher(`
       MATCH (a:Neuron)-[s:SYNAPSE]->(b:Neuron)
+      WHERE a.namespace IS NULL AND a.superseded IS NULL
+      AND b.namespace IS NULL AND b.superseded IS NULL
       RETURN a.name AS source, b.name AS target,
              s.edge_type AS edgeType, s.weight AS weight, s.context AS context
     `).catch(() => []);
@@ -143,8 +148,19 @@ export default {
       }
 
       await writeFile(join(vaultPath, 'neurons', toFilename(n.name)), page);
+      manifestPages.push({
+        file: `neurons/${toFilename(n.name)}`,
+        neuron: n.name,
+        hash: createHash('sha256').update(page).digest('hex'),
+      });
       filesWritten++;
     }
+
+    // Manifest for reverse-tapestry: lets a later import detect which pages a
+    // human edited (hash mismatch) and supersede the underlying neurons.
+    await writeFile(join(vaultPath, 'meta', 'tapestry-manifest.json'),
+      JSON.stringify({ generated_at: new Date().toISOString(), pages: manifestPages }, null, 1));
+    filesWritten++;
 
     // --- Generate cluster pages ---
     // Clear stale cluster/project pages so re-runs don't leave orphans behind.
