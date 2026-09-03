@@ -8,7 +8,7 @@
  */
 
 import { getDaemonConfig } from './loader.js';
-import { nsPredicate } from '../namespaces.js';
+import { livePredicate } from '../namespaces.js';
 
 function chunk(arr, size) {
   const out = [];
@@ -33,7 +33,7 @@ function truncate(s, n) {
 const SWEEP_EDGE_TYPES = ['causal', 'temporal', 'elaborates', 'contradicts', 'contains', 'prerequisite', 'associative'];
 
 async function recomputeGDS(runCypher, log, ns = null) {
-  const countResult = await runCypher(`MATCH (n:Neuron) WHERE ${nsPredicate('n')} RETURN count(n) AS count`, { ns }).catch(() => [{ count: 0 }]);
+  const countResult = await runCypher(`MATCH (n:Neuron) WHERE ${livePredicate('n')} RETURN count(n) AS count`, { ns }).catch(() => [{ count: 0 }]);
   const nodeCount = countResult[0]?.count?.low ?? countResult[0]?.count ?? 0;
   if (nodeCount < 10) {
     log('spider', 'info', `skipping GDS: only ${nodeCount} neurons`);
@@ -44,7 +44,7 @@ async function recomputeGDS(runCypher, log, ns = null) {
   // GDS scores must not flow across namespace boundaries.
   await runCypher(`
     CALL gds.graph.project.cypher('undertow-graph',
-      'MATCH (n:Neuron) WHERE ($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns RETURN id(n) AS id',
+      'MATCH (n:Neuron) WHERE (($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns) AND n.superseded IS NULL RETURN id(n) AS id',
       'MATCH (a:Neuron)-[s:SYNAPSE]-(b:Neuron) WHERE ((($ns IS NULL AND a.namespace IS NULL) OR a.namespace = $ns) AND (($ns IS NULL AND b.namespace IS NULL) OR b.namespace = $ns)) RETURN id(a) AS source, id(b) AS target, s.weight AS weight',
       { parameters: { ns: $ns } })
   `, { ns }).catch(e => log('spider', 'warn', `GDS projection failed: ${e.message}`));
@@ -81,7 +81,7 @@ export default {
 
     const neurons = await runCypher(`
       MATCH (n:Neuron)
-      WHERE ${nsPredicate('n')}
+      WHERE ${livePredicate('n')}
       RETURN elementId(n) AS eid, n.name AS name, n.node_type AS type,
              n.flash_summary AS flash, n.body AS body, n.project AS project
     `, { ns }).catch(err => {
@@ -218,7 +218,7 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
     const unspidered = await runCypher(`
       MATCH (n:Neuron)
       WHERE (n.spidered IS NULL OR n.spidered = false)
-      AND ${nsPredicate('n')}
+      AND ${livePredicate('n')}
       RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type
       ORDER BY n.created_at DESC
       LIMIT 20
@@ -233,10 +233,10 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
         // Find neurons with overlapping keywords that aren't already connected
         const candidates = await runCypher(`
           MATCH (source:Neuron {name: $name})
-          WHERE ${nsPredicate('source')}
+          WHERE ${livePredicate('source')}
           MATCH (candidate:Neuron)
           WHERE candidate.name <> source.name
-          AND ${nsPredicate('candidate')}
+          AND ${livePredicate('candidate')}
           AND NOT (source)-[:SYNAPSE]-(candidate)
           // Keyword overlap: split flash summaries into words and find matches
           WITH source, candidate,
@@ -287,9 +287,9 @@ Which of these candidates should be connected to the source? Only include meanin
 
                 await runCypher(`
                   MATCH (src:Neuron {name: $src})
-                  WHERE ${nsPredicate('src')}
+                  WHERE ${livePredicate('src')}
                   MATCH (tgt:Neuron {name: $tgt})
-                  WHERE ${nsPredicate('tgt')}
+                  WHERE ${livePredicate('tgt')}
                   AND NOT (src)-[:SYNAPSE]-(tgt)
                   CREATE (src)-[:SYNAPSE {
                     weight: $weight, edge_type: $edgeType,
@@ -311,7 +311,7 @@ Which of these candidates should be connected to the source? Only include meanin
 
         // Mark as spidered
         await runCypher(
-          `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} SET n.spidered = true, n.spidered_at = datetime()`,
+          `MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} SET n.spidered = true, n.spidered_at = datetime()`,
           { name: neuron.name, ns }
         ).catch(e => log('error', 'warn', e.message));
         neuronsProcessed++;
@@ -330,7 +330,7 @@ Which of these candidates should be connected to the source? Only include meanin
       // Find neurons that have completely decayed and were never useful
       const forgotten = await runCypher(`
         MATCH (n:Neuron)
-        WHERE ${nsPredicate('n')}
+        WHERE ${livePredicate('n')}
         AND n.tier = 'T3_archive'
         AND n.times_pursued = 0
         AND n.times_surfaced > 0
@@ -352,7 +352,7 @@ Which of these candidates should be connected to the source? Only include meanin
         // Delete the neuron and its synapses
         await runCypher(`
           MATCH (n:Neuron {name: $name})
-          WHERE ${nsPredicate('n')}
+          WHERE ${livePredicate('n')}
           DETACH DELETE n
         `, { name: node.name, ns }).catch(e => log('error', 'warn', e.message));
 

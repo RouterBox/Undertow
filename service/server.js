@@ -24,6 +24,10 @@ import { handleSummarize, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_
 import keeper from './daemons/keeper.js';
 import { sanitizeNamespace } from './namespaces.js';
 import { supersedeNeuron } from './supersede.js';
+import { importVault, reverseTapestry } from './vault.js';
+import vaultwatch from './daemons/vaultwatch.js';
+import { resolve as pathResolve } from 'path';
+import { homedir } from 'os';
 
 // Embed a neuron's full text (name + flash + body) and store the vector.
 // Full-text embedding outperforms summary-only by ~14 points Recall@8
@@ -838,6 +842,48 @@ app.post('/undertow/spider', async (req, res) => {
   }
 });
 
+// POST /undertow/ingest-vault — import a folder of markdown / an Obsidian vault.
+// Body: { dir, namespace?, project?, spider?: true|"full" }
+// One neuron per note; frontmatter carries title/type/tier/event_date/summary;
+// [[wikilinks]] between imported notes become SYNAPSE edges. Idempotent via a
+// content-hash ledger; changed notes SUPERSEDE their neuron.
+app.post('/undertow/ingest-vault', async (req, res) => {
+  if (!undertowEnabled) return res.json({ status: 'disabled' });
+  try {
+    const { dir, project } = req.body || {};
+    if (!dir) return res.status(400).json({ error: 'dir required' });
+    const namespace = sanitizeNamespace(req.body.namespace);
+    const result = await importVault({ dir, namespace, project, runCypher, embedNeuron, log });
+    if (req.body.spider) {
+      const mode = req.body.spider === 'full' ? 'full' : 'incremental';
+      const args = { runCypher, callAnthropic, config: getDaemonConfig('spider'), log, namespace };
+      (mode === 'full' ? spider.runFullSweep(args) : spider.run(args))
+        .then((r) => log('spider', 'info', `post-import spider (${mode}) complete`, { detail: JSON.stringify(r) }))
+        .catch((e) => log('spider', 'error', `post-import spider failed: ${e.message}`));
+      result.spider = `${mode} started`;
+    }
+    res.json({ status: 'ok', ...result });
+  } catch (e) {
+    log('vault', 'error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /undertow/tapestry-import — reverse-tapestry: pull human edits made in
+// the exported Obsidian vault back into the graph as supersessions.
+app.post('/undertow/tapestry-import', async (req, res) => {
+  if (!undertowEnabled) return res.json({ status: 'disabled' });
+  try {
+    const configured = (req.body?.vaultPath || getDaemonConfig('tapestry').vaultPath || './obsidian-vault').replace('~', homedir());
+    const vaultPath = pathResolve(__dirname, '..', configured);
+    const result = await reverseTapestry({ vaultPath, runCypher, embedNeuron, log });
+    res.json({ status: 'ok', ...result });
+  } catch (e) {
+    log('vault', 'error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /undertow/ingest-url — Web content ingestion (M8)
 app.post('/undertow/ingest-url', async (req, res) => {
   if (!undertowEnabled) return res.json({ status: 'disabled' });
@@ -1240,6 +1286,11 @@ app.listen(PORT, async () => {
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);
     log('startup', 'info', `Undertow online — localhost:${PORT} — Neo4j connected — daemons: ${enabledDaemons.join(', ') || 'none'}`);
+    try {
+      vaultwatch.start({ runCypher, embedNeuron, log });
+    } catch (e) {
+      log('vault', 'warn', `vaultwatch startup failed: ${e.message}`);
+    }
   } catch (e) {
     log('startup', 'error', `Neo4j connection failed: ${e.message}. Make sure Docker container is running.`);
   }
