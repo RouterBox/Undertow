@@ -15,7 +15,7 @@
     },
     "wonder": {
       "enabled": true,
-      "model": "claude-sonnet-4-6",
+      "model": "claude-sonnet-5",
       "maxCandidates": 10,
       "stalenessMinutes": 10
     },

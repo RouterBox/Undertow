@@ -6,7 +6,7 @@ import { nsPredicate, livePredicate } from '../namespaces.js';
 import { supersedeNeuron } from '../supersede.js';
 
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
-const SUMMARIZE_MODEL = 'claude-sonnet-4-6';
+const SUMMARIZE_MODEL = 'claude-sonnet-5';
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
 

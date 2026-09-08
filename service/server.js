@@ -78,7 +78,7 @@ warnEnv('GEMINI_API_KEY', process.env.GEMINI_API_KEY, 'vector search disabled');
 warnEnv('BRAVE_API_KEY', process.env.BRAVE_API_KEY, 'Prowler upstream (Brave) disabled');
 warnEnv('PERPLEXITY_API_KEY', process.env.PERPLEXITY_API_KEY, 'Prowler downstream (Perplexity) disabled');
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
-const SUMMARIZE_MODEL = 'claude-sonnet-4-6';
+const SUMMARIZE_MODEL = 'claude-sonnet-5';
 const FALLBACK_MODEL = QUERY_MODEL; // Fall back to Haiku if Sonnet is overloaded
 
 // Resilient API call with retry + model fallback

@@ -61,7 +61,7 @@ export default {
     }
 
     // Ask Sonnet model to analyze the conversation and identify what memories would help
-    const analysisResult = await callAnthropic('claude-sonnet-4-6',
+    const analysisResult = await callAnthropic('claude-sonnet-5',
       `You are Undertow's deep-thinking daemon. You analyze a conversation transcript and decide what memories from a knowledge graph would be most valuable for the NEXT turn.
 
 You are not crafting flashes — you are identifying TOPICS and QUESTIONS that the conversation is heading toward. Think about:
