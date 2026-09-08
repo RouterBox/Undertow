@@ -66,12 +66,21 @@ Every session gets a tier in a lightweight **session ledger** kept by the servic
 
 **Tier assignment, in priority order:**
 
-1. **Explicit contract** — `UNDERTOW_TIER=conscious|observer|drone|off` in the
-   environment. Env vars inherit to child processes, so one line in each launcher
-   we own (AgentBox producer/bolt spawns, RCL's claude subprocesses, cron
-   definitions) declares its entire process tree. We own ~all of today's 88%, so
-   the explicit contract alone covers nearly everything. This matches the
-   AgentBox machineSafety-contract culture: automation declares itself.
+1. **Explicit contract** — `undertow_tier` in the hook payload, declared as
+   `UNDERTOW_TIER=conscious|observer|drone|off` in the *client's* environment.
+   Env vars inherit to child processes, so one line in each launcher we own
+   (AgentBox producer/bolt spawns, RCL's claude subprocesses, cron definitions)
+   declares its entire process tree. We own ~all of today's 88%, so the explicit
+   contract alone covers nearly everything. This matches the AgentBox
+   machineSafety-contract culture: automation declares itself.
+
+   **Scope caveat:** the tier travels in the request body, and the service is a
+   separate process — a client-side env var only reaches it if the client puts
+   it in the payload. The OpenClaw plugin does; **stock Claude Code hooks
+   cannot**, so for hook-only users this mechanism is unreachable. For them the
+   service reads `UNDERTOW_DEFAULT_TIER` from *its own* environment as the tier
+   for sessions that declare nothing (applied at ledger-entry creation only —
+   it never overrides an earned or declared tier).
 2. **Behavioral promotion** (mechanism 2) for undeclared sessions.
 3. **Default: `candidate`** — a probationary state, not a tier. Candidates get
    *nothing* involuntary while the Keeper watches.
@@ -86,6 +95,18 @@ Undeclared sessions start as candidates and **earn** `conscious`:
 - **Promotion rule:** on the Nth prose prompt (default N=3) with human-plausible
   cadence (inter-prompt gaps ≥ a few seconds — Producer one-shots never get
   there, paste-storms don't look human), the session is promoted to `conscious`.
+- **Agentic promotion (second path):** deep agentic work is one substantial
+  prompt followed by hours of tool use — it never accumulates prose turns, so
+  prompt count alone silently starves real humans (2026-09-08 downstream
+  report: 6 days, 125 gated events, zero promotions). A candidate with ≥1 real
+  prompt, sustained tool volume (default 150 PostToolUse events), and a
+  long-lived session (default ≥1 h) is promoted too. One-shots and heartbeat
+  ticks are short-lived and never reach both thresholds; tool events also
+  refresh the ledger TTL so multi-day sessions don't lose their progress.
+- **Starvation diagnostic:** a candidate gated 50 times with zero promotions
+  logs one loud hint pointing at `promoteAfterTurns`/`agenticToolEvents`/
+  `UNDERTOW_DEFAULT_TIER` — silent correctness must not look like silent
+  breakage.
 - **Retro-attach on promotion:** the first flash-eligible turn triggers Wonder to
   read the transcript-so-far (it already knows how), so memory catches up
   mid-conversation. The human loses flashes for two prompts, then gets a

@@ -35,6 +35,14 @@ const defaults = {
   // flashes normally; repeats within the window are fast-pathed.
   habituationHours: 6,
   habituationMaxPrompts: 30,
+  // Agentic promotion: deep agentic work is one substantial prompt followed by
+  // hours of tool use — it never accumulates proseTurns, so prompt-count alone
+  // silently starves real humans (2026-09-08 downstream report: 6 days, 125
+  // gated events, zero promotions). Sustained tool volume over a long-lived
+  // session is corroborating evidence of a live human; producer one-shots and
+  // heartbeat ticks are short-lived and never reach both thresholds.
+  agenticToolEvents: 150,
+  agenticMinHours: 1,
   // cwd substring rules for owned automation (checked case-insensitively).
   cwdRules: [
     { pattern: 'agentbox-worktrees', tier: 'drone' },
@@ -76,6 +84,27 @@ function fingerprint(text) {
 
 function now() { return Date.now(); }
 
+// Promotion. Two independent paths, either suffices:
+//   conversational — N prose prompts with a human-plausible gap (the original rule)
+//   agentic        — at least one real prompt plus sustained tool volume over a
+//                    long-lived session (one prompt + hundreds of tool calls is
+//                    how deep agentic work looks; it is not how one-shots look)
+function maybePromote(e, sessionId) {
+  if (e.tier !== 'candidate' || e.declared) return false;
+  const conversational = e.proseTurns >= config.promoteAfterTurns && e.humanGaps >= 1;
+  const ageHours = (now() - (e.firstSeen || now())) / 3600_000;
+  const agentic = e.proseTurns >= 1 &&
+    (e.toolEvents || 0) >= (config.agenticToolEvents || 150) &&
+    ageHours >= (config.agenticMinHours || 1);
+  if (!conversational && !agentic) return false;
+  e.tier = 'conscious';
+  e.promotedAt = now();
+  stats.promoted++;
+  dirty = true;
+  logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} promoted to conscious via ${conversational ? 'turn-taking' : 'agentic volume'} (${e.proseTurns} turns, ${e.humanGaps} human gaps, ${e.toolEvents || 0} tool events)`);
+  return true;
+}
+
 function loadLedger() {
   if (!existsSync(LEDGER_PATH)) return;
   try {
@@ -113,10 +142,20 @@ function cwdRuleTier(cwd) {
   return null;
 }
 
+// A service-side default for sessions that declare nothing. Stock Claude Code
+// hooks cannot put undertow_tier in the payload (that contract only exists for
+// payload-constructing clients like the OpenClaw plugin), so hook-only users
+// need an env knob. Applied at entry creation only — it must never override a
+// ledger tier that behavioral promotion already earned.
+function defaultTier() {
+  const t = String(process.env.UNDERTOW_DEFAULT_TIER || '').toLowerCase();
+  return VALID_TIERS.has(t) ? t : null;
+}
+
 function getEntry(sessionId, cwd, explicitTier) {
   let e = ledger.get(sessionId);
   if (!e) {
-    const ruled = VALID_TIERS.has(explicitTier) ? explicitTier : cwdRuleTier(cwd);
+    const ruled = VALID_TIERS.has(explicitTier) ? explicitTier : (cwdRuleTier(cwd) || defaultTier());
     e = {
       tier: ruled || 'candidate',
       declared: !!ruled,
@@ -125,6 +164,8 @@ function getEntry(sessionId, cwd, explicitTier) {
       lastSeen: now(),
       lastPrompt: 0,
       humanGaps: 0,
+      toolEvents: 0,
+      gated: 0,
       cwd: cwd || null,
     };
     ledger.set(sessionId, e);
@@ -194,16 +235,23 @@ const keeper = {
     e.proseTurns++;
     dirty = true;
 
-    let promoted = false;
-    if (e.tier === 'candidate' && !e.declared &&
-        e.proseTurns >= config.promoteAfterTurns && e.humanGaps >= 1) {
-      e.tier = 'conscious';
-      e.promotedAt = t;
-      promoted = true;
-      stats.promoted++;
-      logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} promoted to conscious (${e.proseTurns} turns, ${e.humanGaps} human gaps)`);
-    }
+    const promoted = maybePromote(e, sessionId);
     return { tier: e.tier, promoted, habituated: false };
+  },
+
+  /**
+   * Called on PostToolUse ingest. Tool volume is corroborating evidence of a
+   * live agentic session, and touching lastSeen keeps a multi-day session's
+   * ledger entry (and its proseTurns progress) from expiring mid-flight.
+   */
+  recordToolEvent(sessionId) {
+    if (!config.enabled) return;
+    const e = ledger.get(sessionId);
+    if (!e) return;
+    e.toolEvents = (e.toolEvents || 0) + 1;
+    e.lastSeen = now();
+    dirty = true;
+    maybePromote(e, sessionId);
   },
 
   /** Current tier without side effects (for Stop/PostToolUse/PostCompact gating). */
@@ -216,7 +264,19 @@ const keeper = {
   isConscious(sessionId) { return keeper.tierOf(sessionId) === 'conscious'; },
 
   /** Record a fast-pathed (rejected) event for the stats panel. */
-  countFastPath() { stats.fastPathed++; },
+  countFastPath(sessionId) {
+    stats.fastPathed++;
+    // Silent correctness is indistinguishable from silent breakage: a candidate
+    // gated dozens of times with zero promotions deserves one loud hint.
+    const e = sessionId ? ledger.get(sessionId) : null;
+    if (e && e.tier === 'candidate') {
+      e.gated = (e.gated || 0) + 1;
+      dirty = true;
+      if (e.gated === 50) {
+        logFn('keeper', 'warn', `session ${String(sessionId).slice(0, 8)} gated ${e.gated}x with no promotion (${e.proseTurns} prose turns, ${e.toolEvents || 0} tool events) — if this is a real human, see promoteAfterTurns/agenticToolEvents in daemon-config or set UNDERTOW_DEFAULT_TIER`);
+      }
+    }
+  },
 
   /** Manual tier override (POST /undertow/keeper). */
   setTier(sessionId, tier) {

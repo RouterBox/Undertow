@@ -96,7 +96,7 @@ Add these hooks to `~/.claude/settings.json`. If the file already has a `hooks` 
           {
             "type": "http",
             "url": "http://localhost:3030/undertow/query",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
@@ -108,7 +108,7 @@ Add these hooks to `~/.claude/settings.json`. If the file already has a `hooks` 
           {
             "type": "http",
             "url": "http://localhost:3030/undertow/session-start",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
@@ -120,7 +120,7 @@ Add these hooks to `~/.claude/settings.json`. If the file already has a `hooks` 
           {
             "type": "http",
             "url": "http://localhost:3030/undertow/ingest",
-            "timeout": 3000
+            "timeout": 3
           }
         ]
       }
@@ -132,7 +132,7 @@ Add these hooks to `~/.claude/settings.json`. If the file already has a `hooks` 
           {
             "type": "http",
             "url": "http://localhost:3030/undertow/summarize",
-            "timeout": 30000
+            "timeout": 30
           }
         ]
       }
@@ -144,7 +144,7 @@ Add these hooks to `~/.claude/settings.json`. If the file already has a `hooks` 
           {
             "type": "http",
             "url": "http://localhost:3030/undertow/rehydrate",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }

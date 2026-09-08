@@ -17,6 +17,9 @@ import { readdir, readFile, stat, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import neo4j from 'neo4j-driver';
 import Anthropic from '@anthropic-ai/sdk';
+import { randomUUID } from 'crypto';
+import { stripUndertowInjections } from './strip-injections.js';
+import { getEmbedding, isAvailable as embeddingsAvailable } from './embeddings.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '.env') });
@@ -35,6 +38,9 @@ const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS))
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 const STATE_FILE = join(__dirname, '.ingest-history-state.json');
+
+// The closed node_type vocabulary the extraction prompt enumerates.
+const VALID_NODE_TYPES = new Set(['fact', 'insight', 'preference', 'episode', 'decision', 'concept']);
 
 // --- Helpers ---
 
@@ -82,7 +88,9 @@ async function saveState(state) {
 
 // Project directory names to exclude (case-insensitive substring match).
 // These are work repos that should never be ingested into the personal memory graph.
-const EXCLUDED_PROJECT_PATTERNS = ['united', 'cls.', 'gershwin'];
+// Claude Code rewrites '.' to '-' in project directory names, so 'cls-' is the
+// form that actually matches on disk; 'cls.' is kept for raw-path callers.
+const EXCLUDED_PROJECT_PATTERNS = ['united', 'cls.', 'cls-', 'gershwin'];
 
 function isExcludedProject(projectName) {
   const lower = projectName.toLowerCase();
@@ -140,21 +148,38 @@ async function processSession(session) {
   const turns = [];
   let currentTurn = { user: '', assistant: '', tools: [] };
 
+  // Concatenate every content block of the given type. Indexing content[0]
+  // silently discards most assistant prose when extended thinking is on
+  // (content[0] is then a 'thinking' block with no .text).
+  const textBlocks = (content) => {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content.filter(b => b?.type === 'text' && typeof b.text === 'string')
+                  .map(b => b.text).join('\n');
+  };
+
   for (const line of lines) {
     try {
       const msg = JSON.parse(line);
       if (msg.type === 'user' || msg.message?.role === 'user') {
+        // Tool results are recorded with role 'user' — they are not prompts.
+        // Sidechains and meta records aren't human turns either. promptSource
+        // is a Claude Code internal: 'typed' marks a real human prompt, other
+        // values are injections; absence means "unknown", not "not human".
+        if (msg.toolUseResult !== undefined || msg.isSidechain === true || msg.isMeta) continue;
+        const content = msg.message?.content ?? msg.message ?? msg.content ?? '';
+        if (Array.isArray(content) && content.some(b => b?.type === 'tool_result')) continue;
+        if (msg.promptSource && msg.promptSource !== 'typed') continue;
+        const text = stripUndertowInjections(textBlocks(content)).trim();
+        if (!text) continue;
         if (currentTurn.user && currentTurn.assistant) {
           turns.push({ ...currentTurn });
           currentTurn = { user: '', assistant: '', tools: [] };
         }
-        const text = typeof msg.message === 'string' ? msg.message :
-                     (msg.message?.content || msg.content || '');
-        if (typeof text === 'string') currentTurn.user = text.substring(0, 500);
+        currentTurn.user = text.substring(0, 500);
       } else if (msg.type === 'assistant' || msg.role === 'assistant') {
-        const text = typeof msg.message === 'string' ? msg.message :
-                     (msg.message?.content?.[0]?.text || msg.content?.[0]?.text || msg.content || '');
-        if (typeof text === 'string') currentTurn.assistant += text.substring(0, 500);
+        const text = stripUndertowInjections(textBlocks(msg.message?.content ?? msg.message ?? msg.content ?? ''));
+        if (text.trim()) currentTurn.assistant += text.substring(0, 500);
       } else if (msg.type === 'tool_result' || msg.type === 'tool_use') {
         currentTurn.tools.push((msg.name || msg.tool_name || 'unknown').substring(0, 50));
       }
@@ -227,9 +252,12 @@ Do NOT create neurons for:
 Return JSON:
 {
   "neurons": [
-    { "name": "short name (2-5 words)", "node_type": "fact|insight|preference|episode|decision", "tier": "T2_working", "flash_summary": "one sentence, <100 chars" }
+    { "name": "short name (2-5 words)", "node_type": "fact|insight|preference|episode|decision", "tier": "T2_working", "flash_summary": "one sentence, <100 chars", "body": "2-5 sentences of real content: reasoning, context, details" }
   ]
 }
+
+A neuron is a knowledge unit with substance, not a tag — if you cannot write a
+meaningful body of 2-5 sentences, do not emit the neuron.
 
 Maximum 3 neurons per chunk. Most chunks should produce 0-1 neurons. Quality over quantity.`,
       chunkText
@@ -240,6 +268,16 @@ Maximum 3 neurons per chunk. Most chunks should produce 0-1 neurons. Quality ove
       const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : { neurons: [] };
 
       for (const n of (parsed.neurons || [])) {
+        // A neuron with no body is exactly what the Janitor deletes on sight
+        // (and it violates the quality standard). Enforce substance here.
+        const body = String(n.body || '').trim();
+        if (body.length < 40) {
+          console.log(`    - skipped (body too thin): ${n.name}`);
+          continue;
+        }
+        // The extraction prompt enumerates a closed type set, but the model
+        // can invent types; coerce unknowns rather than persisting them.
+        const type = VALID_NODE_TYPES.has(n.node_type) ? n.node_type : 'fact';
         const existing = await runCypher(
           'MATCH (n:Neuron {name: $name}) RETURN n.name LIMIT 1',
           { name: n.name }
@@ -247,20 +285,35 @@ Maximum 3 neurons per chunk. Most chunks should produce 0-1 neurons. Quality ove
         if (existing.length === 0) {
           await runCypher(`
             CREATE (n:Neuron {
-              name: $name, node_type: $type, tier: $tier,
-              flash_summary: $flash, body: '',
+              uid: $uid, name: $name, node_type: $type, tier: $tier,
+              flash_summary: $flash, body: $body,
               source: 'history', base_score: 40, decay_score: 40,
               times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
               created_at: datetime(), last_surfaced: datetime(),
               source_session: $sessionId
             })
           `, {
-            name: n.name, type: n.node_type || 'fact',
-            tier: n.tier || 'T2_working', flash: n.flash_summary,
+            uid: randomUUID(), name: n.name, type,
+            tier: n.tier || 'T2_working', flash: n.flash_summary, body,
             sessionId: session.id
           });
+          // Embed immediately — an unembedded neuron is invisible to vector
+          // search, which is most of retrieval.
+          if (embeddingsAvailable()) {
+            try {
+              const vec = await getEmbedding(`${n.name}. ${n.flash_summary || ''} ${body}`.slice(0, 1500));
+              if (vec) {
+                await runCypher(
+                  'MATCH (n:Neuron {name: $name}) SET n.embedding = $embedding',
+                  { name: n.name, embedding: Array.from(vec) }
+                );
+              }
+            } catch (e) {
+              console.log(`    ! embed failed for ${n.name}: ${e.message}`);
+            }
+          }
           neuronsCreated++;
-          console.log(`    + ${n.name} (${n.node_type})`);
+          console.log(`    + ${n.name} (${type})`);
         }
       }
     } catch {}

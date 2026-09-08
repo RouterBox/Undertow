@@ -4,6 +4,8 @@
 import { readFile } from 'fs/promises';
 import { nsPredicate, livePredicate } from '../namespaces.js';
 import { supersedeNeuron } from '../supersede.js';
+import { stripUndertowInjections } from '../strip-injections.js';
+import { coerceNodeType } from './gobble.js';
 
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
 const SUMMARIZE_MODEL = 'claude-sonnet-5';
@@ -53,26 +55,8 @@ Undertow context:
 
 Only include memories that are likely relevant to the working directory or recent activity. Skip generic/stale memories.`;
 
-// Ouroboros guard (2026-09-02): Undertow's own injected flashes are recorded
-// into session transcripts, so summarizing raw transcript text would let the
-// graph re-memorize its own output (memory echo). Strip injected blocks first.
-function stripUndertowInjections(text) {
-  const lines = String(text || '').split('\n');
-  const out = [];
-  let inBlock = false;
-  for (const line of lines) {
-    if (/^\s*\[UNDERTOW-(FLASH|SESSION-START|REHYDRATE)\]/.test(line)) { inBlock = true; continue; }
-    if (inBlock) {
-      if (/^(Haiku interpretation:|Raw neurons:|Neuron handles:|Undertow context:)/.test(line) ||
-          /^\s*[~\-]\s/.test(line) || /^\s{2,}\S/.test(line) || line.trim() === '') {
-        continue; // still inside the injected block
-      }
-      inBlock = false;
-    }
-    out.push(line);
-  }
-  return out.join('\n');
-}
+// Ouroboros guard (2026-09-02): lives in ../strip-injections.js so historical
+// ingestion shares it — see that module for why.
 
 // --- Summarize handler (Stop hook) ---
 
@@ -163,7 +147,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
             })
           `, {
-          uid: randomUUID(), name: insight.name, type: insight.node_type || 'insight',
+          uid: randomUUID(), name: insight.name, type: coerceNodeType(insight.node_type, 'insight'),
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
           body: insight.body || '', ns, eventDate
         });

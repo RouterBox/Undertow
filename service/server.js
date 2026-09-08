@@ -17,9 +17,9 @@ import prowler from './daemons/prowler.js';
 import tapestry from './daemons/tapestry.js';
 import wonder from './daemons/wonder.js';
 import janitor from './daemons/janitor.js';
-import { getEmbedding, isAvailable as embeddingsAvailable } from './embeddings.js';
+import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo } from './embeddings.js';
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
-import { handleIngest, INGEST_SYSTEM_PROMPT } from './daemons/gobble.js';
+import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { handleSummarize, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
 import { sanitizeNamespace } from './namespaces.js';
@@ -74,7 +74,12 @@ function warnEnv(name, value, consequence) {
 
 requireEnv('NEO4J_PASS', NEO4J_PASS);
 requireEnv('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY);
-warnEnv('GEMINI_API_KEY', process.env.GEMINI_API_KEY, 'vector search disabled');
+// Only the gemini provider needs GEMINI_API_KEY; with a local provider the
+// warning would falsely claim vector search is dead (and train operators to
+// ignore the channel that reports real embedding problems).
+if (getProviderInfo().provider === 'gemini') {
+  warnEnv('GEMINI_API_KEY', process.env.GEMINI_API_KEY, 'vector search disabled');
+}
 warnEnv('BRAVE_API_KEY', process.env.BRAVE_API_KEY, 'Prowler upstream (Brave) disabled');
 warnEnv('PERPLEXITY_API_KEY', process.env.PERPLEXITY_API_KEY, 'Prowler downstream (Perplexity) disabled');
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
@@ -161,7 +166,15 @@ const TOGGLE_FILE = join(__dirname, '.undertow-enabled');
 let undertowEnabled = (() => {
   try { return readFileSync(TOGGLE_FILE, 'utf8').trim() !== 'false'; } catch { return true; }
 })();
-let flashMode = 'both'; // 'both' (Haiku + raw), 'raw' (neurons only, fast), 'haiku' (Haiku only, crafted)
+// Persisted like the toggle: a restart must not silently revert verbosity.
+// Default 'haiku' matches the documented recommendation (clean context window).
+const FLASHMODE_FILE = join(__dirname, '.undertow-flashmode');
+let flashMode = (() => {
+  try {
+    const m = readFileSync(FLASHMODE_FILE, 'utf8').trim();
+    return ['both', 'raw', 'haiku'].includes(m) ? m : 'haiku';
+  } catch { return 'haiku'; }
+})(); // 'both' (Haiku + raw), 'raw' (neurons only, fast), 'haiku' (Haiku only, crafted)
 
 // --- Session State ---
 const sessions = new Map(); // session_id -> { activeTopics: [], pendingFlashes: [] }
@@ -228,6 +241,7 @@ app.post('/undertow/mode/:mode', (req, res) => {
     return res.status(400).json({ error: `Invalid mode. Use: ${valid.join(', ')}` });
   }
   flashMode = req.params.mode;
+  try { writeFileSync(FLASHMODE_FILE, flashMode); } catch {}
   log('config', 'info', `Flash mode set to: ${flashMode}`);
   res.json({ flashMode });
 });
@@ -241,12 +255,12 @@ app.post('/undertow/query', async (req, res) => {
   const gate = keeper.recordPrompt(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier, req.body.prompt);
   const sid = String(req.body.session_id || 'default').slice(0, 8);
   if (gate.habituated) {
-    keeper.countFastPath();
+    keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `habituated: repeated prompt from ${sid} — flash suppressed`);
     return res.json({});
   }
   if (gate.tier !== 'conscious') {
-    keeper.countFastPath();
+    keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `gated: ${gate.tier} session ${sid} — no flash pipeline`);
     return res.json({});
   }
@@ -281,9 +295,12 @@ app.post('/undertow/ingest', async (req, res) => {
   if (!undertowEnabled) return;
   // Keeper gate: only conscious sessions form live memories; observers write
   // to quarantine; drones/candidates form nothing.
+  // Tool volume is Keeper's corroborating evidence of a live agentic session
+  // (and keeps long-lived sessions from expiring out of the ledger mid-flight).
+  keeper.recordToolEvent(req.body.session_id || 'default');
   const ingestTier = keeper.tierOf(req.body.session_id || 'default');
   if (ingestTier !== 'conscious' && ingestTier !== 'observer') {
-    keeper.countFastPath();
+    keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `gated: ${ingestTier} session ${String(req.body.session_id || 'default').slice(0, 8)} — ingest dropped`);
     return;
   }
@@ -311,7 +328,7 @@ app.post('/undertow/summarize', async (req, res) => {
   res.json({});
   if (!undertowEnabled) { log('toggle', 'info', 'Undertow DISABLED'); return; }
   if (!keeper.isConscious(req.body.session_id || 'default')) {
-    keeper.countFastPath();
+    keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `gated: ${keeper.tierOf(req.body.session_id || 'default')} session ${String(req.body.session_id || 'default').slice(0, 8)} — summarize skipped`);
     return;
   }
@@ -347,7 +364,7 @@ app.post('/undertow/session-start', async (req, res) => {
   // they earn attachment (or a cwd rule / explicit tier declares them).
   const entry = keeper.register(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier);
   if (entry.tier !== 'conscious') {
-    keeper.countFastPath();
+    keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `registered: ${entry.tier} session ${String(req.body.session_id || 'default').slice(0, 8)} — watching, no injection yet`);
     return res.json({});
   }
@@ -371,7 +388,7 @@ app.post('/undertow/session-start', async (req, res) => {
 
 // POST /undertow/rehydrate — PostCompact hook
 app.post('/undertow/rehydrate', async (req, res) => {
-  if (!keeper.isConscious(req.body.session_id || 'default')) { keeper.countFastPath(); return res.json({}); }
+  if (!keeper.isConscious(req.body.session_id || 'default')) { keeper.countFastPath(req.body.session_id || 'default'); return res.json({}); }
   log('hook', 'info', 'PostCompact');
   try {
     req.body.namespace = sanitizeNamespace(req.body.namespace);
@@ -660,7 +677,7 @@ Response: [external agent memory submission]`);
         created_at: datetime(), last_surfaced: datetime()
       })
     `, {
-      uid: randomUUID(), name: n.name, type: n.node_type || 'fact', tier: n.tier || 'T2_working',
+      uid: randomUUID(), name: n.name, type: coerceNodeType(n.node_type), tier: n.tier || 'T2_working',
       flash: n.flash_summary, body: n.body || '', source: agentSource
     });
 
@@ -968,7 +985,7 @@ Maximum 5 neurons. If nothing worth remembering, return {"neurons": [], "connect
             source_url: $url, project: 'general'
           })
         `, {
-          uid: randomUUID(), name: n.name, type: n.node_type || 'fact', tier: n.tier || 'T2_working',
+          uid: randomUUID(), name: n.name, type: coerceNodeType(n.node_type), tier: n.tier || 'T2_working',
           flash: n.flash_summary, body: n.body || '', url
         });
         created.push(n.name);
@@ -1075,7 +1092,7 @@ Maximum 5 neurons. Quality over quantity. If nothing is worth remembering, retur
             source_path: $path, project: $project
           })
         `, {
-          uid: randomUUID(), name: n.name, type: n.node_type || 'fact', tier: n.tier || 'T2_working',
+          uid: randomUUID(), name: n.name, type: coerceNodeType(n.node_type), tier: n.tier || 'T2_working',
           flash: n.flash_summary, body: n.body || '', path: filePath,
           project: req.body.project || 'general'
         });
@@ -1286,6 +1303,30 @@ app.listen(PORT, async () => {
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);
     log('startup', 'info', `Undertow online — localhost:${PORT} — Neo4j connected — daemons: ${enabledDaemons.join(', ') || 'none'}`);
+    // Embedding sanity: a provider/index dimension mismatch makes vector search
+    // silently miss everything, presenting as "recall is a bit weak" rather
+    // than "retrieval is dead". One loud boot-time line prevents that.
+    try {
+      const info = getProviderInfo();
+      const idx = await runCypher(
+        `SHOW INDEXES YIELD name, options WHERE name = 'neuron_embedding' RETURN options`
+      );
+      const indexDims = idx[0]?.options?.indexConfig?.['vector.dimensions'];
+      const dims = typeof indexDims?.toNumber === 'function' ? indexDims.toNumber() : Number(indexDims);
+      if (idx.length && dims && dims !== info.dims) {
+        log('startup', 'error', `EMBEDDING DIMENSION MISMATCH: neuron_embedding index is ${dims}-dim but provider ${info.provider} (${info.model}) emits ${info.dims}-dim — vector search will silently miss everything. Run: node switch-embeddings.js`);
+      }
+      const counts = await runCypher(
+        `MATCH (n:Neuron) RETURN count(n) AS total, count(n.embedding) AS embedded`
+      );
+      const total = counts[0]?.total?.toNumber?.() ?? Number(counts[0]?.total || 0);
+      const embedded = counts[0]?.embedded?.toNumber?.() ?? Number(counts[0]?.embedded || 0);
+      if (total > 0 && embedded === 0) {
+        log('startup', 'error', `NO EMBEDDED NEURONS: ${total} live neurons, zero have embeddings — vector search is returning nothing. Run: node backfill-embeddings.js`);
+      }
+    } catch (e) {
+      log('startup', 'warn', `embedding sanity check skipped: ${e.message}`);
+    }
     try {
       vaultwatch.start({ runCypher, embedNeuron, log });
     } catch (e) {

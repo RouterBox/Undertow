@@ -88,6 +88,14 @@ If in doubt, SKIP. A graph with 50 high-quality neurons beats one with 500 noisy
 
 const QUERY_MODEL = 'claude-haiku-4-5-20251001';
 
+// The prompt enumerates a closed node_type set, but nothing stops the model
+// from inventing types (a downstream fork found neurons typed 'gotcha').
+// Coerce unknowns to 'fact' so node_type stays a closed vocabulary.
+const VALID_NODE_TYPES = new Set(['fact', 'concept', 'decision', 'episode', 'insight', 'preference']);
+export function coerceNodeType(type, fallback = 'fact') {
+  return VALID_NODE_TYPES.has(type) ? type : fallback;
+}
+
 async function handleIngest({ req_body, runCypher, callAnthropic, embedNeuron, getSession, randomUUID, log, writeNamespace = null }) {
   const body = req_body;
 
@@ -205,7 +213,7 @@ Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
             event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
           })
         `, {
-        uid: randomUUID(), name: n.name, type: n.node_type || 'fact', tier: n.tier || 'T2_working',
+        uid: randomUUID(), name: n.name, type: coerceNodeType(n.node_type), tier: n.tier || 'T2_working',
         flash: n.flash_summary, body: n.body || '',
         project: sessionForProject.currentProject || 'general',
         ns: writeNamespace, eventDate
