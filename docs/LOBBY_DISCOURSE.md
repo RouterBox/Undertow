@@ -51,8 +51,21 @@ Per-bot 1–10 slider in the app, exactly Gershwin's maps (cooldown + confidence
 ### R7 — One correction round
 Disputes about a checkable fact get **one** message containing the evidence (a path, a hash, a command output), from whoever holds the floor. No corroboration pile-ons; silence = agreement.
 
-### R8 — Bot-to-bot traffic off the human channel (from Smoke's research)
-Worker-to-worker coordination goes through `/session` inbox DMs (or a quiet tower side-channel), and only the outcome is posted to the lobby. Every framework that works routes inter-agent chatter through the coordinator and surfaces the synthesis; our lobby is currently both channels at once, and the human pays for every redundant line in seconds of audio.
+### R8 — Bot-to-bot traffic stays in the lobby, kept concise (REVISED 2026-09-09, RouterBox's ruling)
+Agent-to-agent coordination happens **in the lobby**, not in tower filesystem
+notes or context DMs. Two reasons from the owner: not every agent will be
+tower-native (shared file paths don't generalize), and RouterBox follows all
+inter-agent traffic from his phone — files require walking to the PC. The
+original off-channel version of this rule also collided with tower reality:
+context-to-context pushes render only in the human's DM view and never reach
+the target agent's inbox (discovered 2026-09-08 when three Inspector→River
+reports silently landed on RouterBox's phone).
+
+The chatterstorm concern R8 originally addressed is handled by *discipline*,
+not *relocation*: post concise, information-dense updates; no redundant
+acknowledgement rounds (R9); long artifacts (full test matrices, repro
+scripts) can live in a file or PR description, but the decisions and findings
+themselves belong in the room where the human can see them.
 
 ### R9 — Status lines are inert (R1 corollary, from Smoke's research)
 "On it", "done", "noted" from an agent must never trigger another agent. TTS etiquette rides along: short utterances, no acknowledgements, no self-introductions, never re-read a fact the room already heard.
