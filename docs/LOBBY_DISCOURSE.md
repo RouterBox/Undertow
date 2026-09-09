@@ -68,7 +68,14 @@ scripts) can live in a file or PR description, but the decisions and findings
 themselves belong in the room where the human can see them.
 
 ### R9 — Status lines are inert (R1 corollary, from Smoke's research)
-"On it", "done", "noted" from an agent must never trigger another agent. TTS etiquette rides along: short utterances, no acknowledgements, no self-introductions, never re-read a fact the room already heard.
+"On it", "done", "noted" from an agent must never trigger another agent. TTS etiquette rides along: short utterances, no acknowledgements *between agents*, no self-introductions, never re-read a fact the room already heard.
+
+**Ack-first amendment (2026-09-09, RouterBox's ruling):** when RouterBox sends a
+prompt that will take real time, acknowledge it *immediately* — one line, before
+starting the work — then return with results. From the phone, ten silent minutes
+of work is indistinguishable from a broken agent. The inertness rule still holds:
+that ack is for the human and must never trigger another agent, and agents still
+don't ack each other.
 
 ## Research corroboration
 
