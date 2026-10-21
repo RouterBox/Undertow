@@ -7,7 +7,7 @@ import { supersedeNeuron } from '../supersede.js';
 import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
 
-const QUERY_MODEL = 'claude-haiku-4-5-20251001';
+const QUERY_MODEL = 'claude-haiku-5-5';
 const SUMMARIZE_MODEL = 'claude-sonnet-5';
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.

@@ -82,7 +82,7 @@ if (getProviderInfo().provider === 'gemini') {
 }
 warnEnv('BRAVE_API_KEY', process.env.BRAVE_API_KEY, 'Prowler upstream (Brave) disabled');
 warnEnv('PERPLEXITY_API_KEY', process.env.PERPLEXITY_API_KEY, 'Prowler downstream (Perplexity) disabled');
-const QUERY_MODEL = 'claude-haiku-4-5-20251001';
+const QUERY_MODEL = 'claude-haiku-5-5';
 const SUMMARIZE_MODEL = 'claude-sonnet-5';
 const FALLBACK_MODEL = QUERY_MODEL; // Fall back to Haiku if Sonnet is overloaded
 

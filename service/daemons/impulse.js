@@ -85,7 +85,7 @@ function setCachedQuery(prompt, cwd, result) {
 // --- Query handler ---
 
 async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmbedding, embeddingsAvailable, isDaemonEnabled, getDaemonConfig, wonder, prowler, log, flashMode }) {
-  const QUERY_MODEL = 'claude-haiku-4-5-20251001';
+  const QUERY_MODEL = 'claude-haiku-5-5';
   const startTime = Date.now();
 
   const { prompt, session_id, cwd } = req_body;

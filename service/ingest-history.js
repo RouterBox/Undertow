@@ -32,7 +32,7 @@ if (!NEO4J_PASS) {
   process.exit(1);
 }
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = 'claude-haiku-4-5-20251001';
+const MODEL = 'claude-haiku-5-5';
 
 const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });

@@ -86,7 +86,7 @@ SKIP — the vast majority of events:
 
 If in doubt, SKIP. A graph with 50 high-quality neurons beats one with 500 noisy ones.`;
 
-const QUERY_MODEL = 'claude-haiku-4-5-20251001';
+const QUERY_MODEL = 'claude-haiku-5-5';
 
 // The prompt enumerates a closed node_type set, but nothing stops the model
 // from inventing types (a downstream fork found neurons typed 'gotcha').
