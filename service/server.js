@@ -96,9 +96,19 @@ async function callAnthropic(model, system, userContent, maxTokens = 500) {
       const message = await anthropic.messages.create({
         model: currentModel,
         max_tokens: maxTokens,
+        // Haiku 5.5 thinks by default and burns small max_tokens budgets before writing any text.
+        ...(currentModel.startsWith('claude-haiku') ? { thinking: { type: 'disabled' } } : {}),
         system,
         messages: [{ role: 'user', content: userContent }]
       });
+      // Callers read content[0].text; put text blocks first so a leading thinking block can't blank the reply.
+      const blocks = Array.isArray(message.content) ? message.content : [];
+      if (!blocks.some(b => b?.type === 'text' && b.text)) {
+        log('api', 'warn', `${currentModel} returned no text block`, {
+          detail: `stop_reason=${message.stop_reason} types=${blocks.map(b => b?.type).join(',') || 'none'} out_tokens=${message.usage?.output_tokens}`
+        });
+      }
+      message.content = [...blocks.filter(b => b?.type === 'text'), ...blocks.filter(b => b?.type !== 'text')];
       return { response: message, model: currentModel };
     } catch (e) {
       const isOverloaded = e.status === 529 || e.message?.includes('Overloaded') || e.message?.includes('overloaded');

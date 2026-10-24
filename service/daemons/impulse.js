@@ -475,6 +475,10 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
   } catch {
     parsed = { flashes: [], topics_detected: [] };
   }
+  if (!Array.isArray(parsed.flashes)) {
+    log('query', 'warn', 'model response had no flashes array', { detail: responseText.substring(0, 400) });
+    parsed.flashes = [];
+  }
 
   // Update session state
   if (parsed.topics_detected?.length) {
