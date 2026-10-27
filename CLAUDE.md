@@ -61,6 +61,10 @@ When a prompt arrives, these searches run in parallel:
 
 Results are combined, deduplicated, domain-scored (CWD project detection), diversity-enforced, then Haiku crafts flashes (max 2 per prompt).
 
+## Habituated Turns (Keeper)
+
+A habituated turn is a heartbeat, so no daemon takes a turn there. The Keeper records per session why the latest prompt was habituated: `repeat` (near-identical to one seen within `habituationHours`) or `plumbing` (task notifications and other harness text). On `repeat`, Stop skips every daemon and PostToolUse skips Gobble. On `plumbing`, Stop skips only Wonder's pre-warm; Dreamer and the rest still run. A later normal prompt clears the flag. See [docs/KEEPER.md](docs/KEEPER.md).
+
 ## Domain Scoring
 
 The hook sends `cwd` (working directory). Undertow walks up to find `.git` and tags neurons by repo. Then:
