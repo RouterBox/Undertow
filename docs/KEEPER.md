@@ -153,6 +153,15 @@ occurrence of any prompt shape flashes normally; only the repeats go silent.
 Verified live: "task b3dzfglw4 completed" flashed, "task bqyh0yi1q completed"
 2 seconds later was habituated at zero cost.
 
+**A habituated turn is a heartbeat, so no daemon takes a turn there.** The Keeper
+also remembers *why* a session's latest prompt was habituated (`repeat` for a
+near-identical fingerprint, `plumbing` for harness notifications) until the next
+real prompt clears it. At Stop, a `repeat` turn skips every daemon (Wonder, Dreamer,
+Spider, Janitor, Prowler); at PostToolUse it skips Gobble. A `plumbing` turn skips
+only Wonder's pre-warm, because task notifications often carry real work that
+Dreamer should still process. The flag is per session id and in memory only, so
+parallel turns in one session share it (last prompt wins).
+
 ### The voluntary path is how automation participates
 
 The "we want future agents to know why we did what we did" use case is real —
