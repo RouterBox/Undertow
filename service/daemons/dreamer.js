@@ -6,6 +6,7 @@ import { nsPredicate, livePredicate } from '../namespaces.js';
 import { supersedeNeuron } from '../supersede.js';
 import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
+import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
 
 const QUERY_MODEL = 'claude-haiku-5-5';
 const SUMMARIZE_MODEL = 'claude-sonnet-5';
@@ -216,6 +217,33 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     log('summarize', 'info', `train: ${topics.join(' → ')}`);
   }
 
+  // Explicit feedback (POST /undertow/feedback) is ground truth and overrides Sonnet's
+  // inference for the neurons it names. If Sonnet returned no flash_result covering a
+  // fed-back neuron, add a synthetic one so the normal pursuit/dismissal path below
+  // still applies it (synthetic results touch ONLY the fed-back neurons).
+  const feedbackDone = new Set();
+  const fbEntries = Object.entries(session.explicitFeedback || {});
+  if (fbEntries.length) {
+    parsed.flash_results = Array.isArray(parsed.flash_results) ? parsed.flash_results : [];
+    for (const [fbName, fb] of fbEntries) {
+      const outcome = verdictToOutcome(fb.verdict);
+      if (!outcome) { delete session.explicitFeedback[fbName]; continue; }
+      const entry = [...session.pendingFlashes].reverse().find(pf => pf.sourceNeurons.includes(fbName));
+      if (!entry) {
+        // Nothing to route through the pursuit path (flash entry gone): apply directly.
+        await applyVerdictToNeuron({ runCypher, name: fbName, ns, verdict: fb.verdict, note: fb.note, log })
+          .catch(e => log('error', 'warn', e.message));
+        delete session.explicitFeedback[fbName];
+        continue;
+      }
+      const covered = parsed.flash_results.some(fr =>
+        session.pendingFlashes.find(pf => pf.flashes.some(f => f === fr.flash_text))?.sourceNeurons.includes(fbName));
+      if (!covered) {
+        parsed.flash_results.push({ flash_text: entry.flashes[0], status: outcome.status, synthetic: true });
+      }
+    }
+  }
+
   // Process pursuit/dismissal (with fair domain scoring)
   if (parsed.flash_results?.length) {
     for (const fr of parsed.flash_results) {
@@ -232,7 +260,23 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         const isInDomain = flashEntry.neuronDomains?.[neuronName] !== false;
         const contributingDaemon = flashEntry.neuronDaemons?.[neuronName] || 'impulse';
 
-        if (fr.status === 'pursued') {
+        // Explicit feedback wins over inference: used/useful => pursued,
+        // irrelevant/wrong => dismissed (cross-project dismissal stays neutral below).
+        // 'wrong' also flags the neuron for human review; nothing is auto-corrected.
+        const fb = session.explicitFeedback?.[neuronName];
+        const fbOutcome = fb ? verdictToOutcome(fb.verdict) : null;
+        if (fr.synthetic && !fbOutcome) continue;
+        if (fbOutcome) {
+          if (feedbackDone.has(neuronName)) continue; // applied once per summarize
+          feedbackDone.add(neuronName);
+          if (fbOutcome.flagReview) {
+            await flagNeuronForReview({ runCypher, name: neuronName, ns, note: fb.note, log })
+              .catch(e => log('error', 'warn', e.message));
+          }
+        }
+        const status = fbOutcome ? fbOutcome.status : fr.status;
+
+        if (status === 'pursued') {
           // Consolidation window: only reinforce score/weights once per session per neuron
           const alreadyReinforced = session.pursuedThisSession.has(neuronName);
 
@@ -313,6 +357,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     }
     log('summarize', 'info', `pursuit detection: ${parsed.flash_results.length} flashes evaluated`);
   }
+  // Consume the explicit feedback that was applied above.
+  for (const name of feedbackDone) delete session.explicitFeedback[name];
+  if (feedbackDone.size) log('summarize', 'info', `explicit feedback applied: ${[...feedbackDone].join(', ').substring(0, 200)}`);
 
   // Update active topics
   if (parsed.train_of_thought?.length) {
