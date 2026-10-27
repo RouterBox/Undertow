@@ -19,6 +19,41 @@
 import { getDaemonConfig } from './loader.js';
 import { getEmbedding } from '../embeddings.js';
 
+/**
+ * Pull the most recent human-readable conversation out of a JSONL transcript tail.
+ * Keeps user/assistant text blocks; drops tool results, thinking, tool calls, system reminders
+ * and every non-message entry type. Returns the newest messages that fit in maxChars, oldest first.
+ */
+function extractConversation(rawTail, maxChars) {
+  const lines = rawTail.split('\n');
+  lines.shift(); // first line of a tail slice is usually cut mid-entry
+  const messages = [];
+  for (const line of lines) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type !== 'user' && entry.type !== 'assistant') continue;
+    const content = entry.message?.content;
+    let text = '';
+    if (typeof content === 'string') {
+      text = content;
+    } else if (Array.isArray(content)) {
+      text = content.filter(b => b?.type === 'text' && b.text).map(b => b.text).join('\n');
+    }
+    text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+    if (!text) continue;
+    messages.push(`${entry.type === 'user' ? 'User' : 'Assistant'}: ${text.slice(0, 700)}`);
+  }
+  const kept = [];
+  let total = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (total + messages[i].length > maxChars && kept.length) break;
+    kept.unshift(messages[i]);
+    total += messages[i].length;
+  }
+  return kept.join('\n\n').slice(-maxChars);
+}
+
 export default {
   name: 'wonder',
   type: 'upstream',
@@ -48,8 +83,9 @@ export default {
       try {
         const { readFile } = await import('fs/promises');
         const raw = await readFile(transcriptPath, 'utf8');
-        // Get last ~3000 chars — enough for conversation context
-        transcript = raw.slice(-3000);
+        // The tail of a Claude Code JSONL is mostly hook/system/api-request entries, so slicing raw
+        // text hands the model only metadata. Keep just the real user/assistant text.
+        transcript = extractConversation(raw.slice(-400000), 3000);
       } catch {
         transcript = '';
       }
