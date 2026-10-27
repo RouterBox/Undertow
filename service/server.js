@@ -96,8 +96,8 @@ async function callAnthropic(model, system, userContent, maxTokens = 500) {
       const message = await anthropic.messages.create({
         model: currentModel,
         max_tokens: maxTokens,
-        // Haiku 5.5 thinks by default and burns small max_tokens budgets before writing any text.
-        ...(currentModel.startsWith('claude-haiku') ? { thinking: { type: 'disabled' } } : {}),
+        // Haiku 5.5 and Sonnet 5 think by default and burn small max_tokens budgets before writing any text.
+        ...(currentModel.startsWith('claude-haiku') || currentModel.startsWith('claude-sonnet-5') ? { thinking: { type: 'disabled' } } : {}),
         system,
         messages: [{ role: 'user', content: userContent }]
       });

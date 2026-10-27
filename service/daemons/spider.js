@@ -39,22 +39,26 @@ async function recomputeGDS(runCypher, log, ns = null) {
     log('spider', 'info', `skipping GDS: only ${nodeCount} neurons`);
     return;
   }
-  await runCypher(`CALL gds.graph.drop('undertow-graph', false)`).catch(() => {});
-  // Cypher projection so only this namespace's sub-graph gets scored —
-  // GDS scores must not flow across namespace boundaries.
-  await runCypher(`
-    CALL gds.graph.project.cypher('undertow-graph',
-      'MATCH (n:Neuron) WHERE (($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns) AND n.superseded IS NULL RETURN id(n) AS id',
-      'MATCH (a:Neuron)-[s:SYNAPSE]-(b:Neuron) WHERE ((($ns IS NULL AND a.namespace IS NULL) OR a.namespace = $ns) AND (($ns IS NULL AND b.namespace IS NULL) OR b.namespace = $ns)) RETURN id(a) AS source, id(b) AS target, s.weight AS weight',
-      { parameters: { ns: $ns } })
-  `, { ns }).catch(e => log('spider', 'warn', `GDS projection failed: ${e.message}`));
-  await runCypher(`CALL gds.pageRank.write('undertow-graph', { writeProperty: 'pagerank', maxIterations: 20 })`)
-    .catch(e => log('spider', 'warn', `PageRank failed: ${e.message}`));
-  await runCypher(`CALL gds.betweenness.write('undertow-graph', { writeProperty: 'bridge_score' })`)
-    .catch(e => log('spider', 'warn', `Betweenness failed: ${e.message}`));
-  await runCypher(`CALL gds.louvain.write('undertow-graph', { writeProperty: 'community_id' })`)
-    .catch(e => log('spider', 'warn', `Louvain failed: ${e.message}`));
-  await runCypher(`CALL gds.graph.drop('undertow-graph', false)`).catch(() => {});
+  // Unique graph name per run so overlapping Spider runs cannot collide on a shared GDS graph.
+  const graphName = `undertow-graph-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  try {
+    // Cypher projection so only this namespace's sub-graph gets scored —
+    // GDS scores must not flow across namespace boundaries.
+    await runCypher(`
+      CALL gds.graph.project.cypher('${graphName}',
+        'MATCH (n:Neuron) WHERE (($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns) AND n.superseded IS NULL RETURN id(n) AS id',
+        'MATCH (a:Neuron)-[s:SYNAPSE]-(b:Neuron) WHERE ((($ns IS NULL AND a.namespace IS NULL) OR a.namespace = $ns) AND (($ns IS NULL AND b.namespace IS NULL) OR b.namespace = $ns)) RETURN id(a) AS source, id(b) AS target, s.weight AS weight',
+        { parameters: { ns: $ns } })
+    `, { ns }).catch(e => log('spider', 'warn', `GDS projection failed: ${e.message}`));
+    await runCypher(`CALL gds.pageRank.write('${graphName}', { writeProperty: 'pagerank', maxIterations: 20 })`)
+      .catch(e => log('spider', 'warn', `PageRank failed: ${e.message}`));
+    await runCypher(`CALL gds.betweenness.write('${graphName}', { writeProperty: 'bridge_score' })`)
+      .catch(e => log('spider', 'warn', `Betweenness failed: ${e.message}`));
+    await runCypher(`CALL gds.louvain.write('${graphName}', { writeProperty: 'community_id' })`)
+      .catch(e => log('spider', 'warn', `Louvain failed: ${e.message}`));
+  } finally {
+    await runCypher(`CALL gds.graph.drop('${graphName}', false)`).catch(() => {});
+  }
   log('spider', 'info', 'GDS recomputed: pagerank, bridge_score, community_id');
 }
 
