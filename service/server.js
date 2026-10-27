@@ -22,7 +22,8 @@ import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { handleSummarize, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
-import { sanitizeNamespace } from './namespaces.js';
+import { sanitizeNamespace, livePredicate } from './namespaces.js';
+import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
 import { importVault, reverseTapestry } from './vault.js';
 import vaultwatch from './daemons/vaultwatch.js';
@@ -182,9 +183,9 @@ const FLASHMODE_FILE = join(__dirname, '.undertow-flashmode');
 let flashMode = (() => {
   try {
     const m = readFileSync(FLASHMODE_FILE, 'utf8').trim();
-    return ['both', 'raw', 'haiku'].includes(m) ? m : 'haiku';
+    return ['both', 'raw', 'haiku', 'curated'].includes(m) ? m : 'haiku';
   } catch { return 'haiku'; }
-})(); // 'both' (Haiku + raw), 'raw' (neurons only, fast), 'haiku' (Haiku only, crafted)
+})(); // 'both' (Haiku + raw), 'raw' (neurons only, fast), 'haiku' (Haiku only, crafted), 'curated' (Haiku selects, stored neurons injected)
 
 // --- Session State ---
 const sessions = new Map(); // session_id -> { activeTopics: [], pendingFlashes: [] }
@@ -244,9 +245,9 @@ app.get('/undertow/toggle', (req, res) => {
   res.json({ enabled: undertowEnabled, flashMode });
 });
 
-// Set flash mode: 'both', 'raw', 'haiku'
+// Set flash mode: 'both', 'raw', 'haiku', 'curated'
 app.post('/undertow/mode/:mode', (req, res) => {
-  const valid = ['both', 'raw', 'haiku'];
+  const valid = ['both', 'raw', 'haiku', 'curated'];
   if (!valid.includes(req.params.mode)) {
     return res.status(400).json({ error: `Invalid mode. Use: ${valid.join(', ')}` });
   }
@@ -844,6 +845,101 @@ app.post('/undertow/chase', async (req, res) => {
     res.json({ status: 'chased', neuron });
   } catch (e) {
     log('chase', 'error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /undertow/neuron — read-only neighborhood lookup (no score changes).
+// ?name=<exact name> or ?uid=<uid or 8+ char prefix>, &limit=12 (max 30), &namespace=<ns>
+// Only live (non-superseded) neurons in the requested namespace are returned.
+app.get('/undertow/neuron', async (req, res) => {
+  try {
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    const uid = typeof req.query.uid === 'string' ? req.query.uid.trim().toLowerCase() : '';
+    if (!name && !uid) return res.status(400).json({ error: 'name or uid required' });
+    if (uid && !/^[0-9a-f-]{4,36}$/.test(uid)) return res.status(400).json({ error: 'uid must be a uid or a hex prefix of it (4+ chars)' });
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 12, 1), 30);
+    const ns = sanitizeNamespace(req.query.namespace);
+
+    const matches = await runCypher(`
+      MATCH (n:Neuron)
+      WHERE ${livePredicate('n')} AND ${uid ? 'toLower(n.uid) STARTS WITH $uid' : 'n.name = $name'}
+      RETURN n.uid AS uid, n.name AS name, n.node_type AS type, n.flash_summary AS flash_summary,
+             n.body AS body, n.tier AS tier, toString(n.event_date) AS event_date,
+             n.project AS project, n.namespace AS namespace,
+             n.times_surfaced AS times_surfaced, n.times_pursued AS times_pursued,
+             n.times_dismissed AS times_dismissed, n.base_score AS base_score,
+             n.needs_review AS needs_review
+      LIMIT 6
+    `, { name, uid, ns });
+
+    if (matches.length === 0) {
+      return res.status(404).json({ error: `no live neuron found for ${uid ? `uid prefix "${uid}"` : `name "${name}"`}${ns ? ` in namespace "${ns}"` : ''}` });
+    }
+    if (matches.length > 1) {
+      return res.status(409).json({
+        error: 'ambiguous: more than one neuron matches; retry with a longer uid or the exact name',
+        candidates: matches.map(m => ({ name: m.name, uid: m.uid, type: m.type }))
+      });
+    }
+    const neuron = matches[0];
+    const connected = await runCypher(`
+      MATCH (n:Neuron {uid: $uid})-[s:SYNAPSE]-(c:Neuron)
+      WHERE ${livePredicate('c')}
+      RETURN c.name AS name, c.uid AS uid, c.node_type AS type, c.flash_summary AS flash_summary,
+             s.weight AS weight, s.edge_type AS edge_type,
+             CASE WHEN startNode(s) = n THEN 'out' ELSE 'in' END AS direction
+      ORDER BY s.weight DESC
+      LIMIT toInteger($limit)
+    `, { uid: neuron.uid, limit, ns });
+    res.json({ neuron, connected, connected_returned: connected.length, limit });
+  } catch (e) {
+    log('neuron', 'error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /undertow/feedback — explicit ground-truth verdict on a surfaced neuron.
+// { neuron, verdict: used|useful|irrelevant|wrong, note?, session_id? }
+// Recorded on the session; Dreamer applies it at the next Stop in place of its own
+// pursuit inference for that neuron. With no matching session it is applied directly.
+app.post('/undertow/feedback', async (req, res) => {
+  if (!undertowEnabled) return res.json({ status: 'disabled' });
+  try {
+    const { neuron, verdict, note, session_id } = req.body || {};
+    if (typeof neuron !== 'string' || !neuron.trim()) return res.status(400).json({ error: 'neuron name required' });
+    if (!FEEDBACK_VERDICTS.includes(verdict)) return res.status(400).json({ error: `verdict must be one of: ${FEEDBACK_VERDICTS.join(', ')}` });
+    const cleanNote = typeof note === 'string' ? note.substring(0, 500) : '';
+
+    // Session resolution: explicit session_id (if it has the neuron pending), else the
+    // most recently active in-memory session that was shown this neuron.
+    const shown = (s) => s.pendingFlashes.some(pf => pf.sourceNeurons.includes(neuron));
+    let matchedId = null;
+    if (session_id && sessions.has(session_id) && shown(sessions.get(session_id))) {
+      matchedId = session_id;
+    } else {
+      let best = -1;
+      for (const [id, s] of sessions) {
+        if (shown(s) && s.lastActivity > best) { best = s.lastActivity; matchedId = id; }
+      }
+    }
+
+    if (matchedId) {
+      const s = sessions.get(matchedId);
+      s.explicitFeedback = s.explicitFeedback || {};
+      s.explicitFeedback[neuron] = { verdict, note: cleanNote, ts: Date.now() };
+      log('feedback', 'info', `explicit feedback: ${verdict} "${neuron.substring(0, 60)}"`, { detail: `session ${String(matchedId).slice(0, 8)}${cleanNote ? ` — ${cleanNote}` : ''}` });
+      return res.json({ status: 'recorded', neuron, verdict, session: matchedId, applied: 'at next turn summarize (Dreamer)' });
+    }
+
+    const ns = sanitizeNamespace(req.body.namespace) ?? (session_id && sessions.get(session_id)?.namespace) ?? null;
+    const exists = await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} RETURN n.name AS name LIMIT 1`, { name: neuron, ns });
+    if (exists.length === 0) return res.status(404).json({ error: `no live neuron named "${neuron}"` });
+    await applyVerdictToNeuron({ runCypher, name: neuron, ns, verdict, note: cleanNote, log });
+    log('feedback', 'info', `explicit feedback applied directly: ${verdict} "${neuron.substring(0, 60)}"`, { detail: 'no matching session' });
+    res.json({ status: 'applied_directly', neuron, verdict, session: null, note: 'no session with this neuron among its surfaced flashes; verdict applied to the neuron directly' });
+  } catch (e) {
+    log('feedback', 'error', e.message);
     res.status(500).json({ error: e.message });
   }
 });
