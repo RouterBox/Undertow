@@ -4,6 +4,7 @@
 import neo4j from 'neo4j-driver';
 import { lexicalSearch } from './lexical.js';
 import { nsPredicate, livePredicate } from '../namespaces.js';
+import { parseCuratedSelection, formatCuratedBlock, MAX_CURATED_PICKS } from './curated.js';
 
 // --- Project helpers ---
 
@@ -51,6 +52,32 @@ Return JSON:
 }
 
 Return {"flashes": [], "topics_detected": []} when nothing is genuinely worth surfacing.`;
+
+// Curated mode: Haiku only SELECTS from a numbered list; the injected text is built
+// from the stored neurons themselves (no rewritten flash text).
+const QUERY_SYSTEM_PROMPT_CURATED = `You are Undertow, a subconscious memory daemon. You are given a NUMBERED list of candidate memories and decide which (if any) are worth injecting into the agent's context.
+
+THRESHOLD: Most of the time, the right answer is NOTHING. Select none unless a candidate would genuinely change how the agent approaches the current prompt. Silence is accuracy, not failure.
+
+When you DO select:
+1. Prioritize NON-OBVIOUS connections. The agent will find the obvious things itself.
+2. CONTRADICTION CHECK: If a stored fact conflicts with what the prompt assumes, that candidate is always worth selecting.
+3. Select at most ${MAX_CURATED_PICKS} candidates. One is usually enough. Zero is often best.
+4. "why" is at most 12 words: why this memory matters to THIS prompt. It states relevance, not advice.
+
+SURFACE, DON'T COACH. You report what is true or remembered. Never tell the agent what tone, voice, style, or persona to adopt. Never speculate about the agent's identity or the user's intent. You are the Id: you surface material, you do not direct the response.
+
+STAY IN DOMAIN. Stylistic or creative preferences are ONLY relevant when the current prompt is itself that kind of task. Do NOT select a creative-writing preference, a tone preference, or a persona note during analytical, factual, or technical work.
+
+NO IDENTITY BLEED. Undertow's own nature (subconscious daemon, Freudian framing, etc.) describes the memory system, NOT the main agent.
+
+Return ONLY JSON, using the candidate numbers from the list:
+{
+  "selected": [{"n": 3, "why": "at most 12 words"}],
+  "topics_detected": ["topic1", "topic2"]
+}
+
+Return {"selected": [], "topics_detected": []} when nothing is genuinely worth surfacing.`;
 
 // --- Query cache (deduplicates retries) ---
 const queryCache = new Map(); // key: prompt hash → { result, timestamp }
@@ -454,6 +481,79 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
     return { responseJson: rawResult, session };
   }
 
+  // CURATED MODE: Haiku selects from a numbered list; we inject the selected neurons
+  // themselves (flash + body preview + handle), never Haiku-rewritten text.
+  if (flashMode === 'curated') {
+    const queryResult = await callAnthropic(QUERY_MODEL, QUERY_SYSTEM_PROMPT_CURATED, `User prompt: "${prompt.substring(0, 500)}"
+
+Working directory: ${cwd || 'unknown'}
+Active topics: ${session.activeTopics.join(', ') || 'none'}
+
+Candidate memories from graph search (numbered):
+${unique.map((r, i) => `${i + 1}. [${r.type}] ${r.name}: ${r.flash}${r.event_date ? ` (on ${r.event_date})` : ''}`).join('\n')}
+
+Select the candidates worth surfacing (possibly none). Return JSON.`);
+    if (!queryResult) return { responseJson: {}, session };
+
+    const responseText = queryResult.response.content[0]?.text || '{}';
+    const sel = parseCuratedSelection(responseText, unique.length);
+    if (sel.malformed) {
+      log('query', 'warn', 'curated: model response had no usable selected array', { detail: responseText.substring(0, 400) });
+    }
+    if (sel.topics.length) {
+      session.activeTopics = [...new Set([...sel.topics, ...session.activeTopics])].slice(0, 10);
+    }
+
+    const picks = sel.selected.map(({ n, why }) => ({ ...unique[n - 1], why }));
+    const elapsed = Date.now() - startTime;
+    log('query', 'info', `completed in ${elapsed}ms (curated)`, {
+      detail: `${picks.length} flashes, ${unique.length} candidates`,
+      elapsed,
+      flashCount: picks.length,
+      candidateCount: unique.length,
+      prompt: prompt.substring(0, 100),
+      session_id: session_id || 'default'
+    });
+
+    if (picks.length === 0) {
+      log('query', 'info', 'no flashes to inject');
+      setCachedQuery(prompt, cacheScope, {}); // cache the empty result like the other modes
+      return { responseJson: {}, session };
+    }
+
+    // Candidate rows carry no body: fetch bodies/uids for the (<=4) picks in one query.
+    try {
+      const rows = await runCypher(`
+        MATCH (n:Neuron) WHERE n.name IN $names AND ${livePredicate('n')}
+        RETURN n.name AS name, n.uid AS uid, n.body AS body
+      `, { names: picks.map((p) => p.name), ns });
+      const byName = new Map(rows.map((r) => [r.name, r]));
+      for (const p of picks) {
+        const row = byName.get(p.name);
+        if (row) { p.body = row.body; p.uid = p.uid || row.uid; }
+      }
+    } catch (e) {
+      log('query', 'warn', `curated: body fetch failed: ${e.message}`);
+    }
+
+    // Track ONLY the selected neurons for Dreamer's pursuit matching.
+    session.pendingFlashes.push({
+      turn: Date.now(),
+      flashes: picks.map((p) => `${p.name}: ${p.flash}`),
+      sourceNeurons: picks.map((p) => p.name),
+      neuronDomains: picks.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
+      neuronDaemons: picks.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
+    });
+
+    const flashBlock = formatCuratedBlock(picks, unique.length, elapsed);
+    log('query', 'info', 'flashes injected', { detail: picks.map((p) => `${p.name}: ${p.flash}`).join(' | ') });
+    log('injection', 'info', 'CONTEXT INJECTED', { detail: flashBlock });
+
+    const curatedResult = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: flashBlock } };
+    setCachedQuery(prompt, cacheScope, curatedResult);
+    return { responseJson: curatedResult, session };
+  }
+
   // HAIKU / BOTH MODE: Ask Haiku to judge and craft flashes
   const queryResult = await callAnthropic(QUERY_MODEL, QUERY_SYSTEM_PROMPT, `User prompt: "${prompt.substring(0, 500)}"
 
@@ -543,4 +643,4 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
   return { responseJson: {}, session };
 }
 
-export { QUERY_SYSTEM_PROMPT, handleQuery, mapCwdToProject, isNeuronInProject };
+export { QUERY_SYSTEM_PROMPT, QUERY_SYSTEM_PROMPT_CURATED, handleQuery, mapCwdToProject, isNeuronInProject };
