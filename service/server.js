@@ -882,8 +882,10 @@ app.get('/undertow/neuron', async (req, res) => {
         candidates: matches.map(m => ({ name: m.name, uid: m.uid, type: m.type }))
       });
     }
-    const neuron = matches[0];
-    const connected = await runCypher(`
+    // Neo4j integers arrive as {low, high}; flatten them for JSON consumers.
+    const plain = (row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, neo4j.isInt(v) ? v.toNumber() : v]));
+    const neuron = plain(matches[0]);
+    const connected = (await runCypher(`
       MATCH (n:Neuron {uid: $uid})-[s:SYNAPSE]-(c:Neuron)
       WHERE ${livePredicate('c')}
       RETURN c.name AS name, c.uid AS uid, c.node_type AS type, c.flash_summary AS flash_summary,
@@ -891,7 +893,7 @@ app.get('/undertow/neuron', async (req, res) => {
              CASE WHEN startNode(s) = n THEN 'out' ELSE 'in' END AS direction
       ORDER BY s.weight DESC
       LIMIT toInteger($limit)
-    `, { uid: neuron.uid, limit, ns });
+    `, { uid: neuron.uid, limit, ns })).map(plain);
     res.json({ neuron, connected, connected_returned: connected.length, limit });
   } catch (e) {
     log('neuron', 'error', e.message);
