@@ -61,7 +61,7 @@ Only include memories that are likely relevant to the working directory or recen
 
 // --- Summarize handler (Stop hook) ---
 
-async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log }) {
+async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
   const { session_id, transcript_path, cwd } = req_body;
 
   // Namespace isolation: writes and reinforcement stay inside the session's
@@ -368,7 +368,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
 
   // Opus daemon: prepare flashes for next turn using full transcript context
   // (live graph only — skip for namespaced sessions)
-  if (!ns && isDaemonEnabled('wonder')) {
+  if (!ns && !skipWonder && isDaemonEnabled('wonder')) {
     log('summarize', 'info', 'triggering wonder daemon');
     wonder.prepare({
       session, transcriptPath: transcript_path, cwd, sessionId: session_id,
@@ -472,4 +472,20 @@ async function handleRehydrate({ req_body, session, runCypher, log }) {
   };
 }
 
-export { SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
+// Stop-hook entry that applies turn habituation: a habituated turn is a
+// heartbeat, so no daemon takes a turn there. 'repeat' skips everything;
+// 'plumbing' skips only Wonder's prepare (task notifications often carry real
+// work, so Dreamer/Spider/Janitor/Prowler still run - deliberate carve-out).
+async function summarizeForTurn(deps, keeper) {
+  const sid = deps.req_body.session_id || 'default';
+  const reason = keeper.turnHabituation(sid);
+  if (reason === 'repeat') {
+    keeper.countFastPath(sid);
+    deps.log('keeper', 'info', `habituated turn (repeat) - skipped (${String(sid).slice(0, 8)})`);
+    return { skipped: true };
+  }
+  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing' });
+  return { skipped: false };
+}
+
+export { summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };

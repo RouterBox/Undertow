@@ -53,6 +53,10 @@ let config = { ...defaults };
 let ledger = new Map(); // sessionId → entry
 let dirty = false;
 let logFn = () => {};
+// Why each session's latest prompt was habituated: 'repeat' | 'plumbing'.
+// In-memory only (turn-scoped; a stale flag surviving a restart would wrongly
+// skip a later Stop). Absent key = the latest prompt was not habituated.
+const turnReasons = new Map();
 let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0 };
 
 // A prompt that is harness plumbing rather than a human thought — task
@@ -200,7 +204,7 @@ const keeper = {
    * promotion rule, and returns { tier, promoted, habituated }.
    */
   recordPrompt(sessionId, cwd, explicitTier, promptText) {
-    if (!config.enabled) return { tier: 'conscious', promoted: false, habituated: false };
+    if (!config.enabled) return { tier: 'conscious', promoted: false, habituated: false, reason: null };
     const e = getEntry(sessionId, cwd, explicitTier);
     const t = now();
 
@@ -208,7 +212,8 @@ const keeper = {
     // thought — suppress unconditionally, no fingerprint or window needed.
     if (promptText && isSystemPlumbing(promptText)) {
       stats.habituated++;
-      return { tier: e.tier, promoted: false, habituated: true };
+      turnReasons.set(sessionId, 'plumbing');
+      return { tier: e.tier, promoted: false, habituated: true, reason: 'plumbing' };
     }
 
     // Habituation: repeated near-identical prompts are loop ticks. They keep
@@ -226,9 +231,12 @@ const keeper = {
       dirty = true;
       if (lastSeen && (t - lastSeen) < (config.habituationHours || 6) * 3600_000) {
         stats.habituated++;
-        return { tier: e.tier, promoted: false, habituated: true };
+        turnReasons.set(sessionId, 'repeat');
+        return { tier: e.tier, promoted: false, habituated: true, reason: 'repeat' };
       }
     }
+
+    turnReasons.delete(sessionId); // a real (non-habituated) prompt clears the flag
 
     if (e.lastPrompt && (t - e.lastPrompt) >= (config.minCadenceSeconds * 1000)) e.humanGaps++;
     e.lastPrompt = t;
@@ -236,7 +244,18 @@ const keeper = {
     dirty = true;
 
     const promoted = maybePromote(e, sessionId);
-    return { tier: e.tier, promoted, habituated: false };
+    return { tier: e.tier, promoted, habituated: false, reason: null };
+  },
+
+  /**
+   * Why the session's latest prompt was habituated: 'repeat' | 'plumbing' | null.
+   * A habituated turn is a heartbeat, so Stop/PostToolUse consult this to keep
+   * daemons from taking a turn there. Stop fires after that turn's prompt hook,
+   * so reading it at Stop is right; caveat: parallel turns in one session id
+   * share a single flag (last prompt wins).
+   */
+  turnHabituation(sessionId) {
+    return turnReasons.get(sessionId) || null;
   },
 
   /**

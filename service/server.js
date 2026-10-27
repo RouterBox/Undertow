@@ -20,7 +20,7 @@ import janitor from './daemons/janitor.js';
 import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo } from './embeddings.js';
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
-import { handleSummarize, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
+import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
 import { sanitizeNamespace, livePredicate } from './namespaces.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
@@ -315,6 +315,13 @@ app.post('/undertow/ingest', async (req, res) => {
     log('keeper', 'info', `gated: ${ingestTier} session ${String(req.body.session_id || 'default').slice(0, 8)} — ingest dropped`);
     return;
   }
+  // A habituated (repeat) turn is a heartbeat: Gobble takes no turn. Plumbing
+  // turns still ingest (they often carry real work).
+  if (keeper.turnHabituation(req.body.session_id || 'default') === 'repeat') {
+    keeper.countFastPath(req.body.session_id || 'default');
+    log('keeper', 'info', `habituated turn (repeat) - skipped ingest (${String(req.body.session_id || 'default').slice(0, 8)})`);
+    return;
+  }
   log('hook', 'info', 'PostToolUse');
 
   try {
@@ -348,7 +355,7 @@ app.post('/undertow/summarize', async (req, res) => {
   try {
     req.body.namespace = sanitizeNamespace(req.body.namespace);
     const session = getSession(req.body.session_id || 'default');
-    await handleSummarize({
+    await summarizeForTurn({
       req_body: req.body,
       session,
       runCypher,
@@ -362,7 +369,7 @@ app.post('/undertow/summarize', async (req, res) => {
       janitor,
       prowler,
       log
-    });
+    }, keeper);
   } catch (e) {
     log('summarize', 'error', e.message);
   }
