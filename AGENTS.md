@@ -39,11 +39,12 @@ Hooks (settings.json) → Undertow Service (localhost:3030) → Haiku/Sonnet →
 
 ## Flash Modes
 
-Undertow has three flash modes controlled via `POST /undertow/mode/:mode`:
+Undertow has four flash modes controlled via `POST /undertow/mode/:mode`:
 
 - **`haiku`** (recommended) — Only Haiku's crafted flash text is injected. Clean context.
 - **`both`** — Haiku interpretation + raw neuron data. Richer but more verbose.
 - **`raw`** — Raw neurons only, no Haiku. Fast, zero LLM cost, no interpretation.
+- **`curated`** — Haiku only *selects* (at most 4, often zero) from a numbered candidate list; the injected block is built from the selected neurons themselves: `[type] name: flash`, a ~300-char body preview, a handle (`{name, uid}`), and Haiku's one-line "why". No Cypher. Nothing is injected when nothing is selected. The block ends with a pointer to the MCP tools `undertow_neighbors` (explore a neuron's connections via `GET /undertow/neuron`) and `undertow_feedback` (`POST /undertow/feedback`, verdicts `used` / `useful` / `irrelevant` / `wrong`). Explicit feedback is ground truth for Dreamer's pursuit/dismissal; `wrong` also sets `needs_review` on the neuron (never auto-corrects).
 
 Current default is `haiku` — keeps the context window clean.
 
@@ -140,6 +141,8 @@ Health check: `curl http://localhost:3030/health`
 | POST /undertow/ingest-file | Ingest a local file |
 | POST /undertow/correct | Agent-initiated memory correction |
 | POST /undertow/chase | Agent-initiated follow-up pursuit |
+| GET /undertow/neuron | Read-only neuron + connected neurons (`?name=` or `?uid=`, `&limit=`) |
+| POST /undertow/feedback | Explicit verdict on a surfaced neuron (used/useful/irrelevant/wrong) |
 | GET/POST /undertow/daemon-config | View/update daemon settings |
 
 ### Utility
@@ -150,7 +153,7 @@ Health check: `curl http://localhost:3030/health`
 | GET /undertow/health | Graph health metrics + alerts |
 | GET /undertow/logs | Log viewer with filtering |
 | GET/POST /undertow/toggle | Enable/disable Undertow |
-| POST /undertow/mode/:mode | Set flash mode (haiku/both/raw) |
+| POST /undertow/mode/:mode | Set flash mode (haiku/both/raw/curated) |
 | POST /undertow/external-ingest | Cross-agent memory intake |
 
 ## Flash Hygiene
