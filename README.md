@@ -224,6 +224,16 @@ export async function createMessage({ model, system, userContent, maxTokens, thi
 
 `thinking` is `undefined` or `{ type: 'disabled' }` and can be ignored by backends without a thinking mode. Throw an error with `status = 429` or `529` to get Undertow's built-in retry and model fallback. Set the `UNDERTOW_*_MODEL` variables to model ids your backend understands.
 
+### MCP endpoint
+
+The service exposes its API as MCP tools over Streamable HTTP at `/mcp` — no separate MCP server process needed. For Claude Code:
+
+```bash
+claude mcp add --transport http undertow http://127.0.0.1:3030/mcp
+```
+
+Tools: `undertow_health_check`, `undertow_query`, `undertow_chase`, `undertow_stats`, `undertow_patterns`, `undertow_correct`, `undertow_ingest`, `undertow_spider`, `undertow_logs`, `undertow_neighbors`, `undertow_feedback`. Each returns the route's JSON plus `http_status`, flagged `isError` on non-2xx. Names and input schemas match the standalone `undertow-mcp` 1.1.0 stdio server, so it is a drop-in replacement.
+
 ---
 
 ## Roadmap

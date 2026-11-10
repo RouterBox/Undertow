@@ -7,6 +7,7 @@ dotenv.config({ path: join(__dirname, '.env') });
 import express from 'express';
 import neo4j from 'neo4j-driver';
 import { callLLM, resolveModel, getProvider, usesAnthropicProvider } from './llm.js';
+import { mountMcp, createHttpDispatch } from './mcp.js';
 import { readFile, appendFile, mkdir, writeFile } from 'fs/promises';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { basename as pathBasename } from 'path';
@@ -1359,8 +1360,20 @@ app.get('/undertow/logs', async (req, res) => {
   }
 });
 
+// --- MCP endpoint (/mcp) ---
+// Tools call this service's own routes over loopback, so they get exactly the
+// same validation and behavior as any HTTP caller.
+function loopbackBaseUrl() {
+  const addr = httpServer.address();
+  let host = addr.address;
+  if (host === '0.0.0.0' || host === '::') host = '127.0.0.1';
+  if (host.includes(':')) host = `[${host}]`;
+  return `http://${host}:${addr.port}`;
+}
+mountMcp(app, { dispatch: createHttpDispatch(loopbackBaseUrl), log });
+
 // --- Startup ---
-app.listen(PORT, async () => {
+const httpServer = app.listen(PORT, async () => {
   try {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
