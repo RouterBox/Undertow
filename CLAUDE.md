@@ -182,8 +182,9 @@ When a flash contains an interesting lead, **chase it through the graph**. Each 
 
 **How to chase:**
 ```bash
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 curl -s -X POST http://localhost:7474/db/neo4j/tx/commit \
-  -H "Content-Type: application/json" -u "${NEO4J_USER:-neo4j}:$NEO4J_PASS" \
+  -H "Content-Type: application/json" -u "$NEO4J_USER:$NEO4J_PASS" \
   -d '{"statements": [{"statement": "MATCH (n:Neuron {name: \"NEURON_NAME\"})-[s:SYNAPSE]-(connected) RETURN n.flash_summary, n.body, type(s), s.weight, s.edge_type, connected.name, connected.flash_summary"}]}'
 ```
 

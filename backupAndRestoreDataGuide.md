@@ -64,7 +64,8 @@ bash export.sh
 The script runs:
 
 ```bash
-docker exec neo4j cypher-shell -u "${NEO4J_USER:-neo4j}" -p "$NEO4J_PASS" "
+NEO4J_USER="${NEO4J_USER:-neo4j}"
+docker exec neo4j cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASS" "
 CALL apoc.export.cypher.all(null, {format: 'cypher-shell', stream: true})
 YIELD cypherStatements
 RETURN cypherStatements
@@ -97,8 +98,9 @@ existing graph will fail on duplicate-name constraints.
 
 ```bash
 docker start neo4j  # if not running
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 cat exports/undertow-latest.cypher | \
-  docker exec -i neo4j cypher-shell -u "${NEO4J_USER:-neo4j}" -p "$NEO4J_PASS"
+  docker exec -i neo4j cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASS"
 ```
 
 After restore, sanity-check:
@@ -133,8 +135,8 @@ docker stop neo4j
 docker rm neo4j
 
 # Recreate on a new volume name (e.g., neo4j_data_v2):
-export NEO4J_AUTH="${NEO4J_USER:-neo4j}/${NEO4J_PASS}"
-docker run -d --name neo4j \
+NEO4J_USER="${NEO4J_USER:-neo4j}"
+NEO4J_AUTH="$(printf '%s/%s' "$NEO4J_USER" "$NEO4J_PASS")" docker run -d --name neo4j \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH \
   -e NEO4J_PLUGINS='["apoc","graph-data-science"]' \
@@ -210,8 +212,9 @@ volume's current password and setting the new one from your `.env`:
 ```bash
 # OLD_NEO4J_PASS: the password the volume currently has.
 # NEO4J_PASS:     the new password (from service/.env).
-docker exec -it neo4j cypher-shell -u "${NEO4J_USER:-neo4j}" -p "$OLD_NEO4J_PASS" \
-  "ALTER USER ${NEO4J_USER:-neo4j} SET PASSWORD '$NEO4J_PASS'"
+NEO4J_USER="${NEO4J_USER:-neo4j}"
+docker exec -it neo4j cypher-shell -u "$NEO4J_USER" -p "$OLD_NEO4J_PASS" \
+  "ALTER USER $NEO4J_USER SET PASSWORD '$NEO4J_PASS'"
 ```
 
 **Connection pooling on the service side.** The Node service holds a

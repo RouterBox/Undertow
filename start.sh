@@ -16,15 +16,15 @@ if [ -z "$NEO4J_PASS" ]; then
   echo "ERROR: NEO4J_PASS not set in $ENV_FILE"
   exit 1
 fi
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 
 echo "Starting Undertow..."
 
 # Start Neo4j if not running
 if ! docker ps --filter name=neo4j --format '{{.Names}}' | grep -q neo4j; then
   echo "Starting Neo4j..."
-  # Build NEO4J_AUTH at runtime and pass it to docker by name.
-  export NEO4J_AUTH="${NEO4J_USER:-neo4j}/${NEO4J_PASS}"
-  docker start neo4j 2>/dev/null || docker run -d --name neo4j \
+  # NEO4J_AUTH is composed at runtime and scoped to the docker run only.
+  docker start neo4j 2>/dev/null || NEO4J_AUTH="$(printf '%s/%s' "$NEO4J_USER" "$NEO4J_PASS")" docker run -d --name neo4j \
     -p 7474:7474 -p 7687:7687 \
     -e NEO4J_AUTH \
     -e NEO4J_PLUGINS='["apoc", "graph-data-science"]' \
