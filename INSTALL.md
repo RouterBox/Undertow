@@ -46,6 +46,7 @@ cp service/.env.example service/.env
 
 Edit `service/.env` and set, at minimum:
 - `NEO4J_PASS` — pick any password; whatever you set here will be used to create the Neo4j container in the next step.
+- `NEO4J_USER` — optional; defaults to `neo4j`. Used together with `NEO4J_PASS` everywhere below.
 - `ANTHROPIC_API_KEY` — required for Impulse/Gobble/Dreamer/Wonder.
 - `GEMINI_API_KEY` — required for vector search.
 
@@ -55,14 +56,15 @@ Optional: `BRAVE_API_KEY`, `PERPLEXITY_API_KEY` for Prowler. See comments in `.e
 
 ### Step 3: Start Neo4j
 
-The password you put in `.env` must match the one you create the Neo4j container with. Source `.env` first so `$NEO4J_PASS` is set, then run docker:
+The password you put in `.env` must match the one you create the Neo4j container with. Source `.env` first so `$NEO4J_USER` (default `neo4j`) and `$NEO4J_PASS` are set, build `NEO4J_AUTH` from them, then run docker:
 
 ```bash
 set -a; source service/.env; set +a
+export NEO4J_AUTH="${NEO4J_USER:-neo4j}/${NEO4J_PASS}"
 
 docker run -d --name neo4j \
   -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/$NEO4J_PASS \
+  -e NEO4J_AUTH \
   -e NEO4J_PLUGINS='["apoc", "graph-data-science"]' \
   -v neo4j_data:/data \
   neo4j:community
@@ -162,7 +164,7 @@ Connect to Neo4j and create required indexes:
 ```bash
 curl -X POST http://localhost:7474/db/neo4j/tx/commit \
   -H "Content-Type: application/json" \
-  -u "neo4j:$NEO4J_PASS" \
+  -u "${NEO4J_USER:-neo4j}:$NEO4J_PASS" \
   -d '{
     "statements": [
       {"statement": "CREATE INDEX neuron_name IF NOT EXISTS FOR (n:Neuron) ON (n.name)"},
@@ -200,7 +202,7 @@ To seed an initial neuron for testing:
 ```bash
 curl -X POST http://localhost:7474/db/neo4j/tx/commit \
   -H "Content-Type: application/json" \
-  -u "neo4j:$NEO4J_PASS" \
+  -u "${NEO4J_USER:-neo4j}:$NEO4J_PASS" \
   -d '{
     "statements": [
       {"statement": "CREATE (n:Neuron {name: \"Undertow Installation\", node_type: \"episode\", tier: \"T2_working\", flash_summary: \"Undertow was installed and configured successfully\", base_score: 50, times_surfaced: 0, times_pursued: 0, times_dismissed: 0, created_at: datetime(), last_surfaced: datetime(), source: \"user_input\"}) RETURN n.name"}

@@ -22,9 +22,11 @@ echo "Starting Undertow..."
 # Start Neo4j if not running
 if ! docker ps --filter name=neo4j --format '{{.Names}}' | grep -q neo4j; then
   echo "Starting Neo4j..."
+  # Build NEO4J_AUTH at runtime and pass it to docker by name.
+  export NEO4J_AUTH="${NEO4J_USER:-neo4j}/${NEO4J_PASS}"
   docker start neo4j 2>/dev/null || docker run -d --name neo4j \
     -p 7474:7474 -p 7687:7687 \
-    -e NEO4J_AUTH=neo4j/$NEO4J_PASS \
+    -e NEO4J_AUTH \
     -e NEO4J_PLUGINS='["apoc", "graph-data-science"]' \
     -v neo4j_data:/data \
     neo4j:community

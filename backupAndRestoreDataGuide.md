@@ -64,7 +64,7 @@ bash export.sh
 The script runs:
 
 ```bash
-docker exec neo4j cypher-shell -u neo4j -p "$NEO4J_PASS" "
+docker exec neo4j cypher-shell -u "${NEO4J_USER:-neo4j}" -p "$NEO4J_PASS" "
 CALL apoc.export.cypher.all(null, {format: 'cypher-shell', stream: true})
 YIELD cypherStatements
 RETURN cypherStatements
@@ -98,7 +98,7 @@ existing graph will fail on duplicate-name constraints.
 ```bash
 docker start neo4j  # if not running
 cat exports/undertow-latest.cypher | \
-  docker exec -i neo4j cypher-shell -u neo4j -p "$NEO4J_PASS"
+  docker exec -i neo4j cypher-shell -u "${NEO4J_USER:-neo4j}" -p "$NEO4J_PASS"
 ```
 
 After restore, sanity-check:
@@ -133,9 +133,10 @@ docker stop neo4j
 docker rm neo4j
 
 # Recreate on a new volume name (e.g., neo4j_data_v2):
+export NEO4J_AUTH="${NEO4J_USER:-neo4j}/${NEO4J_PASS}"
 docker run -d --name neo4j \
   -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/$NEO4J_PASS \
+  -e NEO4J_AUTH \
   -e NEO4J_PLUGINS='["apoc","graph-data-science"]' \
   -v neo4j_data_v2:/data \
   neo4j:community
