@@ -252,6 +252,8 @@ When Undertow injects a flash (`[UNDERTOW-FLASH]`), evaluate it critically:
 **"connection refused" on port 3030:** The Undertow service isn't running. Start it with `bash start.sh` or `node service/server.js`.
 The service binds `127.0.0.1` by default, so callers on another machine or in a container also get "connection refused" — set `UNDERTOW_HOST=0.0.0.0` (and `UNDERTOW_API_TOKEN`) in `service/.env`.
 
+**`LOCAL EMBEDDINGS UNAVAILABLE` at startup** (only with `EMBEDDINGS_PROVIDER=local`): the embedding model couldn't be downloaded or found, so vector search is off (`/health` shows `embeddings.available: false`). If the model host is blocked on your network, set `EMBEDDINGS_REMOTE_HOST` to a mirror, or copy the model files into `EMBEDDINGS_MODEL_DIR` (default `service/.models/<model id>/`; the error lists the exact files) and set `EMBEDDINGS_OFFLINE=true`. A cache from an earlier install has the same layout and can be copied in.
+
 **401 unauthorized:** `UNDERTOW_API_TOKEN` is set, so `/mcp` and mutating `/undertow/*` calls need an `Authorization: Bearer <token>` header (hooks included).
 
 ## Startup Script
