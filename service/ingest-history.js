@@ -16,7 +16,7 @@ import { dirname, join } from 'path';
 import { readdir, readFile, stat, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import neo4j from 'neo4j-driver';
-import Anthropic from '@anthropic-ai/sdk';
+import { getProvider, resolveModel } from './llm.js';
 import { randomUUID } from 'crypto';
 import { stripUndertowInjections } from './strip-injections.js';
 import { getEmbedding, isAvailable as embeddingsAvailable } from './embeddings.js';
@@ -31,11 +31,8 @@ if (!NEO4J_PASS) {
   console.error('NEO4J_PASS not set. Copy service/.env.example to service/.env and configure it.');
   process.exit(1);
 }
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = 'claude-haiku-5-5';
 
 const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 const STATE_FILE = join(__dirname, '.ingest-history-state.json');
 
@@ -56,9 +53,10 @@ async function runCypher(query, params = {}) {
 
 async function callHaiku(system, user) {
   try {
-    const msg = await anthropic.messages.create({
-      model: MODEL, max_tokens: 800, system,
-      messages: [{ role: 'user', content: user }]
+    // Raw provider call (no thinking override, own retry below) — unchanged semantics.
+    const provider = await getProvider();
+    const msg = await provider.createMessage({
+      model: resolveModel('ingest'), maxTokens: 800, system, userContent: user
     });
     return msg.content[0]?.text || '{}';
   } catch (e) {

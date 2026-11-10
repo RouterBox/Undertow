@@ -1,6 +1,7 @@
 // dreamer.js — Dreamer daemon (turn processing, session start, rehydration)
 // Extracted from server.js — no behavior changes
 
+import { resolveModel } from '../llm.js';
 import { readFile } from 'fs/promises';
 import { nsPredicate, livePredicate } from '../namespaces.js';
 import { supersedeNeuron } from '../supersede.js';
@@ -8,8 +9,6 @@ import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
 
-const QUERY_MODEL = 'claude-haiku-5-5';
-const SUMMARIZE_MODEL = 'claude-sonnet-5';
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
 
@@ -85,6 +84,7 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
     .filter(f => Date.now() - f.turn < 10 * 60 * 1000)
     .flatMap(f => f.flashes);
 
+  const SUMMARIZE_MODEL = resolveModel('summarize');
   const result = await callAnthropic(SUMMARIZE_MODEL, SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
 ${transcript}
 
@@ -424,7 +424,7 @@ async function handleSessionStart({ req_body, session, runCypher, callAnthropic,
     return { responseJson: {} };
   }
 
-  const startResult = await callAnthropic(QUERY_MODEL, SESSION_START_SYSTEM_PROMPT, `Working directory: ${cwd || 'unknown'}
+  const startResult = await callAnthropic(resolveModel('query'), SESSION_START_SYSTEM_PROMPT, `Working directory: ${cwd || 'unknown'}
 
 T1 index neurons:
 ${t1Neurons.map(n => `- [${n.type}] ${n.name}: ${n.flash}`).join('\n')}

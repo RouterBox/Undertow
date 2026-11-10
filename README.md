@@ -107,7 +107,7 @@ Claude Code Hooks (settings.json)
 - **Neo4j** graph database runs locally in Docker. Your data stays on your machine.
 - **Undertow service** is a Node.js/Express HTTP server on localhost:3030.
 - **Hooks** are configured in Claude Code's `settings.json` — standard hook system, no patches.
-- **Models**: Haiku for fast operations (query, ingest), Sonnet for deeper analysis (summarize).
+- **Models**: Haiku for fast operations (query, ingest), Sonnet for deeper analysis (summarize). Provider and model ids are configurable — see [Configuration](#configuration).
 
 ### The Daemons
 
@@ -188,6 +188,41 @@ Your data lives in a Docker volume on your machine. Nothing is sent anywhere exc
 - Docker
 - Node.js 18+
 - Anthropic API key (Haiku + Sonnet access)
+
+---
+
+## Configuration
+
+All settings live in `service/.env` (see `service/.env.example`). Beyond the Neo4j and API keys covered in `INSTALL.md`:
+
+### LLM provider
+
+Every model call goes through one module, `service/llm.js`. Defaults reproduce the stock setup (Anthropic, Haiku for query/ingest, Sonnet for summaries).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UNDERTOW_LLM_PROVIDER` | `anthropic` | Built-in provider. Only `anthropic` ships in core. |
+| `UNDERTOW_LLM_BASE_URL` | SDK default | Passed to the Anthropic SDK as `baseURL` (proxies, gateways, compatible endpoints). |
+| `UNDERTOW_LLM_PROVIDER_MODULE` | — | Path to an ESM module that replaces the provider (see below). Relative paths resolve from `service/`. When set, `ANTHROPIC_API_KEY` is no longer required. |
+| `UNDERTOW_QUERY_MODEL` | `claude-haiku-5-5` | Flash selection, session start, spider evaluations. |
+| `UNDERTOW_INGEST_MODEL` | `claude-haiku-5-5` | Gobble and the external / URL / file / historical ingestors. |
+| `UNDERTOW_SUMMARIZE_MODEL` | `claude-sonnet-5` | Dreamer turn summaries and Wonder's deep analysis. |
+| `UNDERTOW_FALLBACK_MODEL` | query model | Model used after repeated 429/529s. |
+| `ANTHROPIC_API_KEY` | — | Required for the built-in provider. |
+| `ANTHROPIC_WORKSPACE_ID` | — | Sent as `anthropic-workspace-id` (needed by identity-linked keys). |
+
+**Provider plugins.** To use another backend without forking, point `UNDERTOW_LLM_PROVIDER_MODULE` at a module exporting:
+
+```js
+// my-provider.mjs
+export const name = 'my-provider'; // optional, shown in logs
+export async function createMessage({ model, system, userContent, maxTokens, thinking }) {
+  const text = await callMyBackend({ model, system, prompt: userContent, maxTokens });
+  return { content: [{ type: 'text', text }], stop_reason: 'end_turn' };
+}
+```
+
+`thinking` is `undefined` or `{ type: 'disabled' }` and can be ignored by backends without a thinking mode. Throw an error with `status = 429` or `529` to get Undertow's built-in retry and model fallback. Set the `UNDERTOW_*_MODEL` variables to model ids your backend understands.
 
 ---
 

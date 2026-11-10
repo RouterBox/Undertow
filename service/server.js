@@ -6,7 +6,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '.env') });
 import express from 'express';
 import neo4j from 'neo4j-driver';
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM, resolveModel, getProvider, usesAnthropicProvider } from './llm.js';
 import { readFile, appendFile, mkdir, writeFile } from 'fs/promises';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { basename as pathBasename } from 'path';
@@ -74,7 +74,7 @@ function warnEnv(name, value, consequence) {
 }
 
 requireEnv('NEO4J_PASS', NEO4J_PASS);
-requireEnv('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY);
+if (usesAnthropicProvider()) requireEnv('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY);
 // Only the gemini provider needs GEMINI_API_KEY; with a local provider the
 // warning would falsely claim vector search is dead (and train operators to
 // ignore the channel that reports real embedding problems).
@@ -83,62 +83,13 @@ if (getProviderInfo().provider === 'gemini') {
 }
 warnEnv('BRAVE_API_KEY', process.env.BRAVE_API_KEY, 'Prowler upstream (Brave) disabled');
 warnEnv('PERPLEXITY_API_KEY', process.env.PERPLEXITY_API_KEY, 'Prowler downstream (Perplexity) disabled');
-const QUERY_MODEL = 'claude-haiku-5-5';
-const SUMMARIZE_MODEL = 'claude-sonnet-5';
-const FALLBACK_MODEL = QUERY_MODEL; // Fall back to Haiku if Sonnet is overloaded
+// Model ids are resolved per role in llm.js (env-overridable, defaults unchanged).
+const INGEST_MODEL = resolveModel('ingest');
 
-// Resilient API call with retry + model fallback
-async function callAnthropic(model, system, userContent, maxTokens = 500) {
-  const maxRetries = 2;
-  let currentModel = model;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const message = await anthropic.messages.create({
-        model: currentModel,
-        max_tokens: maxTokens,
-        // Haiku 5.5 and Sonnet 5 think by default and burn small max_tokens budgets before writing any text.
-        ...(currentModel.startsWith('claude-haiku') || currentModel.startsWith('claude-sonnet-5') ? { thinking: { type: 'disabled' } } : {}),
-        system,
-        messages: [{ role: 'user', content: userContent }]
-      });
-      // Callers read content[0].text; put text blocks first so a leading thinking block can't blank the reply.
-      const blocks = Array.isArray(message.content) ? message.content : [];
-      if (!blocks.some(b => b?.type === 'text' && b.text)) {
-        log('api', 'warn', `${currentModel} returned no text block`, {
-          detail: `stop_reason=${message.stop_reason} types=${blocks.map(b => b?.type).join(',') || 'none'} out_tokens=${message.usage?.output_tokens}`
-        });
-      }
-      message.content = [...blocks.filter(b => b?.type === 'text'), ...blocks.filter(b => b?.type !== 'text')];
-      return { response: message, model: currentModel };
-    } catch (e) {
-      const isOverloaded = e.status === 529 || e.message?.includes('Overloaded') || e.message?.includes('overloaded');
-      const isRateLimit = e.status === 429;
-
-      if (isOverloaded || isRateLimit) {
-        if (attempt < maxRetries) {
-          // First retry: wait and try same model
-          if (attempt === 0) {
-            const delay = 2000 + Math.random() * 1000;
-            log('api', 'warn', `${currentModel} ${e.status} — retrying in ${Math.round(delay)}ms`);
-            await new Promise(r => setTimeout(r, delay));
-          }
-          // Second retry: fall back to cheaper model
-          if (attempt === 1 && currentModel !== FALLBACK_MODEL) {
-            currentModel = FALLBACK_MODEL;
-            log('api', 'warn', `falling back to ${FALLBACK_MODEL}`);
-          }
-        } else {
-          log('api', 'error', `all retries exhausted for ${model} (${e.status})`);
-          return null;
-        }
-      } else {
-        log('api', 'error', `${currentModel}: ${e.message}`);
-        return null;
-      }
-    }
-  }
-  return null;
+// Resilient API call with retry + model fallback — delegates to the provider seam.
+// Kept under this name because daemons receive it as `callAnthropic`.
+function callAnthropic(model, system, userContent, maxTokens = 500) {
+  return callLLM(model, system, userContent, maxTokens, { log });
 }
 
 // --- Logging ---
@@ -161,13 +112,13 @@ async function log(endpoint, level, message, data = {}) {
 
 // --- Clients ---
 const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
-// Identity-linked ("All workspaces") API keys require the workspace to act in.
-const anthropic = new Anthropic({
-  apiKey: ANTHROPIC_API_KEY,
-  defaultHeaders: process.env.ANTHROPIC_WORKSPACE_ID
-    ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID }
-    : undefined
-});
+// Fail fast on a misconfigured LLM provider (bad UNDERTOW_LLM_PROVIDER / _MODULE).
+try {
+  await getProvider();
+} catch (e) {
+  console.error(`[undertow] LLM provider failed to load: ${e.message}`);
+  process.exit(1);
+}
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
@@ -667,7 +618,7 @@ app.post('/undertow/external-ingest', async (req, res) => {
     const agentSource = source || agent_name || 'external';
 
     // Use Haiku to evaluate and create neurons
-    const extResult = await callAnthropic(QUERY_MODEL, INGEST_SYSTEM_PROMPT, `Tool: ExternalIngest
+    const extResult = await callAnthropic(INGEST_MODEL, INGEST_SYSTEM_PROMPT, `Tool: ExternalIngest
 Input: ${JSON.stringify({ source: agentSource, text: text.substring(0, 1000) })}
 Response: [external agent memory submission]`);
     if (!extResult) return res.json({ status: 'api_error' });
@@ -1055,7 +1006,7 @@ app.post('/undertow/ingest-url', async (req, res) => {
     }
 
     // Haiku evaluates what's worth remembering
-    const evalResult = await callAnthropic(QUERY_MODEL,
+    const evalResult = await callAnthropic(INGEST_MODEL,
       `You are Undertow's web ingestor. Extract key insights worth remembering from this web page.
 
 CRITICAL: Return ONLY valid JSON. No markdown fences. No code blocks. No backticks.
@@ -1154,7 +1105,7 @@ app.post('/undertow/ingest-file', async (req, res) => {
       return res.json({ status: 'empty_content' });
     }
 
-    const evalResult = await callAnthropic(QUERY_MODEL,
+    const evalResult = await callAnthropic(INGEST_MODEL,
       `You are Undertow's file ingestor. Extract key insights, facts, or concepts worth remembering from this file content.
 
 CRITICAL: Return ONLY valid JSON. No markdown fences. No code blocks. No backticks.

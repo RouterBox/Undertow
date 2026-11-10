@@ -1,6 +1,7 @@
 // impulse.js — Impulse daemon (flash-crafting pipeline)
 // Extracted from server.js — no behavior changes
 
+import { resolveModel } from '../llm.js';
 import neo4j from 'neo4j-driver';
 import { lexicalSearch } from './lexical.js';
 import { nsPredicate, livePredicate } from '../namespaces.js';
@@ -112,7 +113,7 @@ function setCachedQuery(prompt, cwd, result) {
 // --- Query handler ---
 
 async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmbedding, embeddingsAvailable, isDaemonEnabled, getDaemonConfig, wonder, prowler, log, flashMode }) {
-  const QUERY_MODEL = 'claude-haiku-5-5';
+  const QUERY_MODEL = resolveModel('query');
   const startTime = Date.now();
 
   const { prompt, session_id, cwd } = req_body;
