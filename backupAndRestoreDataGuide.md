@@ -202,13 +202,16 @@ curl http://localhost:3030/undertow/stats | jq .neurons
 
 **Password mismatch.** The most common failure. Neo4j stores the password
 inside the volume's data files, not in the container env. Recreating a
-container with `NEO4J_AUTH=neo4j/foo` against an existing volume that was
-created with `NEO4J_AUTH=neo4j/bar` will silently keep the old `bar`
-password. To change a password on an existing volume, use `cypher-shell`:
+container with a new `NEO4J_AUTH` against an existing volume will silently
+keep the password that volume was first created with. To change the
+password on an existing volume, use `cypher-shell`, logging in with the
+volume's current password and setting the new one from your `.env`:
 
 ```bash
-docker exec -it neo4j cypher-shell -u neo4j -p oldpass \
-  "ALTER USER neo4j SET PASSWORD 'newpass'"
+# OLD_NEO4J_PASS: the password the volume currently has.
+# NEO4J_PASS:     the new password (from service/.env).
+docker exec -it neo4j cypher-shell -u "${NEO4J_USER:-neo4j}" -p "$OLD_NEO4J_PASS" \
+  "ALTER USER ${NEO4J_USER:-neo4j} SET PASSWORD '$NEO4J_PASS'"
 ```
 
 **Connection pooling on the service side.** The Node service holds a
