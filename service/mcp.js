@@ -10,6 +10,10 @@
 // calls its own routes over loopback, so every tool runs through exactly the
 // same validation and logic as a plain HTTP caller.
 //
+// Mutating tools (undertow_spider, undertow_ingest, and undertow_correct with
+// action=delete) are refused unless the host passes allowMutations: true
+// (UNDERTOW_MCP_ALLOW_MUTATIONS in server.js).
+//
 // The transport runs stateless (a fresh McpServer per request, JSON responses),
 // which needs no session store and suits request/response tools.
 
@@ -57,8 +61,17 @@ function toolResult({ ok, text }) {
   return { isError: !ok, content: [{ type: 'text', text }] };
 }
 
+function mutationsDisabled(what) {
+  return toolResult({
+    ok: false,
+    text: `${what} is disabled on this Undertow server: mutating MCP tools are off by default. ` +
+      'An operator can enable undertow_spider, undertow_ingest and undertow_correct action=delete by ' +
+      'setting UNDERTOW_MCP_ALLOW_MUTATIONS=true on the service.',
+  });
+}
+
 /** Create an McpServer with the 11 Undertow tools registered. */
-export function createUndertowMcpServer({ dispatch, version = '0.1.0' }) {
+export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMutations = false }) {
   const call = async (...args) => toolResult(await dispatch(...args));
   const server = new McpServer({ name: 'undertow', version });
 
@@ -180,8 +193,10 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0' }) {
           .describe('Optional explicit tier override (e.g. T1_index, T2_working, T3_archive). Only used with action: update.'),
       },
     },
-    async ({ neuron, action, reason, body, flash_summary, tier }) =>
-      call('POST', '/undertow/correct', { body: { neuron, action, reason, body, flash_summary, tier } })
+    async ({ neuron, action, reason, body, flash_summary, tier }) => {
+      if (action === 'delete' && !allowMutations) return mutationsDisabled('undertow_correct action=delete');
+      return call('POST', '/undertow/correct', { body: { neuron, action, reason, body, flash_summary, tier } });
+    }
   );
 
   server.registerTool(
@@ -208,8 +223,10 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0' }) {
         tool_response: z.string().optional().describe('The resulting output/content to evaluate for ingestion.'),
       },
     },
-    async ({ session_id, tool_name, tool_input, tool_response }) =>
-      call('POST', '/undertow/ingest', { body: { session_id, tool_name, tool_input, tool_response } })
+    async ({ session_id, tool_name, tool_input, tool_response }) => {
+      if (!allowMutations) return mutationsDisabled('undertow_ingest');
+      return call('POST', '/undertow/ingest', { body: { session_id, tool_name, tool_input, tool_response } });
+    }
   );
 
   server.registerTool(
@@ -229,7 +246,10 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0' }) {
           .describe("'full' runs the full-graph sweep instead of the default incremental run."),
       },
     },
-    async ({ mode }) => call('POST', '/undertow/spider', { body: mode === 'full' ? { mode: 'full' } : {} })
+    async ({ mode }) => {
+      if (!allowMutations) return mutationsDisabled('undertow_spider');
+      return call('POST', '/undertow/spider', { body: mode === 'full' ? { mode: 'full' } : {} });
+    }
   );
 
   server.registerTool(
@@ -314,9 +334,9 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0' }) {
 }
 
 /** Mount the stateless Streamable HTTP MCP endpoint at /mcp. */
-export function mountMcp(app, { dispatch, version, log = () => {} }) {
+export function mountMcp(app, { dispatch, version, allowMutations = false, log = () => {} }) {
   app.post('/mcp', async (req, res) => {
-    const server = createUndertowMcpServer({ dispatch, version });
+    const server = createUndertowMcpServer({ dispatch, version, allowMutations });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {

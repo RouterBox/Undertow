@@ -8,6 +8,7 @@ import express from 'express';
 import neo4j from 'neo4j-driver';
 import { callLLM, resolveModel, getProvider, usesAnthropicProvider } from './llm.js';
 import { mountMcp, createHttpDispatch } from './mcp.js';
+import { apiTokenGuard } from './auth.js';
 import { readFile, appendFile, mkdir, writeFile } from 'fs/promises';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { basename as pathBasename } from 'path';
@@ -56,6 +57,12 @@ async function embedNeuron(name, flashSummary) {
 
 // --- Config ---
 const PORT = 3030;
+// Bind loopback by default; set UNDERTOW_HOST=0.0.0.0 (or an interface IP) to accept remote callers.
+const HOST = process.env.UNDERTOW_HOST || '127.0.0.1';
+// Optional bearer token for /mcp and mutating /undertow/* routes (see auth.js).
+const API_TOKEN = process.env.UNDERTOW_API_TOKEN || '';
+// Mutating MCP tools (spider, ingest, correct action=delete) are off unless explicitly enabled.
+const MCP_ALLOW_MUTATIONS = /^(1|true|yes|on)$/i.test(process.env.UNDERTOW_MCP_ALLOW_MUTATIONS || '');
 const LOG_DIR = join(__dirname, 'logs');
 const LOG_FILE = join(LOG_DIR, `undertow-${new Date().toISOString().split('T')[0]}.log`);
 const NEO4J_URI = process.env.NEO4J_URI || 'bolt://localhost:7687';
@@ -121,6 +128,7 @@ try {
   process.exit(1);
 }
 const app = express();
+if (API_TOKEN) app.use(apiTokenGuard(API_TOKEN));
 app.use(express.json({ limit: '1mb' }));
 
 // --- Undertow Toggle & Config ---
@@ -1370,10 +1378,19 @@ function loopbackBaseUrl() {
   if (host.includes(':')) host = `[${host}]`;
   return `http://${host}:${addr.port}`;
 }
-mountMcp(app, { dispatch: createHttpDispatch(loopbackBaseUrl), log });
+mountMcp(app, {
+  dispatch: createHttpDispatch(loopbackBaseUrl, {
+    headers: API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}
+  }),
+  allowMutations: MCP_ALLOW_MUTATIONS,
+  log
+});
 
 // --- Startup ---
-const httpServer = app.listen(PORT, async () => {
+const httpServer = app.listen(PORT, HOST, async () => {
+  if (!['127.0.0.1', 'localhost', '::1'].includes(HOST) && !API_TOKEN) {
+    log('startup', 'warn', `listening on ${HOST} without UNDERTOW_API_TOKEN — anyone who can reach this port can read and modify memory`);
+  }
   try {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
@@ -1381,7 +1398,7 @@ const httpServer = app.listen(PORT, async () => {
     const enabledDaemons = Object.entries(daemonCfg.daemons || {})
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);
-    log('startup', 'info', `Undertow online — localhost:${PORT} — Neo4j connected — daemons: ${enabledDaemons.join(', ') || 'none'}`);
+    log('startup', 'info', `Undertow online — ${HOST}:${PORT} — Neo4j connected — daemons: ${enabledDaemons.join(', ') || 'none'}`);
     // Embedding sanity: a provider/index dimension mismatch makes vector search
     // silently miss everything, presenting as "recall is a bit weak" rather
     // than "retrieval is dead". One loud boot-time line prevents that.

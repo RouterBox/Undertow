@@ -105,7 +105,7 @@ Claude Code Hooks (settings.json)
 ```
 
 - **Neo4j** graph database runs locally in Docker. Your data stays on your machine.
-- **Undertow service** is a Node.js/Express HTTP server on localhost:3030.
+- **Undertow service** is a Node.js/Express HTTP server on localhost:3030 (loopback-only by default; see [Configuration](#configuration)).
 - **Hooks** are configured in Claude Code's `settings.json` — standard hook system, no patches.
 - **Models**: Haiku for fast operations (query, ingest), Sonnet for deeper analysis (summarize). Provider and model ids are configurable — see [Configuration](#configuration).
 
@@ -232,7 +232,21 @@ The service exposes its API as MCP tools over Streamable HTTP at `/mcp` — no s
 claude mcp add --transport http undertow http://127.0.0.1:3030/mcp
 ```
 
-Tools: `undertow_health_check`, `undertow_query`, `undertow_chase`, `undertow_stats`, `undertow_patterns`, `undertow_correct`, `undertow_ingest`, `undertow_spider`, `undertow_logs`, `undertow_neighbors`, `undertow_feedback`. Each returns the route's JSON plus `http_status`, flagged `isError` on non-2xx. Names and input schemas match the standalone `undertow-mcp` 1.1.0 stdio server, so it is a drop-in replacement.
+Tools: `undertow_health_check`, `undertow_query`, `undertow_chase`, `undertow_stats`, `undertow_patterns`, `undertow_correct`, `undertow_ingest`, `undertow_spider`, `undertow_logs`, `undertow_neighbors`, `undertow_feedback`. Each returns the route's JSON plus `http_status`, flagged `isError` on non-2xx. Names and input schemas match the standalone `undertow-mcp` 1.1.0 stdio server, so it can replace it — except that the mutating tools are off by default (see `UNDERTOW_MCP_ALLOW_MUTATIONS` below).
+
+### Network and access
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UNDERTOW_HOST` | `127.0.0.1` | Interface to bind. Loopback-only by default; set `0.0.0.0` (or a specific interface IP) to accept remote callers. |
+| `UNDERTOW_API_TOKEN` | — | When set, `/mcp` and every mutating `/undertow/*` request (non-GET) require `Authorization: Bearer <token>`. Read-only GET routes and `/health` stay open. |
+| `UNDERTOW_MCP_ALLOW_MUTATIONS` | off | Set `true` to enable the MCP tools `undertow_spider`, `undertow_ingest` and `undertow_correct` with `action: delete`. When off they return an `isError` result explaining how to enable them. |
+
+Hooks and tools on the same machine work unchanged with the loopback default. **Remote callers** (another machine, a container, a reverse proxy on a different host) need `UNDERTOW_HOST` set — and you should set `UNDERTOW_API_TOKEN` whenever you do; the service logs a warning if it listens beyond loopback without one. With a token set, add an `Authorization: Bearer <token>` header to each Claude Code HTTP hook, and register the MCP endpoint with it:
+
+```bash
+claude mcp add --transport http undertow http://127.0.0.1:3030/mcp --header "Authorization: Bearer $UNDERTOW_API_TOKEN"
+```
 
 ---
 

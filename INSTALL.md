@@ -246,6 +246,9 @@ When Undertow injects a flash (`[UNDERTOW-FLASH]`), evaluate it critically:
 **Flashes are slow (>5s):** This is usually Anthropic API latency. The hook timeout is 5 seconds. If Haiku is slow, flashes will be dropped silently and your session continues normally.
 
 **"connection refused" on port 3030:** The Undertow service isn't running. Start it with `bash start.sh` or `node service/server.js`.
+The service binds `127.0.0.1` by default, so callers on another machine or in a container also get "connection refused" — set `UNDERTOW_HOST=0.0.0.0` (and `UNDERTOW_API_TOKEN`) in `service/.env`.
+
+**401 unauthorized:** `UNDERTOW_API_TOKEN` is set, so `/mcp` and mutating `/undertow/*` calls need an `Authorization: Bearer <token>` header (hooks included).
 
 ## Startup Script
 
