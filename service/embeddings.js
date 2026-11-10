@@ -3,7 +3,7 @@
  *
  * EMBEDDINGS_PROVIDER in service/.env selects the backend:
  *   gemini (default) — Google gemini-embedding-001, 3072 dims. Needs GEMINI_API_KEY.
- *   local            — @xenova/transformers ONNX in-process, no API, no network
+ *   local            — @huggingface/transformers ONNX in-process, no API, no network
  *                      after first model download. Default model
  *                      Xenova/all-MiniLM-L6-v2 (384 dims); override with
  *                      EMBEDDINGS_LOCAL_MODEL.
@@ -40,9 +40,11 @@ let localLoading = null;
 async function getLocalExtractor() {
   if (localExtractor) return localExtractor;
   if (!localLoading) {
-    localLoading = import('@xenova/transformers').then(async ({ pipeline }) => {
+    localLoading = import('@huggingface/transformers').then(async ({ pipeline }) => {
       const model = process.env.EMBEDDINGS_LOCAL_MODEL || LOCAL_DEFAULT_MODEL;
-      localExtractor = await pipeline('feature-extraction', model);
+      // q8 = the quantized ONNX weights @xenova/transformers v2 loaded by
+      // default, so vectors stay compatible with ones already stored.
+      localExtractor = await pipeline('feature-extraction', model, { dtype: 'q8' });
       return localExtractor;
     });
   }
