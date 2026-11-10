@@ -4,6 +4,7 @@
 
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -103,16 +104,17 @@ test('/mcp mutating tools run when allowMutations is on', async () => {
 });
 
 test('UNDERTOW_API_TOKEN: /mcp and mutating routes require the bearer token', async () => {
-  const b = await startApp({ token: 'sekrit' });
+  const token = randomBytes(16).toString('hex');
+  const b = await startApp({ token });
   const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' };
   assert.equal((await fetch(`${b}/mcp`, init)).status, 401);
   assert.equal((await fetch(`${b}/mcp`, { ...init, headers: { ...init.headers, Authorization: 'Bearer wrong' } })).status, 401);
   assert.equal((await fetch(`${b}/undertow/toggle`, init)).status, 401);
-  assert.equal((await fetch(`${b}/undertow/toggle`, { ...init, headers: { ...init.headers, Authorization: 'Bearer sekrit' } })).status, 200);
+  assert.equal((await fetch(`${b}/undertow/toggle`, { ...init, headers: { ...init.headers, Authorization: `Bearer ${token}` } })).status, 200);
   assert.equal((await fetch(`${b}/undertow/stats`)).status, 200, 'read-only GET routes stay open');
 
   await assert.rejects(connect(new URL(`${b}/mcp`)));
-  const client = await connect(new URL(`${b}/mcp`), { headers: { Authorization: 'Bearer sekrit' } });
+  const client = await connect(new URL(`${b}/mcp`), { headers: { Authorization: `Bearer ${token}` } });
   const { tools } = await client.listTools();
   assert.equal(tools.length, 11);
   await client.close();
