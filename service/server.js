@@ -794,13 +794,18 @@ app.post('/undertow/chase', async (req, res) => {
     if (!neuron) return res.status(400).json({ error: 'neuron name required' });
 
     // Strong pursuit reward: +15 base_score (vs +10 for normal pursuit)
-    await runCypher(`
+    const rewarded = await runCypher(`
       MATCH (n:Neuron {name: $name})
       SET n.times_pursued = n.times_pursued + 1,
           n.base_score = CASE WHEN n.base_score + 15 > 100 THEN 100 ELSE n.base_score + 15 END,
           n.last_surfaced = datetime()
       RETURN n.name, n.base_score
-    `, { name: neuron }).catch(e => log('error', 'warn', e.message));
+    `, { name: neuron }).catch(e => { log('error', 'warn', e.message); return null; });
+
+    // MATCH found nothing: don't tell the caller the reward landed.
+    if (Array.isArray(rewarded) && rewarded.length === 0) {
+      return res.status(404).json({ status: 'not_found', error: `no neuron named "${neuron}"`, neuron });
+    }
 
     // Strengthen outbound synapses more aggressively (+0.08 vs +0.05 for normal pursuit)
     await runCypher(`
