@@ -121,7 +121,7 @@ Health check: `curl http://localhost:3030/health`
 
 - **Browser:** http://localhost:7474
 - **Bolt:** bolt://localhost:7687
-- **Auth:** neo4j / `$NEO4J_PASS` (the value you set in `service/.env`)
+- **Auth:** `$NEO4J_USER` (default `neo4j`) / `$NEO4J_PASS` (the value you set in `service/.env`)
 - **Vector index:** `neuron_embedding`, 3072 dims, cosine similarity
 
 ## Endpoints
@@ -182,8 +182,9 @@ When a flash contains an interesting lead, **chase it through the graph**. Each 
 
 **How to chase:**
 ```bash
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 curl -s -X POST http://localhost:7474/db/neo4j/tx/commit \
-  -H "Content-Type: application/json" -u "neo4j:$NEO4J_PASS" \
+  -H "Content-Type: application/json" -u "$NEO4J_USER:$NEO4J_PASS" \
   -d '{"statements": [{"statement": "MATCH (n:Neuron {name: \"NEURON_NAME\"})-[s:SYNAPSE]-(connected) RETURN n.flash_summary, n.body, type(s), s.weight, s.edge_type, connected.name, connected.flash_summary"}]}'
 ```
 

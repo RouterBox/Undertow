@@ -46,6 +46,7 @@ cp service/.env.example service/.env
 
 Edit `service/.env` and set, at minimum:
 - `NEO4J_PASS` — pick any password; whatever you set here will be used to create the Neo4j container in the next step.
+- `NEO4J_USER` — optional; defaults to `neo4j`. Used together with `NEO4J_PASS` everywhere below.
 - `ANTHROPIC_API_KEY` — required for Impulse/Gobble/Dreamer/Wonder.
 - `GEMINI_API_KEY` — required for vector search.
 
@@ -55,14 +56,15 @@ Optional: `BRAVE_API_KEY`, `PERPLEXITY_API_KEY` for Prowler. See comments in `.e
 
 ### Step 3: Start Neo4j
 
-The password you put in `.env` must match the one you create the Neo4j container with. Source `.env` first so `$NEO4J_PASS` is set, then run docker:
+The password you put in `.env` must match the one you create the Neo4j container with. Source `.env` first so `$NEO4J_USER` (default `neo4j`) and `$NEO4J_PASS` are set, then run docker (`NEO4J_AUTH` is composed from them for that one command):
 
 ```bash
 set -a; source service/.env; set +a
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 
-docker run -d --name neo4j \
+NEO4J_AUTH="$(printf '%s/%s' "$NEO4J_USER" "$NEO4J_PASS")" docker run -d --name neo4j \
   -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/$NEO4J_PASS \
+  -e NEO4J_AUTH \
   -e NEO4J_PLUGINS='["apoc", "graph-data-science"]' \
   -v neo4j_data:/data \
   neo4j:community
@@ -160,9 +162,10 @@ Add these hooks to `~/.claude/settings.json`. If the file already has a `hooks` 
 Connect to Neo4j and create required indexes:
 
 ```bash
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 curl -X POST http://localhost:7474/db/neo4j/tx/commit \
   -H "Content-Type: application/json" \
-  -u "neo4j:$NEO4J_PASS" \
+  -u "$NEO4J_USER:$NEO4J_PASS" \
   -d '{
     "statements": [
       {"statement": "CREATE INDEX neuron_name IF NOT EXISTS FOR (n:Neuron) ON (n.name)"},
@@ -198,9 +201,10 @@ Start a new Claude Code session (the hooks activate on session start). Type any 
 
 To seed an initial neuron for testing:
 ```bash
+NEO4J_USER="${NEO4J_USER:-neo4j}"
 curl -X POST http://localhost:7474/db/neo4j/tx/commit \
   -H "Content-Type: application/json" \
-  -u "neo4j:$NEO4J_PASS" \
+  -u "$NEO4J_USER:$NEO4J_PASS" \
   -d '{
     "statements": [
       {"statement": "CREATE (n:Neuron {name: \"Undertow Installation\", node_type: \"episode\", tier: \"T2_working\", flash_summary: \"Undertow was installed and configured successfully\", base_score: 50, times_surfaced: 0, times_pursued: 0, times_dismissed: 0, created_at: datetime(), last_surfaced: datetime(), source: \"user_input\"}) RETURN n.name"}
@@ -247,6 +251,8 @@ When Undertow injects a flash (`[UNDERTOW-FLASH]`), evaluate it critically:
 
 **"connection refused" on port 3030:** The Undertow service isn't running. Start it with `bash start.sh` or `node service/server.js`.
 The service binds `127.0.0.1` by default, so callers on another machine or in a container also get "connection refused" — set `UNDERTOW_HOST=0.0.0.0` (and `UNDERTOW_API_TOKEN`) in `service/.env`.
+
+**`LOCAL EMBEDDINGS UNAVAILABLE` at startup** (only with `EMBEDDINGS_PROVIDER=local`): the embedding model couldn't be downloaded or found, so vector search is off (`/health` shows `embeddings.available: false`). If the model host is blocked on your network, set `EMBEDDINGS_REMOTE_HOST` to a mirror, or copy the model files into `EMBEDDINGS_MODEL_DIR` (default `service/.models/<model id>/`; the error lists the exact files) and set `EMBEDDINGS_OFFLINE=true`. A cache from an earlier install has the same layout and can be copied in.
 
 **401 unauthorized:** `UNDERTOW_API_TOKEN` is set, so `/mcp` and mutating `/undertow/*` calls need an `Authorization: Bearer <token>` header (hooks included).
 

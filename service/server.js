@@ -19,7 +19,7 @@ import prowler from './daemons/prowler.js';
 import tapestry from './daemons/tapestry.js';
 import wonder from './daemons/wonder.js';
 import janitor from './daemons/janitor.js';
-import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo } from './embeddings.js';
+import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo, initEmbeddings, getEmbeddingStatus } from './embeddings.js';
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
@@ -187,7 +187,7 @@ async function runCypher(query, params = {}) {
 app.get('/health', async (req, res) => {
   try {
     await runCypher('RETURN 1');
-    res.json({ status: 'ok', neo4j: 'connected', enabled: undertowEnabled, uptime: process.uptime() });
+    res.json({ status: 'ok', neo4j: 'connected', enabled: undertowEnabled, uptime: process.uptime(), embeddings: getEmbeddingStatus() });
   } catch (e) {
     res.status(503).json({ status: 'error', neo4j: 'disconnected', error: e.message });
   }
@@ -1396,6 +1396,9 @@ const httpServer = app.listen(PORT, HOST, async () => {
   if (!['127.0.0.1', 'localhost', '::1'].includes(HOST) && !API_TOKEN) {
     log('startup', 'warn', `listening on ${HOST} without UNDERTOW_API_TOKEN — anyone who can reach this port can read and modify memory`);
   }
+  // Local embeddings: load the model now so a missing/unreachable model is one
+  // loud startup error (and /health shows it), not a silent per-query null.
+  initEmbeddings({ log: (msg) => log('startup', 'error', msg) });
   try {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();

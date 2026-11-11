@@ -224,6 +224,18 @@ export async function createMessage({ model, system, userContent, maxTokens, thi
 
 `thinking` is `undefined` or `{ type: 'disabled' }` and can be ignored by backends without a thinking mode. Throw an error with `status = 429` or `529` to get Undertow's built-in retry and model fallback. Set the `UNDERTOW_*_MODEL` variables to model ids your backend understands.
 
+### Local embeddings
+
+With `EMBEDDINGS_PROVIDER=local`, embeddings run in-process via transformers.js (default model `Xenova/all-MiniLM-L6-v2`, 384 dims). The model is downloaded once on first use; these settings control where it comes from:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EMBEDDINGS_MODEL_DIR` | `service/.models` | Model cache and pre-staged copies, laid out as `<dir>/<model id>/` (`config.json`, `tokenizer.json`, `tokenizer_config.json`, `onnx/model_quantized.onnx`). Relative paths resolve from `service/`. |
+| `EMBEDDINGS_OFFLINE` | `false` | `true` = never download; load only from `EMBEDDINGS_MODEL_DIR`. |
+| `EMBEDDINGS_REMOTE_HOST` | Hugging Face Hub | Download from a mirror instead, e.g. `https://your-mirror.example/`. |
+
+The model loads at startup. If it can't be loaded (no network access to the model host, missing files in offline mode), the service logs one `LOCAL EMBEDDINGS UNAVAILABLE` error naming the model dir and expected files, and `/health` reports `embeddings.available: false`.
+
 ### MCP endpoint
 
 The service exposes its API as MCP tools over Streamable HTTP at `/mcp` — no separate MCP server process needed. For Claude Code:
