@@ -9,6 +9,7 @@ import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
 import { gateRun } from '../downstream-gate.js';
+import { recordPursuitDay } from '../pursuit-day.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -404,6 +405,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               ON MATCH SET d.pursued = coalesce(d.pursued, 0) + 1
             `, { daemon: contributingDaemon }).catch(e => log('error', 'warn', e.message));
 
+          // Per-day counter for the health window (live graph only)
+          await recordPursuitDay({ runCypher, status: 'pursued', ns, log });
+
           if (!alreadyReinforced) {
             // Strengthen outbound synapses only (directional reinforcement)
             await runCypher(`
@@ -442,6 +446,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               ON CREATE SET d.pursued = 0, d.dismissed = 1
               ON MATCH SET d.dismissed = coalesce(d.dismissed, 0) + 1
             `, { daemon: contributingDaemon }).catch(e => log('error', 'warn', e.message));
+
+          // Per-day counter for the health window (live graph only)
+          await recordPursuitDay({ runCypher, status: 'dismissed', ns, log });
 
           // Weaken related synapses (same-project dismissal only)
           await runCypher(`

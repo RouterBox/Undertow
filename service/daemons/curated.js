@@ -4,6 +4,7 @@
 // parser, formatter and verdict mapping can be unit-tested without Neo4j.
 
 import { nsPredicate } from '../namespaces.js';
+import { recordPursuitDay } from '../pursuit-day.js';
 
 export const MAX_CURATED_PICKS = 4;
 export const BODY_PREVIEW_CHARS = 300;
@@ -123,6 +124,8 @@ export async function applyVerdictToNeuron({ runCypher, name, ns, verdict, note,
             n.last_surfaced = datetime()
       `, params);
   }
+  // Per-day counter for the health window (live graph only)
+  await recordPursuitDay({ runCypher, status: outcome.status, ns, log });
   if (outcome.flagReview) await flagNeuronForReview({ runCypher, name, ns, note, log });
   return outcome;
 }

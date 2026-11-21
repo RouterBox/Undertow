@@ -27,6 +27,7 @@ import keeper from './daemons/keeper.js';
 import { sanitizeNamespace, livePredicate } from './namespaces.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
+import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
 import { importVault, reverseTapestry } from './vault.js';
 import vaultwatch from './daemons/vaultwatch.js';
 import { resolve as pathResolve } from 'path';
@@ -807,6 +808,9 @@ app.post('/undertow/chase', async (req, res) => {
       return res.status(404).json({ status: 'not_found', error: `no neuron named "${neuron}"`, neuron });
     }
 
+    // Per-day counter for the health window (chase is always the live graph)
+    await recordPursuitDay({ runCypher, status: 'pursued', ns: null, log });
+
     // Strengthen outbound synapses more aggressively (+0.08 vs +0.05 for normal pursuit)
     await runCypher(`
       MATCH (n:Neuron {name: $name})-[s:SYNAPSE]->()
@@ -1266,7 +1270,7 @@ app.post('/undertow/daemon-config/:daemon', async (req, res) => {
 // GET /undertow/health — Graph health metrics (from GRAPH_THEORY.md research)
 app.get('/undertow/health', async (req, res) => {
   try {
-    const [neuronCount, synapseCount, diversityCheck, communityHealth, ageDistribution, growthRatio, topRetrieved] = await Promise.all([
+    const [neuronCount, synapseCount, diversityCheck, communityHealth, ageDistribution, growthRatio, topRetrieved, pursuitDays] = await Promise.all([
       runCypher('MATCH (n:Neuron) RETURN count(n) AS count'),
       runCypher('MATCH ()-[s:SYNAPSE]->() RETURN count(s) AS count'),
       // Filter bubble check: are top neurons dominating retrievals?
@@ -1297,7 +1301,8 @@ app.get('/undertow/health', async (req, res) => {
         END AS age_bucket, count(n) AS count
         RETURN age_bucket, count ORDER BY count DESC
       `).catch(() => []),
-      // Growth ratio: pursuits vs dismissals in recent data
+      // Growth ratio, ALL TIME: pursuits vs dismissals summed over every surfaced neuron.
+      // Reported only; GRAPH_DYING is raised from the PursuitDay window below.
       runCypher(`
         MATCH (n:Neuron) WHERE n.times_surfaced > 0
         RETURN sum(n.times_pursued) AS totalPursued,
@@ -1310,14 +1315,19 @@ app.get('/undertow/health', async (req, res) => {
         MATCH (n:Neuron) WHERE n.times_surfaced > 3
         RETURN n.name, n.times_surfaced, n.times_pursued, n.times_dismissed
         ORDER BY n.times_surfaced DESC LIMIT 10
-      `).catch(() => [])
+      `).catch(() => []),
+      // Per-day pursuit/dismissal counters for the recent window
+      runCypher(`
+        MATCH (d:PursuitDay) WHERE d.date >= $since
+        RETURN d.date AS date, d.pursued AS pursued, d.dismissed AS dismissed
+      `, { since: windowStart() }).catch(e => { log('health', 'error', `PursuitDay query failed: ${e.message}`); return null; })
     ]);
 
     const concentration = diversityCheck[0]?.concentration || 0;
     const alerts = [];
     if (concentration > 0.8) alerts.push('FILTER_BUBBLE: top 10% of neurons account for >' + Math.round(concentration * 100) + '% of retrievals');
-    const ratioVal = typeof growthRatio[0]?.ratio === 'object' ? growthRatio[0].ratio.low : (growthRatio[0]?.ratio || 0);
-    if (ratioVal < 0.5) alerts.push('GRAPH_DYING: pursuit/dismissal ratio is ' + Number(ratioVal).toFixed(2) + ' (healthy > 1.0)');
+    const window = pursuitWindow(pursuitDays);
+    if (window.status === 'GRAPH_DYING') alerts.push('GRAPH_DYING: pursuit/dismissal ratio over the last ' + window.days + ' days is ' + window.ratio.toFixed(2) + ' (healthy > 1.0)');
     if ((communityHealth[0]?.communities || 0) < 3) alerts.push('LOW_DIVERSITY: only ' + (communityHealth[0]?.communities || 0) + ' communities detected');
 
     // Unwrap Neo4j integers
@@ -1338,10 +1348,13 @@ app.get('/undertow/health', async (req, res) => {
       },
       communities: unwrapObj(communityHealth[0]),
       ageDistribution: ageDistribution.map(unwrapObj),
-      growthRatio: unwrapObj(growthRatio[0]),
+      // totalPursued / totalDismissed / ratio are all-time; window is the last 30 days.
+      growthRatio: { ...unwrapObj(growthRatio[0]), window },
       topRetrieved: topRetrieved.map(unwrapObj),
       alerts,
-      status: alerts.length === 0 ? 'HEALTHY' : 'NEEDS_ATTENTION'
+      // HEALTHY needs evidence: with no alert but a window that is thin or
+      // unreadable, the pursuit ratio is not known, so the status says so.
+      status: alerts.length > 0 ? 'NEEDS_ATTENTION' : window.status === 'HEALTHY' ? 'HEALTHY' : 'UNKNOWN'
     });
   } catch (e) {
     log('health', 'error', e.message);
@@ -1403,6 +1416,7 @@ const httpServer = app.listen(PORT, HOST, async () => {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
     keeper.init({ log, daemonConfig: daemonCfg.daemons?.keeper });
+    await ensurePursuitDayConstraint({ runCypher, log });
     const enabledDaemons = Object.entries(daemonCfg.daemons || {})
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);
