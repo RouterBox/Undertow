@@ -110,6 +110,19 @@ function setCachedQuery(prompt, cwd, result) {
   }
 }
 
+// times_surfaced +1 for each neuron actually injected into the agent's context.
+// Matched by name within the namespace, as Dreamer does. Not awaited: the hook
+// response must not wait on a counter. Errors are logged, never thrown.
+function markSurfaced({ runCypher, names, ns, log }) {
+  if (!names.length) return;
+  runCypher(`
+      UNWIND $names AS name
+      MATCH (n:Neuron {name: name})
+      WHERE ${nsPredicate('n')}
+      SET n.times_surfaced = coalesce(n.times_surfaced, 0) + 1
+    `, { names, ns }).catch(e => log('error', 'warn', e.message));
+}
+
 // --- Query handler ---
 
 async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmbedding, embeddingsAvailable, isDaemonEnabled, getDaemonConfig, wonder, prowler, log, flashMode }) {
@@ -477,6 +490,8 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
       neuronDomains: unique.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: unique.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
     });
+    // Only the first 8 candidates are written into the block above.
+    markSurfaced({ runCypher, names: unique.slice(0, 8).map(r => r.name), ns, log });
 
     const rawResult = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: flashBlock } };
     setCachedQuery(prompt, cacheScope, rawResult);
@@ -547,6 +562,7 @@ Select the candidates worth surfacing (possibly none). Return JSON.`);
       neuronDomains: picks.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: picks.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
     });
+    markSurfaced({ runCypher, names: picks.map((p) => p.name), ns, log });
 
     const flashBlock = formatCuratedBlock(picks, unique.length, elapsed);
     log('query', 'info', 'flashes injected', { detail: picks.map((p) => `${p.name}: ${p.flash}`).join(' | ') });
@@ -597,6 +613,10 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
       neuronDomains: unique.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: unique.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
     });
+    // Haiku's flashes are free text with no link back to the candidates they drew
+    // on, so which neurons were surfaced cannot be told: count every candidate
+    // (the same set Dreamer attributes this entry's outcome to). This overcounts.
+    markSurfaced({ runCypher, names: unique.map(r => r.name), ns, log });
   }
 
   const elapsed = Date.now() - startTime;
