@@ -3,7 +3,7 @@
     "spider": {
       "enabled": true,
       "schedule": "session-end",
-      "pruneEnabled": true,
+      "pruneEnabled": false,
       "pruneThreshold": 5,
       "pruneMinAge": 30,
       "similarityThreshold": 0.6,

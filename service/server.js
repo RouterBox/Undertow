@@ -27,7 +27,7 @@ import keeper from './daemons/keeper.js';
 import { sanitizeNamespace, livePredicate } from './namespaces.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
-import { recordPursuitDay, pursuitWindow, windowStart } from './pursuit-day.js';
+import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
 import { importVault, reverseTapestry } from './vault.js';
 import vaultwatch from './daemons/vaultwatch.js';
 import { resolve as pathResolve } from 'path';
@@ -1320,7 +1320,7 @@ app.get('/undertow/health', async (req, res) => {
       runCypher(`
         MATCH (d:PursuitDay) WHERE d.date >= $since
         RETURN d.date AS date, d.pursued AS pursued, d.dismissed AS dismissed
-      `, { since: windowStart() }).catch(() => [])
+      `, { since: windowStart() }).catch(e => { log('health', 'error', `PursuitDay query failed: ${e.message}`); return null; })
     ]);
 
     const concentration = diversityCheck[0]?.concentration || 0;
@@ -1352,7 +1352,9 @@ app.get('/undertow/health', async (req, res) => {
       growthRatio: { ...unwrapObj(growthRatio[0]), window },
       topRetrieved: topRetrieved.map(unwrapObj),
       alerts,
-      status: alerts.length === 0 ? 'HEALTHY' : 'NEEDS_ATTENTION'
+      // HEALTHY needs evidence: with no alert but a window that is thin or
+      // unreadable, the pursuit ratio is not known, so the status says so.
+      status: alerts.length > 0 ? 'NEEDS_ATTENTION' : window.status === 'HEALTHY' ? 'HEALTHY' : 'UNKNOWN'
     });
   } catch (e) {
     log('health', 'error', e.message);
@@ -1414,6 +1416,7 @@ const httpServer = app.listen(PORT, HOST, async () => {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
     keeper.init({ log, daemonConfig: daemonCfg.daemons?.keeper });
+    await ensurePursuitDayConstraint({ runCypher, log });
     const enabledDaemons = Object.entries(daemonCfg.daemons || {})
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);

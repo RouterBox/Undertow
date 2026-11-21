@@ -481,17 +481,19 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
       session_id: session_id || 'default'
     });
 
-    // Still track for pursuit detection
+    // Track for pursuit detection, and count as surfaced, only the neurons written
+    // into the block above (the first 8). A candidate that was never shown must
+    // not be judged or dismissed.
+    const shown = unique.slice(0, 8);
     session.pendingFlashes.push({
       turn: Date.now(),
-      flashes: unique.map(r => r.flash),
-      flashNeurons: unique.map(r => r.name), // flashes[i] is flashNeurons[i]'s own line
-      sourceNeurons: unique.map(r => r.name),
-      neuronDomains: unique.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
-      neuronDaemons: unique.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
+      flashes: shown.map(r => r.flash),
+      flashNeurons: shown.map(r => r.name), // flashes[i] is flashNeurons[i]'s own line
+      sourceNeurons: shown.map(r => r.name),
+      neuronDomains: shown.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
+      neuronDaemons: shown.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
     });
-    // Only the first 8 candidates are written into the block above.
-    markSurfaced({ runCypher, names: unique.slice(0, 8).map(r => r.name), ns, log });
+    markSurfaced({ runCypher, names: shown.map(r => r.name), ns, log });
 
     const rawResult = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: flashBlock } };
     setCachedQuery(prompt, cacheScope, rawResult);
@@ -617,6 +619,9 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
     // on, so which neurons were surfaced cannot be told: count every candidate
     // (the same set Dreamer attributes this entry's outcome to). This overcounts.
     markSurfaced({ runCypher, names: unique.map(r => r.name), ns, log });
+  } else if (flashMode === 'both' && unique.length > 0) {
+    // No Haiku flash, but "both" mode still writes the first 8 raw neurons into the block.
+    markSurfaced({ runCypher, names: unique.slice(0, 8).map(r => r.name), ns, log });
   }
 
   const elapsed = Date.now() - startTime;

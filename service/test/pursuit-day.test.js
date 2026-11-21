@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { recordPursuitDay, pursuitWindow, windowStart, WINDOW_DAYS, MIN_OUTCOMES } from '../pursuit-day.js';
+import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint, WINDOW_DAYS, MIN_OUTCOMES } from '../pursuit-day.js';
 import { applyVerdictToNeuron } from '../daemons/curated.js';
 import { handleSummarize } from '../daemons/dreamer.js';
 
@@ -161,4 +161,22 @@ test('window: Neo4j integer objects are unwrapped', () => {
   assert.equal(w.pursued, 3);
   assert.equal(w.dismissed, 27);
   assert.equal(w.status, 'GRAPH_DYING');
+});
+
+test('window: a failed query (null rows) is "unavailable", not "insufficient data"', () => {
+  const w = pursuitWindow(null);
+  assert.equal(w.status, 'unavailable');
+  assert.equal(w.pursued, null);
+  assert.equal(pursuitWindow([]).status, 'insufficient data');
+});
+
+test('constraint: created once with IF NOT EXISTS; a failure is logged, not thrown', async () => {
+  const calls = [];
+  await ensurePursuitDayConstraint({ runCypher: async (q) => { calls.push(q); return []; }, log: () => {} });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /CREATE CONSTRAINT pursuit_day_date IF NOT EXISTS FOR \(d:PursuitDay\) REQUIRE d\.date IS UNIQUE/);
+
+  const logs = [];
+  await ensurePursuitDayConstraint({ runCypher: async () => { throw new Error('duplicates exist'); }, log: (...a) => logs.push(a) });
+  assert.ok(logs.some(l => l[1] === 'warn' && /duplicates exist/.test(l[2])));
 });

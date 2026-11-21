@@ -93,3 +93,24 @@ test('a failed increment is logged, not thrown, and the flash is still returned'
   assert.ok(out.responseJson.hookSpecificOutput.additionalContext.includes('A:'));
   assert.ok(h.logs.some(l => l[0] === 'error' && l[1] === 'warn' && /neo4j down/.test(l[2])));
 });
+
+test('raw: only the 8 shown neurons are tracked for judging', async () => {
+  const names = Array.from({ length: 10 }, (_, i) => `N${i + 1}`);
+  const h = harness({ candidates: names, flashMode: 'raw' });
+  await handleQuery(h.deps);
+  const entry = h.session.pendingFlashes[0];
+  assert.deepEqual(entry.sourceNeurons, names.slice(0, 8));
+  assert.deepEqual(entry.flashNeurons, names.slice(0, 8));
+  assert.equal(entry.flashes.length, 8);
+  assert.ok(!('N9' in entry.neuronDomains) && !('N10' in entry.neuronDomains));
+});
+
+test('both: with no Haiku flash the raw neurons written into the block are still counted', async () => {
+  const names = Array.from({ length: 10 }, (_, i) => `N${i + 1}`);
+  const h = harness({ candidates: names, flashMode: 'both', haikuText: JSON.stringify({ flashes: [], topics_detected: [] }) });
+  const out = await handleQuery(h.deps);
+  assert.equal(h.surfaced().length, 1);
+  assert.deepEqual(h.surfaced()[0].p.names, names.slice(0, 8));
+  assert.ok(out.responseJson.hookSpecificOutput.additionalContext.includes('N1:'), 'raw neurons were injected');
+  assert.equal(h.session.pendingFlashes.length, 0, 'nothing to judge without a flash');
+});

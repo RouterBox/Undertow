@@ -38,6 +38,15 @@ export async function recordPursuitDay({ runCypher, status, ns, log, now = new D
   }
 }
 
+/**
+ * MERGE on PursuitDay.date is only safe against concurrent first writes of a
+ * day when the date is unique. Run once at startup. Errors are logged, not thrown.
+ */
+export async function ensurePursuitDayConstraint({ runCypher, log }) {
+  await runCypher('CREATE CONSTRAINT pursuit_day_date IF NOT EXISTS FOR (d:PursuitDay) REQUIRE d.date IS UNIQUE')
+    .catch(e => log('startup', 'warn', `PursuitDay uniqueness constraint not created: ${e.message}`));
+}
+
 // Neo4j integers arrive as {low, high}.
 const num = (v) => (v && typeof v === 'object' ? v.low : Number(v)) || 0;
 
@@ -45,8 +54,11 @@ const num = (v) => (v && typeof v === 'object' ? v.low : Number(v)) || 0;
  * Sum PursuitDay rows ({date, pursued, dismissed}) that fall inside the window.
  * status: 'insufficient data' (fewer than MIN_OUTCOMES outcomes), 'GRAPH_DYING'
  * (ratio < 0.5) or 'HEALTHY'. ratio is null when the window holds no dismissals.
+ * rows === null means the query itself failed: status 'unavailable', which is
+ * not the same as a window with little data in it.
  */
 export function pursuitWindow(rows, now = new Date()) {
+  if (rows === null) return { days: WINDOW_DAYS, pursued: null, dismissed: null, ratio: null, status: 'unavailable' };
   const since = windowStart(now);
   const today = utcDay(now);
   let pursued = 0;
