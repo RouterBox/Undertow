@@ -8,6 +8,7 @@ import { supersedeNeuron } from '../supersede.js';
 import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
+import { gateRun } from '../downstream-gate.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -378,18 +379,25 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     });
   }
 
-  // Run downstream daemons at session end
+  // Run downstream daemons. Stop fires after every turn, so each is gated:
+  // one run at a time per namespace, and a pause between runs.
   const spiderConfig = getDaemonConfig('spider');
   if (isDaemonEnabled('spider') && spiderConfig.schedule === 'session-end') {
-    log('summarize', 'info', 'triggering spider daemon');
-    spider.run({ runCypher, callAnthropic, config: spiderConfig, log, namespace: ns }).catch(e => {
+    const gated = gateRun(`spider:${ns ?? ''}`, (spiderConfig.minIntervalSeconds ?? 300) * 1000, () => {
+      log('summarize', 'info', 'triggering spider daemon');
+      return spider.run({ runCypher, callAnthropic, config: spiderConfig, log, namespace: ns });
+    });
+    gated.promise?.catch(e => {
       log('spider', 'error', `spider failed during summarize: ${e.message}`);
     });
   }
 
   // Janitor daemon — clean up garbage neurons
   if (isDaemonEnabled('janitor')) {
-    janitor.run({ runCypher, log, namespace: ns }).catch(e => {
+    const janitorConfig = getDaemonConfig('janitor');
+    const gated = gateRun(`janitor:${ns ?? ''}`, (janitorConfig.minIntervalSeconds ?? 300) * 1000, () =>
+      janitor.run({ runCypher, log, namespace: ns }));
+    gated.promise?.catch(e => {
       log('janitor', 'error', `janitor failed: ${e.message}`);
     });
   }
