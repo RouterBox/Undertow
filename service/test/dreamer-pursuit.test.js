@@ -245,3 +245,63 @@ test('non-pursued log line reports what actually happened', async () => {
   assert.match(detailFor(same, 'A: flash A'), /times_dismissed \+1 on 1 neuron\(s\)/);
   assert.match(detailFor(same, 'unknown flash'), /nothing applied/);
 });
+
+test('two overlapping Stops judge an entry once', async () => {
+  const h = harness({
+    entries: [haikuEntry(['kettle flash'], ['A'])],
+    responses: [
+      [{ flash_text: 'kettle flash', status: 'dismissed' }],
+      [{ flash_text: 'kettle flash', status: 'dismissed' }]
+    ]
+  });
+  // Both Stops start before either model call has returned.
+  await Promise.all([handleSummarize(h.deps), handleSummarize(h.deps)]);
+  assert.ok(h.prompts[0].includes('kettle flash'));
+  assert.ok(!h.prompts[1].includes('kettle flash'), 'the second Stop does not send a claimed entry');
+  assert.equal(h.count('A', DISMISS_RE), 1, 'one dismissal, not two');
+});
+
+test('a failed call releases the claim so the next Stop can judge the entry', async () => {
+  const h = harness({
+    entries: [haikuEntry(['kettle flash'], ['A'])],
+    responses: [null, [{ flash_text: 'kettle flash', status: 'pursued' }]]
+  });
+  await handleSummarize(h.deps);
+  assert.equal(h.session.pendingFlashes[0].judging, false);
+  await handleSummarize(h.deps);
+  assert.equal(h.count('A', PURSUE_RE), 1);
+});
+
+test('a reply that matches none of the entry flashes leaves it for one retry', async () => {
+  const h = harness({
+    entries: [haikuEntry(['kettle flash'], ['A'])],
+    responses: [
+      [{ flash_text: 'a paraphrase of the kettle flash', status: 'dismissed' }],
+      [{ flash_text: 'kettle flash', status: 'pursued' }]
+    ]
+  });
+  await handleSummarize(h.deps);
+  assert.notEqual(h.session.pendingFlashes[0].judged, true, 'unmatched entry is not closed');
+  assert.equal(h.count('A', DISMISS_RE), 0);
+  await handleSummarize(h.deps);
+  assert.ok(h.prompts[1].includes('kettle flash'), 'sent again');
+  assert.equal(h.count('A', PURSUE_RE), 1);
+  assert.equal(h.session.pendingFlashes[0].judged, true);
+});
+
+test('an entry that never matches is closed after two attempts with no outcome', async () => {
+  const h = harness({
+    entries: [haikuEntry(['kettle flash'], ['A'])],
+    responses: [
+      [{ flash_text: 'paraphrase one', status: 'dismissed' }],
+      [{ flash_text: 'paraphrase two', status: 'dismissed' }],
+      [{ flash_text: 'kettle flash', status: 'dismissed' }]
+    ]
+  });
+  await handleSummarize(h.deps);
+  await handleSummarize(h.deps);
+  assert.equal(h.session.pendingFlashes[0].judged, true);
+  await handleSummarize(h.deps);
+  assert.ok(!h.prompts[2].includes('kettle flash'), 'not sent a third time');
+  assert.equal(h.count('A', DISMISS_RE), 0);
+});

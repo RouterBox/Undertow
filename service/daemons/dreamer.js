@@ -107,6 +107,9 @@ function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
 
 // --- Summarize handler (Stop hook) ---
 
+// How many Stops may send an entry to the judge before it is closed unmatched.
+const MAX_JUDGE_ATTEMPTS = 2;
+
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
   const { session_id, transcript_path, cwd } = req_body;
 
@@ -130,8 +133,13 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   // Stop only: once judged it stays in pendingFlashes (explicit feedback still looks
   // it up) but is not sent or counted again.
   const evaluated = session.pendingFlashes
-    .filter(f => !f.judged && Date.now() - f.turn < 10 * 60 * 1000);
+    .filter(f => !f.judged && !f.judging && Date.now() - f.turn < 10 * 60 * 1000);
   const recentFlashes = evaluated.flatMap(f => f.flashes);
+
+  // Claim the entries before the await: Stops for one session can overlap, and a
+  // second Stop must not send the same entries to the judge while this one waits.
+  for (const entry of evaluated) entry.judging = true;
+  const release = () => { for (const entry of evaluated) entry.judging = false; };
 
   const result = await callAnthropic(SUMMARIZE_MODEL, SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
 ${transcript}
@@ -139,9 +147,10 @@ ${transcript}
 Flashes that were injected this turn:
 ${recentFlashes.length > 0 ? recentFlashes.join('\n') : '[none]'}
 
-Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`, 1000);
+Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`, 1000)
+    .catch(e => { release(); throw e; });
 
-  if (!result) return;
+  if (!result) { release(); return; }
   const message = result.response;
   if (result.model !== SUMMARIZE_MODEL) {
     log('summarize', 'warn', `used fallback model: ${result.model}`);
@@ -153,13 +162,21 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
   } catch {
+    release();
     return;
   }
 
-  // Mark the entries judged only now that the model returned parseable flash_results,
-  // so a failed or malformed call leaves them for the next Stop.
+  // An entry is judged once the model returned a result for one of its flashes.
+  // A failed or malformed call leaves it for the next Stop. So does a reply whose
+  // flash_text matches none of its flashes (a paraphrase), up to
+  // MAX_JUDGE_ATTEMPTS Stops; after that it is closed without an outcome.
+  release();
   if (Array.isArray(parsed.flash_results)) {
-    for (const entry of evaluated) entry.judged = true;
+    for (const entry of evaluated) {
+      const matched = parsed.flash_results.some(fr => entry.flashes.includes(fr.flash_text));
+      entry.judgeAttempts = (entry.judgeAttempts || 0) + 1;
+      if (matched || entry.judgeAttempts >= MAX_JUDGE_ATTEMPTS) entry.judged = true;
+    }
   }
 
   // Process updates to existing neurons — supersession, not overwrite:
