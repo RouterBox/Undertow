@@ -398,7 +398,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // (writes to the live graph — skip for namespaced sessions)
   if (!ns && isDaemonEnabled('prowler') && session.activeTopics.length > 0) {
     log('summarize', 'info', 'triggering prowler daemon');
-    prowler.deepResearch({ topics: session.activeTopics, runCypher, log }).catch(e => {
+    prowler.deepResearch({ topics: session.activeTopics, session, runCypher, embedNeuron, log }).catch(e => {
       log('prowler', 'error', `prowler failed: ${e.message}`);
     });
   }
