@@ -472,6 +472,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
     session.pendingFlashes.push({
       turn: Date.now(),
       flashes: unique.map(r => r.flash),
+      flashNeurons: unique.map(r => r.name), // flashes[i] is flashNeurons[i]'s own line
       sourceNeurons: unique.map(r => r.name),
       neuronDomains: unique.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: unique.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
@@ -541,6 +542,7 @@ Select the candidates worth surfacing (possibly none). Return JSON.`);
     session.pendingFlashes.push({
       turn: Date.now(),
       flashes: picks.map((p) => `${p.name}: ${p.flash}`),
+      flashNeurons: picks.map((p) => p.name), // flashes[i] is flashNeurons[i]'s own line
       sourceNeurons: picks.map((p) => p.name),
       neuronDomains: picks.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: picks.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
