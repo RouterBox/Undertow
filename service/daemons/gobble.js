@@ -1,6 +1,7 @@
 // gobble.js — Gobble daemon (memory ingestion from tool events)
 // Extracted from server.js — no behavior changes
 
+import { resolveModel } from '../llm.js';
 import { supersedeNeuron } from '../supersede.js';
 
 const INGEST_SYSTEM_PROMPT = `You are Undertow's memory writer. You evaluate tool events from a Claude Code session and decide what's worth remembering in a persistent knowledge graph.
@@ -86,7 +87,6 @@ SKIP — the vast majority of events:
 
 If in doubt, SKIP. A graph with 50 high-quality neurons beats one with 500 noisy ones.`;
 
-const QUERY_MODEL = 'claude-haiku-5-5';
 
 // The prompt enumerates a closed node_type set, but nothing stops the model
 // from inventing types (a downstream fork found neurons typed 'gotcha').
@@ -141,7 +141,7 @@ async function handleIngest({ req_body, runCypher, callAnthropic, embedNeuron, g
   }
 
   // Ask Haiku to evaluate
-  const ingestResult = await callAnthropic(QUERY_MODEL, INGEST_SYSTEM_PROMPT, `Tool: ${tool_name}
+  const ingestResult = await callAnthropic(resolveModel('ingest'), INGEST_SYSTEM_PROMPT, `Tool: ${tool_name}
 Input: ${inputStr}
 Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
   if (!ingestResult) return;

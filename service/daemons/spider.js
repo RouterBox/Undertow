@@ -7,6 +7,7 @@
  * 3. Pre-compute GDS scores (PageRank, betweenness, community)
  */
 
+import { resolveModel } from '../llm.js';
 import { getDaemonConfig } from './loader.js';
 import { livePredicate } from '../namespaces.js';
 
@@ -138,7 +139,7 @@ export default {
 
         let parsed = null;
         try {
-          const result = await callAnthropic('claude-haiku-5-5',
+          const result = await callAnthropic(resolveModel('query'),
             `You are Undertow's Spider daemon doing knowledge-graph edge discovery.
 
 You receive a numbered list of memory neurons (knowledge units). Find pairs that share a GENUINE, SPECIFIC relationship. Ignore vague topical overlap — only connect neurons where one actually informs, causes, follows, contradicts, contains, or is required by another, or where they are tightly associated by a shared concrete subject.
@@ -260,7 +261,7 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
 
         if (candidates.length > 0) {
           // Ask Haiku to evaluate which connections are meaningful
-          const evalResult = await callAnthropic('claude-haiku-5-5',
+          const evalResult = await callAnthropic(resolveModel('query'),
             `You are Undertow's spider daemon. You evaluate potential connections between neurons in a knowledge graph.
 
 For each candidate pair, decide if a meaningful connection exists. Return JSON:

@@ -1,15 +1,15 @@
 // dreamer.js — Dreamer daemon (turn processing, session start, rehydration)
 // Extracted from server.js — no behavior changes
 
+import { resolveModel } from '../llm.js';
 import { readFile } from 'fs/promises';
 import { nsPredicate, livePredicate } from '../namespaces.js';
 import { supersedeNeuron } from '../supersede.js';
 import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
+import { gateRun } from '../downstream-gate.js';
 
-const QUERY_MODEL = 'claude-haiku-5-5';
-const SUMMARIZE_MODEL = 'claude-sonnet-5';
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
 
@@ -152,6 +152,7 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   for (const entry of evaluated) entry.judging = true;
   const release = () => { for (const entry of evaluated) entry.judging = false; };
 
+  const SUMMARIZE_MODEL = resolveModel('summarize');
   let parsed;
   try {
   const result = await callAnthropic(SUMMARIZE_MODEL, SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
@@ -494,18 +495,25 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     });
   }
 
-  // Run downstream daemons at session end
+  // Run downstream daemons. Stop fires after every turn, so each is gated:
+  // one run at a time per namespace, and a pause between runs.
   const spiderConfig = getDaemonConfig('spider');
   if (isDaemonEnabled('spider') && spiderConfig.schedule === 'session-end') {
-    log('summarize', 'info', 'triggering spider daemon');
-    spider.run({ runCypher, callAnthropic, config: spiderConfig, log, namespace: ns }).catch(e => {
+    const gated = gateRun(`spider:${ns ?? ''}`, (spiderConfig.minIntervalSeconds ?? 300) * 1000, () => {
+      log('summarize', 'info', 'triggering spider daemon');
+      return spider.run({ runCypher, callAnthropic, config: spiderConfig, log, namespace: ns });
+    });
+    gated.promise?.catch(e => {
       log('spider', 'error', `spider failed during summarize: ${e.message}`);
     });
   }
 
   // Janitor daemon — clean up garbage neurons
   if (isDaemonEnabled('janitor')) {
-    janitor.run({ runCypher, log, namespace: ns }).catch(e => {
+    const janitorConfig = getDaemonConfig('janitor');
+    const gated = gateRun(`janitor:${ns ?? ''}`, (janitorConfig.minIntervalSeconds ?? 300) * 1000, () =>
+      janitor.run({ runCypher, log, namespace: ns }));
+    gated.promise?.catch(e => {
       log('janitor', 'error', `janitor failed: ${e.message}`);
     });
   }
@@ -540,7 +548,7 @@ async function handleSessionStart({ req_body, session, runCypher, callAnthropic,
     return { responseJson: {} };
   }
 
-  const startResult = await callAnthropic(QUERY_MODEL, SESSION_START_SYSTEM_PROMPT, `Working directory: ${cwd || 'unknown'}
+  const startResult = await callAnthropic(resolveModel('query'), SESSION_START_SYSTEM_PROMPT, `Working directory: ${cwd || 'unknown'}
 
 T1 index neurons:
 ${t1Neurons.map(n => `- [${n.type}] ${n.name}: ${n.flash}`).join('\n')}

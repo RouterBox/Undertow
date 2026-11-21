@@ -6,7 +6,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '.env') });
 import express from 'express';
 import neo4j from 'neo4j-driver';
-import Anthropic from '@anthropic-ai/sdk';
+import { callLLM, resolveModel, getProvider, usesAnthropicProvider } from './llm.js';
+import { mountMcp, createHttpDispatch } from './mcp.js';
+import { apiTokenGuard } from './auth.js';
 import { readFile, appendFile, mkdir, writeFile } from 'fs/promises';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { basename as pathBasename } from 'path';
@@ -17,7 +19,7 @@ import prowler from './daemons/prowler.js';
 import tapestry from './daemons/tapestry.js';
 import wonder from './daemons/wonder.js';
 import janitor from './daemons/janitor.js';
-import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo } from './embeddings.js';
+import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo, initEmbeddings, getEmbeddingStatus } from './embeddings.js';
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
@@ -55,6 +57,12 @@ async function embedNeuron(name, flashSummary) {
 
 // --- Config ---
 const PORT = 3030;
+// Bind loopback by default; set UNDERTOW_HOST=0.0.0.0 (or an interface IP) to accept remote callers.
+const HOST = process.env.UNDERTOW_HOST || '127.0.0.1';
+// Optional bearer token for /mcp and mutating /undertow/* routes (see auth.js).
+const API_TOKEN = process.env.UNDERTOW_API_TOKEN || '';
+// Mutating MCP tools (spider, ingest, correct action=delete) are off unless explicitly enabled.
+const MCP_ALLOW_MUTATIONS = /^(1|true|yes|on)$/i.test(process.env.UNDERTOW_MCP_ALLOW_MUTATIONS || '');
 const LOG_DIR = join(__dirname, 'logs');
 const LOG_FILE = join(LOG_DIR, `undertow-${new Date().toISOString().split('T')[0]}.log`);
 const NEO4J_URI = process.env.NEO4J_URI || 'bolt://localhost:7687';
@@ -74,7 +82,7 @@ function warnEnv(name, value, consequence) {
 }
 
 requireEnv('NEO4J_PASS', NEO4J_PASS);
-requireEnv('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY);
+if (usesAnthropicProvider()) requireEnv('ANTHROPIC_API_KEY', ANTHROPIC_API_KEY);
 // Only the gemini provider needs GEMINI_API_KEY; with a local provider the
 // warning would falsely claim vector search is dead (and train operators to
 // ignore the channel that reports real embedding problems).
@@ -83,62 +91,13 @@ if (getProviderInfo().provider === 'gemini') {
 }
 warnEnv('BRAVE_API_KEY', process.env.BRAVE_API_KEY, 'Prowler upstream (Brave) disabled');
 warnEnv('PERPLEXITY_API_KEY', process.env.PERPLEXITY_API_KEY, 'Prowler downstream (Perplexity) disabled');
-const QUERY_MODEL = 'claude-haiku-5-5';
-const SUMMARIZE_MODEL = 'claude-sonnet-5';
-const FALLBACK_MODEL = QUERY_MODEL; // Fall back to Haiku if Sonnet is overloaded
+// Model ids are resolved per role in llm.js (env-overridable, defaults unchanged).
+const INGEST_MODEL = resolveModel('ingest');
 
-// Resilient API call with retry + model fallback
-async function callAnthropic(model, system, userContent, maxTokens = 500) {
-  const maxRetries = 2;
-  let currentModel = model;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const message = await anthropic.messages.create({
-        model: currentModel,
-        max_tokens: maxTokens,
-        // Haiku 5.5 and Sonnet 5 think by default and burn small max_tokens budgets before writing any text.
-        ...(currentModel.startsWith('claude-haiku') || currentModel.startsWith('claude-sonnet-5') ? { thinking: { type: 'disabled' } } : {}),
-        system,
-        messages: [{ role: 'user', content: userContent }]
-      });
-      // Callers read content[0].text; put text blocks first so a leading thinking block can't blank the reply.
-      const blocks = Array.isArray(message.content) ? message.content : [];
-      if (!blocks.some(b => b?.type === 'text' && b.text)) {
-        log('api', 'warn', `${currentModel} returned no text block`, {
-          detail: `stop_reason=${message.stop_reason} types=${blocks.map(b => b?.type).join(',') || 'none'} out_tokens=${message.usage?.output_tokens}`
-        });
-      }
-      message.content = [...blocks.filter(b => b?.type === 'text'), ...blocks.filter(b => b?.type !== 'text')];
-      return { response: message, model: currentModel };
-    } catch (e) {
-      const isOverloaded = e.status === 529 || e.message?.includes('Overloaded') || e.message?.includes('overloaded');
-      const isRateLimit = e.status === 429;
-
-      if (isOverloaded || isRateLimit) {
-        if (attempt < maxRetries) {
-          // First retry: wait and try same model
-          if (attempt === 0) {
-            const delay = 2000 + Math.random() * 1000;
-            log('api', 'warn', `${currentModel} ${e.status} — retrying in ${Math.round(delay)}ms`);
-            await new Promise(r => setTimeout(r, delay));
-          }
-          // Second retry: fall back to cheaper model
-          if (attempt === 1 && currentModel !== FALLBACK_MODEL) {
-            currentModel = FALLBACK_MODEL;
-            log('api', 'warn', `falling back to ${FALLBACK_MODEL}`);
-          }
-        } else {
-          log('api', 'error', `all retries exhausted for ${model} (${e.status})`);
-          return null;
-        }
-      } else {
-        log('api', 'error', `${currentModel}: ${e.message}`);
-        return null;
-      }
-    }
-  }
-  return null;
+// Resilient API call with retry + model fallback — delegates to the provider seam.
+// Kept under this name because daemons receive it as `callAnthropic`.
+function callAnthropic(model, system, userContent, maxTokens = 500) {
+  return callLLM(model, system, userContent, maxTokens, { log });
 }
 
 // --- Logging ---
@@ -161,14 +120,15 @@ async function log(endpoint, level, message, data = {}) {
 
 // --- Clients ---
 const driver = neo4j.driver(NEO4J_URI, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
-// Identity-linked ("All workspaces") API keys require the workspace to act in.
-const anthropic = new Anthropic({
-  apiKey: ANTHROPIC_API_KEY,
-  defaultHeaders: process.env.ANTHROPIC_WORKSPACE_ID
-    ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID }
-    : undefined
-});
+// Fail fast on a misconfigured LLM provider (bad UNDERTOW_LLM_PROVIDER / _MODULE).
+try {
+  await getProvider();
+} catch (e) {
+  console.error(`[undertow] LLM provider failed to load: ${e.message}`);
+  process.exit(1);
+}
 const app = express();
+if (API_TOKEN) app.use(apiTokenGuard(API_TOKEN));
 app.use(express.json({ limit: '1mb' }));
 
 // --- Undertow Toggle & Config ---
@@ -227,7 +187,7 @@ async function runCypher(query, params = {}) {
 app.get('/health', async (req, res) => {
   try {
     await runCypher('RETURN 1');
-    res.json({ status: 'ok', neo4j: 'connected', enabled: undertowEnabled, uptime: process.uptime() });
+    res.json({ status: 'ok', neo4j: 'connected', enabled: undertowEnabled, uptime: process.uptime(), embeddings: getEmbeddingStatus() });
   } catch (e) {
     res.status(503).json({ status: 'error', neo4j: 'disconnected', error: e.message });
   }
@@ -667,7 +627,7 @@ app.post('/undertow/external-ingest', async (req, res) => {
     const agentSource = source || agent_name || 'external';
 
     // Use Haiku to evaluate and create neurons
-    const extResult = await callAnthropic(QUERY_MODEL, INGEST_SYSTEM_PROMPT, `Tool: ExternalIngest
+    const extResult = await callAnthropic(INGEST_MODEL, INGEST_SYSTEM_PROMPT, `Tool: ExternalIngest
 Input: ${JSON.stringify({ source: agentSource, text: text.substring(0, 1000) })}
 Response: [external agent memory submission]`);
     if (!extResult) return res.json({ status: 'api_error' });
@@ -834,13 +794,18 @@ app.post('/undertow/chase', async (req, res) => {
     if (!neuron) return res.status(400).json({ error: 'neuron name required' });
 
     // Strong pursuit reward: +15 base_score (vs +10 for normal pursuit)
-    await runCypher(`
+    const rewarded = await runCypher(`
       MATCH (n:Neuron {name: $name})
       SET n.times_pursued = n.times_pursued + 1,
           n.base_score = CASE WHEN n.base_score + 15 > 100 THEN 100 ELSE n.base_score + 15 END,
           n.last_surfaced = datetime()
       RETURN n.name, n.base_score
-    `, { name: neuron }).catch(e => log('error', 'warn', e.message));
+    `, { name: neuron }).catch(e => { log('error', 'warn', e.message); return null; });
+
+    // MATCH found nothing: don't tell the caller the reward landed.
+    if (Array.isArray(rewarded) && rewarded.length === 0) {
+      return res.status(404).json({ status: 'not_found', error: `no neuron named "${neuron}"`, neuron });
+    }
 
     // Strengthen outbound synapses more aggressively (+0.08 vs +0.05 for normal pursuit)
     await runCypher(`
@@ -1055,7 +1020,7 @@ app.post('/undertow/ingest-url', async (req, res) => {
     }
 
     // Haiku evaluates what's worth remembering
-    const evalResult = await callAnthropic(QUERY_MODEL,
+    const evalResult = await callAnthropic(INGEST_MODEL,
       `You are Undertow's web ingestor. Extract key insights worth remembering from this web page.
 
 CRITICAL: Return ONLY valid JSON. No markdown fences. No code blocks. No backticks.
@@ -1154,7 +1119,7 @@ app.post('/undertow/ingest-file', async (req, res) => {
       return res.json({ status: 'empty_content' });
     }
 
-    const evalResult = await callAnthropic(QUERY_MODEL,
+    const evalResult = await callAnthropic(INGEST_MODEL,
       `You are Undertow's file ingestor. Extract key insights, facts, or concepts worth remembering from this file content.
 
 CRITICAL: Return ONLY valid JSON. No markdown fences. No code blocks. No backticks.
@@ -1408,8 +1373,32 @@ app.get('/undertow/logs', async (req, res) => {
   }
 });
 
+// --- MCP endpoint (/mcp) ---
+// Tools call this service's own routes over loopback, so they get exactly the
+// same validation and behavior as any HTTP caller.
+function loopbackBaseUrl() {
+  const addr = httpServer.address();
+  let host = addr.address;
+  if (host === '0.0.0.0' || host === '::') host = '127.0.0.1';
+  if (host.includes(':')) host = `[${host}]`;
+  return `http://${host}:${addr.port}`;
+}
+mountMcp(app, {
+  dispatch: createHttpDispatch(loopbackBaseUrl, {
+    headers: API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}
+  }),
+  allowMutations: MCP_ALLOW_MUTATIONS,
+  log
+});
+
 // --- Startup ---
-app.listen(PORT, async () => {
+const httpServer = app.listen(PORT, HOST, async () => {
+  if (!['127.0.0.1', 'localhost', '::1'].includes(HOST) && !API_TOKEN) {
+    log('startup', 'warn', `listening on ${HOST} without UNDERTOW_API_TOKEN — anyone who can reach this port can read and modify memory`);
+  }
+  // Local embeddings: load the model now so a missing/unreachable model is one
+  // loud startup error (and /health shows it), not a silent per-query null.
+  initEmbeddings({ log: (msg) => log('startup', 'error', msg) });
   try {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
@@ -1417,7 +1406,7 @@ app.listen(PORT, async () => {
     const enabledDaemons = Object.entries(daemonCfg.daemons || {})
       .filter(([, v]) => v.enabled)
       .map(([k]) => k);
-    log('startup', 'info', `Undertow online — localhost:${PORT} — Neo4j connected — daemons: ${enabledDaemons.join(', ') || 'none'}`);
+    log('startup', 'info', `Undertow online — ${HOST}:${PORT} — Neo4j connected — daemons: ${enabledDaemons.join(', ') || 'none'}`);
     // Embedding sanity: a provider/index dimension mismatch makes vector search
     // silently miss everything, presenting as "recall is a bit weak" rather
     // than "retrieval is dead". One loud boot-time line prevents that.
