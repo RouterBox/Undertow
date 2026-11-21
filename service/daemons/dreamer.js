@@ -8,6 +8,7 @@ import { supersedeNeuron } from '../supersede.js';
 import { stripUndertowInjections } from '../strip-injections.js';
 import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
+import { mapCwdToProject } from './impulse.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -67,6 +68,11 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   // declared namespace (null = live graph).
   const ns = req_body.namespace ?? session.namespace ?? null;
   if (ns) session.namespace = ns;
+
+  // New neurons carry the session's project. Impulse sets it on a query; a
+  // session whose prompts never reached Impulse still has a cwd here.
+  if (cwd && !session.currentProject) session.currentProject = mapCwdToProject(cwd);
+  const project = session.currentProject || 'general';
 
   // Read transcript if available
   let transcript = '';
@@ -144,13 +150,13 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               source: 'conversation', decay_score: 50, base_score: 50,
               times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
               created_at: datetime(), last_surfaced: datetime(),
-              namespace: $ns,
+              project: $project, namespace: $ns,
               event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
             })
           `, {
           uid: randomUUID(), name: insight.name, type: coerceNodeType(insight.node_type, 'insight'),
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
-          body: insight.body || '', ns, eventDate
+          body: insight.body || '', project, ns, eventDate
         });
 
         // Create connections for insights
@@ -196,9 +202,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
                 source: 'conversation', decay_score: 50, base_score: 50,
                 times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
                 created_at: datetime(), last_surfaced: datetime(),
-                namespace: $ns
+                project: $project, namespace: $ns
               })
-            `, { name: topic, uid: randomUUID(), ns });
+            `, { name: topic, uid: randomUUID(), project, ns });
         }
       }
 
