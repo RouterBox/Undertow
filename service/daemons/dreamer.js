@@ -59,6 +59,52 @@ Only include memories that are likely relevant to the working directory or recen
 // Ouroboros guard (2026-09-02): lives in ../strip-injections.js so historical
 // ingestion shares it — see that module for why.
 
+// --- Transcript excerpt for the pursuit judge ---
+
+const EXCERPT_MAX_CHARS = 6000;
+const EXCERPT_PROMPT_MAX_CHARS = 1000;
+
+// Build the judge's excerpt from a Claude Code JSONL transcript: everything since
+// the last real user prompt — the prompt, the assistant's text, and one compact line
+// per tool call. The raw tail of the file is envelope lines (attachments, api-request
+// records, session metadata), so slicing it shows the judge none of the reply.
+// Returns null when the text is not JSONL or holds no messages (caller falls back).
+function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
+  let prompt = null;
+  let reply = [];
+  for (const line of String(raw || '').split('\n')) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    // Only real conversation lines; other envelopes can carry a message too.
+    if (!entry || (entry.type !== 'user' && entry.type !== 'assistant')) continue;
+    if (entry.isSidechain || entry.isMeta || entry.isCompactSummary) continue;
+    const content = entry.message?.content;
+    const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
+    if (entry.type === 'user') {
+      // A user line holding only tool_result blocks is not a prompt.
+      const text = stripUndertowInjections(blocks.filter(b => b?.type === 'text').map(b => b.text || '').join('\n')).trim();
+      if (text) { prompt = text; reply = []; }
+      continue;
+    }
+    for (const b of blocks) {
+      if (b?.type === 'text') {
+        const text = stripUndertowInjections(b.text || '').trim();
+        if (text) reply.push(`Assistant: ${text}`);
+      } else if (b?.type === 'tool_use') {
+        const input = (JSON.stringify(b.input ?? {}) || '').replace(/\s+/g, ' ').substring(0, 120);
+        reply.push(`[tool] ${b.name}: ${input}`);
+      }
+    }
+  }
+  if (prompt === null && reply.length === 0) return null;
+  const head = prompt === null ? '' : `User: ${prompt.substring(0, EXCERPT_PROMPT_MAX_CHARS)}\n`;
+  const body = reply.join('\n');
+  const room = Math.max(0, maxChars - head.length);
+  // When it must be cut, keep the END of the reply: that is where the answer is.
+  return head + (body.length > room ? body.slice(-room) : body);
+}
+
 // --- Summarize handler (Stop hook) ---
 
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
@@ -74,16 +120,18 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   if (transcript_path) {
     try {
       const raw = await readFile(transcript_path, 'utf8');
-      transcript = stripUndertowInjections(raw).slice(-2000);
+      transcript = buildTranscriptExcerpt(raw) ?? stripUndertowInjections(raw).slice(-2000);
     } catch {
       transcript = '[transcript unavailable]';
     }
   }
 
-  // Get recent pending flashes for pursuit detection
-  const recentFlashes = session.pendingFlashes
-    .filter(f => Date.now() - f.turn < 10 * 60 * 1000)
-    .flatMap(f => f.flashes);
+  // Get recent pending flashes for pursuit detection. An entry is judged at one
+  // Stop only: once judged it stays in pendingFlashes (explicit feedback still looks
+  // it up) but is not sent or counted again.
+  const evaluated = session.pendingFlashes
+    .filter(f => !f.judged && Date.now() - f.turn < 10 * 60 * 1000);
+  const recentFlashes = evaluated.flatMap(f => f.flashes);
 
   const result = await callAnthropic(SUMMARIZE_MODEL, SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
 ${transcript}
@@ -106,6 +154,12 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
   } catch {
     return;
+  }
+
+  // Mark the entries judged only now that the model returned parseable flash_results,
+  // so a failed or malformed call leaves them for the next Stop.
+  if (Array.isArray(parsed.flash_results)) {
+    for (const entry of evaluated) entry.judged = true;
   }
 
   // Process updates to existing neurons — supersession, not overwrite:
@@ -222,6 +276,20 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // fed-back neuron, add a synthetic one so the normal pursuit/dismissal path below
   // still applies it (synthetic results touch ONLY the fed-back neurons).
   const feedbackDone = new Set();
+  // Which entry and which of its neurons a flash result speaks for. Sonnet's results
+  // resolve only against the entries evaluated at this Stop; a synthetic (feedback)
+  // result carries its own entry, which may already be judged. An entry with a
+  // per-flash mapping (flashNeurons, parallel to flashes) attributes a flash to its
+  // own neuron; without one (haiku/both) the flash speaks for the whole entry.
+  const neuronsFor = (fr) => {
+    if (fr.synthetic) {
+      return { entry: fr.entry, neurons: fr.entry.sourceNeurons.filter(n => verdictToOutcome(session.explicitFeedback?.[n]?.verdict)) };
+    }
+    const entry = evaluated.find(pf => pf.flashes.some(f => f === fr.flash_text));
+    if (!entry) return null;
+    if (!Array.isArray(entry.flashNeurons)) return { entry, neurons: entry.sourceNeurons };
+    return { entry, neurons: entry.flashNeurons.filter((n, i) => entry.flashes[i] === fr.flash_text) };
+  };
   const fbEntries = Object.entries(session.explicitFeedback || {});
   if (fbEntries.length) {
     parsed.flash_results = Array.isArray(parsed.flash_results) ? parsed.flash_results : [];
@@ -236,27 +304,37 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         delete session.explicitFeedback[fbName];
         continue;
       }
-      const covered = parsed.flash_results.some(fr =>
-        session.pendingFlashes.find(pf => pf.flashes.some(f => f === fr.flash_text))?.sourceNeurons.includes(fbName));
+      const covered = parsed.flash_results.some(fr => neuronsFor(fr)?.neurons.includes(fbName));
       if (!covered) {
-        parsed.flash_results.push({ flash_text: entry.flashes[0], status: outcome.status, synthetic: true });
+        parsed.flash_results.push({ flash_text: entry.flashes[0], status: outcome.status, synthetic: true, entry });
       }
     }
   }
 
   // Process pursuit/dismissal (with fair domain scoring)
   if (parsed.flash_results?.length) {
+    // One outcome per neuron per entry per Stop, pursued winning over dismissed —
+    // an entry with k flashes must not hand each of its neurons k outcomes.
+    const outcomes = new Map(); // entry -> Map(neuron -> status)
     for (const fr of parsed.flash_results) {
-      // Find which neurons were associated with this flash
-      const flashEntry = session.pendingFlashes.find(
-        pf => pf.flashes.some(f => f === fr.flash_text)
-      );
-      if (!flashEntry) continue;
+      const hit = neuronsFor(fr);
+      if (!hit) continue;
+      if (!outcomes.has(hit.entry)) outcomes.set(hit.entry, new Map());
+      const byNeuron = outcomes.get(hit.entry);
+      for (const neuronName of hit.neurons) {
+        if (fr.status === 'pursued' || !byNeuron.has(neuronName)) byNeuron.set(neuronName, fr.status);
+      }
+    }
+
+    // What was actually applied, for the per-flash log below.
+    const applied = new Map(); // entry -> Map(neuron -> 'pursued' | 'dismissed' | 'skipped')
+    for (const [flashEntry, byNeuron] of outcomes) {
+      applied.set(flashEntry, new Map());
 
       // Track which neurons have already been reinforced this session (consolidation window)
       session.pursuedThisSession = session.pursuedThisSession || new Set();
 
-      for (const neuronName of flashEntry.sourceNeurons) {
+      for (const [neuronName, inferredStatus] of byNeuron) {
         const isInDomain = flashEntry.neuronDomains?.[neuronName] !== false;
         const contributingDaemon = flashEntry.neuronDaemons?.[neuronName] || 'impulse';
 
@@ -265,7 +343,6 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         // 'wrong' also flags the neuron for human review; nothing is auto-corrected.
         const fb = session.explicitFeedback?.[neuronName];
         const fbOutcome = fb ? verdictToOutcome(fb.verdict) : null;
-        if (fr.synthetic && !fbOutcome) continue;
         if (fbOutcome) {
           if (feedbackDone.has(neuronName)) continue; // applied once per summarize
           feedbackDone.add(neuronName);
@@ -274,7 +351,8 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               .catch(e => log('error', 'warn', e.message));
           }
         }
-        const status = fbOutcome ? fbOutcome.status : fr.status;
+        const status = fbOutcome ? fbOutcome.status : inferredStatus;
+        applied.get(flashEntry).set(neuronName, status === 'pursued' ? 'pursued' : isInDomain ? 'dismissed' : 'skipped');
 
         if (status === 'pursued') {
           // Consolidation window: only reinforce score/weights once per session per neuron
@@ -352,7 +430,15 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
       if (fr.status === 'pursued') {
         log('summarize', 'info', `pursuit: ✓ "${flashPreview}"`, { detail: 'base_score +10, synapses strengthened' });
       } else {
-        log('summarize', 'info', `pursuit: ✗ "${flashPreview}"`, { detail: 'same-domain dismissal — times_dismissed +1' });
+        const hit = neuronsFor(fr);
+        const did = hit ? hit.neurons.map(n => applied.get(hit.entry)?.get(n)) : [];
+        const count = (what) => did.filter(d => d === what).length;
+        const parts = [];
+        if (count('dismissed')) parts.push(`same-domain dismissal — times_dismissed +1 on ${count('dismissed')} neuron(s)`);
+        if (count('skipped')) parts.push(`${count('skipped')} cross-project neuron(s) skipped, no penalty`);
+        if (count('pursued')) parts.push(`${count('pursued')} neuron(s) pursued via another flash or explicit feedback`);
+        const detail = !hit ? 'no matching pending flash — nothing applied' : parts.join('; ') || 'nothing applied';
+        log('summarize', 'info', `pursuit: ✗ "${flashPreview}"`, { detail });
       }
     }
     log('summarize', 'info', `pursuit detection: ${parsed.flash_results.length} flashes evaluated`);
@@ -488,4 +574,4 @@ async function summarizeForTurn(deps, keeper) {
   return { skipped: false };
 }
 
-export { summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
+export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
