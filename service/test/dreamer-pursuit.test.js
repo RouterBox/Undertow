@@ -272,36 +272,58 @@ test('a failed call releases the claim so the next Stop can judge the entry', as
   assert.equal(h.count('A', PURSUE_RE), 1);
 });
 
-test('a reply that matches none of the entry flashes leaves it for one retry', async () => {
+test('a trimmed or re-punctuated flash_text still resolves, in the same Stop', async () => {
+  const flash = '~ The kettle thermostat was recalibrated to 92 degrees last spring.';
   const h = harness({
-    entries: [haikuEntry(['kettle flash'], ['A'])],
-    responses: [
-      [{ flash_text: 'a paraphrase of the kettle flash', status: 'dismissed' }],
-      [{ flash_text: 'kettle flash', status: 'pursued' }]
-    ]
+    entries: [haikuEntry([flash], ['A'])],
+    responses: [[{ flash_text: 'The kettle thermostat was recalibrated to 92 degrees last spring', status: 'pursued' }]]
   });
   await handleSummarize(h.deps);
-  assert.notEqual(h.session.pendingFlashes[0].judged, true, 'unmatched entry is not closed');
-  assert.equal(h.count('A', DISMISS_RE), 0);
-  await handleSummarize(h.deps);
-  assert.ok(h.prompts[1].includes('kettle flash'), 'sent again');
   assert.equal(h.count('A', PURSUE_RE), 1);
   assert.equal(h.session.pendingFlashes[0].judged, true);
 });
 
-test('an entry that never matches is closed after two attempts with no outcome', async () => {
+test('with a per-flash mapping a trimmed flash_text goes only to its own neuron', async () => {
+  const entry = {
+    ...haikuEntry(['Kettle thermostat recalibrated to 92 degrees.', 'Barn roof repainted green in the autumn.'], ['A', 'B']),
+    flashNeurons: ['A', 'B']
+  };
+  const h = harness({
+    entries: [entry],
+    responses: [[{ flash_text: 'kettle thermostat recalibrated to 92 degrees', status: 'pursued' }]]
+  });
+  await handleSummarize(h.deps);
+  assert.equal(h.count('A', PURSUE_RE), 1);
+  assert.equal(h.count('B', PURSUE_RE), 0);
+});
+
+test('a flash the reply did not mention gets no outcome and is not judged at a later turn', async () => {
   const h = harness({
     entries: [haikuEntry(['kettle flash'], ['A'])],
     responses: [
-      [{ flash_text: 'paraphrase one', status: 'dismissed' }],
-      [{ flash_text: 'paraphrase two', status: 'dismissed' }],
+      [{ flash_text: 'something else entirely', status: 'dismissed' }],
       [{ flash_text: 'kettle flash', status: 'dismissed' }]
     ]
   });
   await handleSummarize(h.deps);
+  assert.equal(h.session.pendingFlashes[0].judged, true, 'closed at the Stop it was shown in');
   await handleSummarize(h.deps);
-  assert.equal(h.session.pendingFlashes[0].judged, true);
-  await handleSummarize(h.deps);
-  assert.ok(!h.prompts[2].includes('kettle flash'), 'not sent a third time');
+  assert.ok(!h.prompts[1].includes('kettle flash'), 'not sent with the next turn');
   assert.equal(h.count('A', DISMISS_RE), 0);
+  assert.equal(h.count('A', PURSUE_RE), 0);
+});
+
+test('a throw from the judge call releases the claim', async () => {
+  const h = harness({ entries: [haikuEntry(['kettle flash'], ['A'])], responses: [] });
+  h.deps.callAnthropic = async () => { throw new Error('network down'); };
+  await assert.rejects(handleSummarize(h.deps), /network down/);
+  assert.equal(h.session.pendingFlashes[0].judging, false);
+  assert.notEqual(h.session.pendingFlashes[0].judged, true);
+});
+
+test('a malformed response object releases the claim', async () => {
+  const h = harness({ entries: [haikuEntry(['kettle flash'], ['A'])], responses: [] });
+  h.deps.callAnthropic = async () => ({ model: 'claude-sonnet-5', response: {} });
+  await assert.rejects(handleSummarize(h.deps));
+  assert.equal(h.session.pendingFlashes[0].judging, false);
 });

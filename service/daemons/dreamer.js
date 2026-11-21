@@ -107,8 +107,19 @@ function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
 
 // --- Summarize handler (Stop hook) ---
 
-// How many Stops may send an entry to the judge before it is closed unmatched.
-const MAX_JUDGE_ATTEMPTS = 2;
+// The judge is asked to echo each flash in flash_text, and sometimes trims or
+// re-punctuates it. Two texts are the same flash when they are equal after
+// normalising case, whitespace and edge punctuation, or when one contains the
+// other and the shorter is long enough to be unambiguous.
+const normFlash = (t) => String(t ?? '').toLowerCase().replace(/\s+/g, ' ').replace(/^[\s~"'`*-]+|[\s"'`.!*]+$/g, '');
+function sameFlash(a, b) {
+  const x = normFlash(a);
+  const y = normFlash(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  return short.length >= 20 && long.includes(short);
+}
 
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
   const { session_id, transcript_path, cwd } = req_body;
@@ -141,42 +152,41 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   for (const entry of evaluated) entry.judging = true;
   const release = () => { for (const entry of evaluated) entry.judging = false; };
 
+  let parsed;
+  try {
   const result = await callAnthropic(SUMMARIZE_MODEL, SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
 ${transcript}
 
 Flashes that were injected this turn:
 ${recentFlashes.length > 0 ? recentFlashes.join('\n') : '[none]'}
 
-Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`, 1000)
-    .catch(e => { release(); throw e; });
+Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`, 1000);
 
-  if (!result) { release(); return; }
+  if (!result) return;
   const message = result.response;
   if (result.model !== SUMMARIZE_MODEL) {
     log('summarize', 'warn', `used fallback model: ${result.model}`);
   }
 
   const responseText = message.content[0]?.text || '{}';
-  let parsed;
   try {
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
   } catch {
-    release();
     return;
   }
+  } finally {
+    // Whatever happened above (no result, a malformed reply, a throw), the claim
+    // is released, so the entries are never left stuck in "judging".
+    release();
+  }
 
-  // An entry is judged once the model returned a result for one of its flashes.
-  // A failed or malformed call leaves it for the next Stop. So does a reply whose
-  // flash_text matches none of its flashes (a paraphrase), up to
-  // MAX_JUDGE_ATTEMPTS Stops; after that it is closed without an outcome.
-  release();
+  // A parseable flash_results closes every entry it was asked about: a flash is
+  // judged only against the reply it was shown in, never a later turn's. A failed
+  // or malformed call leaves the entries for the next Stop. An entry whose flashes
+  // the reply did not mention gets no outcome.
   if (Array.isArray(parsed.flash_results)) {
-    for (const entry of evaluated) {
-      const matched = parsed.flash_results.some(fr => entry.flashes.includes(fr.flash_text));
-      entry.judgeAttempts = (entry.judgeAttempts || 0) + 1;
-      if (matched || entry.judgeAttempts >= MAX_JUDGE_ATTEMPTS) entry.judged = true;
-    }
+    for (const entry of evaluated) entry.judged = true;
   }
 
   // Process updates to existing neurons — supersession, not overwrite:
@@ -302,10 +312,13 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     if (fr.synthetic) {
       return { entry: fr.entry, neurons: fr.entry.sourceNeurons.filter(n => verdictToOutcome(session.explicitFeedback?.[n]?.verdict)) };
     }
-    const entry = evaluated.find(pf => pf.flashes.some(f => f === fr.flash_text));
+    // Exact text first; a trimmed or re-punctuated echo second.
+    const entry = evaluated.find(pf => pf.flashes.some(f => f === fr.flash_text))
+      || evaluated.find(pf => pf.flashes.some(f => sameFlash(f, fr.flash_text)));
     if (!entry) return null;
     if (!Array.isArray(entry.flashNeurons)) return { entry, neurons: entry.sourceNeurons };
-    return { entry, neurons: entry.flashNeurons.filter((n, i) => entry.flashes[i] === fr.flash_text) };
+    const exact = entry.flashNeurons.filter((n, i) => entry.flashes[i] === fr.flash_text);
+    return { entry, neurons: exact.length ? exact : entry.flashNeurons.filter((n, i) => sameFlash(entry.flashes[i], fr.flash_text)) };
   };
   const fbEntries = Object.entries(session.explicitFeedback || {});
   if (fbEntries.length) {
