@@ -62,6 +62,8 @@ const defaults = {
 };
 
 const VALID_KINDS = new Set(['agent', 'human']);
+// The hook events a Claude Code session sends (the payload's hook_event_name).
+const HOOK_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'PostCompact']);
 
 let config = { ...defaults };
 let ledger = new Map(); // sessionId → entry
@@ -323,6 +325,38 @@ const keeper = {
     }
   },
 
+  /**
+   * The gate for POST /undertow/query. A call from the undertow_query MCP tool
+   * (via 'mcp') is a deliberate request, not a person's prompt: it earns no
+   * turn-taking credit and no habituation, creates no ledger entry, and is
+   * answered whatever the session's tier (unless that tier is 'off').
+   */
+  gateQuery(sessionId, cwd, explicitTier, promptText, via) {
+    if (via !== 'mcp') return keeper.recordPrompt(sessionId, cwd, explicitTier, promptText);
+    const off = config.enabled && ledger.get(sessionId)?.tier === 'off';
+    return { tier: off ? 'off' : 'conscious', promoted: false, habituated: false, reason: null };
+  },
+
+  /**
+   * Note that a real hook payload was seen for a session the ledger already
+   * has (the payload of a Claude Code hook carries hook_event_name). Release
+   * of a held neuron needs this: an entry made by a bare POST does not qualify.
+   */
+  noteHook(sessionId, hookEventName) {
+    if (!config.enabled || !HOOK_EVENTS.has(hookEventName)) return;
+    const e = ledger.get(sessionId);
+    if (!e) return;
+    e.hookEvents = e.hookEvents || {};
+    if (!e.hookEvents[hookEventName]) { e.hookEvents[hookEventName] = now(); dirty = true; }
+  },
+
+  /** True when the session's ledger entry has seen real hook traffic (or the Keeper is disabled). */
+  fromHooks(sessionId) {
+    if (!config.enabled) return true;
+    const e = ledger.get(sessionId);
+    return !!(e && e.hookEvents && Object.keys(e.hookEvents).length);
+  },
+
   /** Remember that a session is an agent session (sticky; survives a roster outage). */
   markAgent(sessionId, label) {
     const e = getEntry(sessionId, null, null);
@@ -352,6 +386,7 @@ const keeper = {
    * did not answer). Waits at most the roster timeout.
    */
   async askRoster(sessionId, fetchImpl) {
+    if (!config.enabled) return 'none';
     if (ledger.get(sessionId)?.agentFlag) return 'flagged';
     if (!(config.agentRosters || []).length) return 'none';
     const found = await lookupAgent(sessionId, { urls: config.agentRosters, kinds: config.agentRosterKinds, ...(fetchImpl ? { fetchImpl } : {}) });
@@ -377,7 +412,8 @@ const keeper = {
    * Agent sessions keep their flashes; what Dreamer writes from them is held
    * apart (see docs/KEEPER.md, "Agent sessions"). It is a declared fact, never
    * inferred from behaviour. In order:
-   *   1. declared with setKind (POST /undertow/keeper {kind})
+   *   1. declared with setKind (POST /undertow/keeper {kind}); except that a
+   *      session a roster listed stays an agent even when declared human
    *   2. flagged as an agent: a launcher's roster listed its id (markAgent)
    *   3. cwd matches one of config.agentCwdPatterns
    * (2 and 3 are isAgentSession. The rosters are asked by resolveAgent, which
@@ -388,6 +424,8 @@ const keeper = {
   sessionKind(sessionId, cwd) {
     if (!config.enabled) return { kind: 'human', why: 'keeper disabled' };
     const e = ledger.get(sessionId);
+    // A launcher's roster is a fact: it beats a declaration of human.
+    if (e && e.agentFlag && e.declaredKind === 'human') return noteKind(e, sessionId, { kind: 'agent', why: `flagged (${e.agentFlag})` });
     if (e && VALID_KINDS.has(e.declaredKind)) return noteKind(e, sessionId, { kind: e.declaredKind, why: 'declared' });
     const a = keeper.isAgentSession(sessionId, cwd);
     if (a.agent) return noteKind(e, sessionId, { kind: 'agent', why: a.why });
@@ -399,7 +437,19 @@ const keeper = {
     return !config.enabled || ledger.has(sessionId);
   },
 
-  /** Manual declaration of who a session is: 'agent' | 'human', or null to clear. */
+  /**
+   * Declare a session human, after asking the rosters: refused when a roster
+   * lists the session (it is an agent) or did not answer (it cannot be told).
+   * Returns { ok, reason }.
+   */
+  async declareHuman(sessionId, fetchImpl) {
+    const roster = await keeper.askRoster(sessionId, fetchImpl);
+    if (roster === 'agent' || roster === 'flagged') return { ok: false, reason: 'a launcher roster lists this session: it is an agent session' };
+    if (roster === 'unknown') return { ok: false, reason: 'a launcher roster did not answer, so this session cannot be confirmed as human: try again' };
+    return { ok: keeper.setKind(sessionId, 'human'), reason: null };
+  },
+
+  /** Manual declaration of who a session is: 'agent' | 'human', or null to clear. (For 'human' over HTTP use declareHuman.) */
   setKind(sessionId, kind) {
     if (kind !== null && !VALID_KINDS.has(kind)) return false;
     const e = getEntry(sessionId, null, null);

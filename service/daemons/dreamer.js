@@ -69,6 +69,7 @@ NEVER KEEP:
 - Forecasts, plans, intentions, or anything that is only true "today", "now", "currently" or "pending".
 - Counts and measurements that will be different next week, unless they are the evidence inside a lesson.
 - Tool usage, git operations, file reads, hook events, status confirmations, conversation flow, or anything that is just "X happened".
+- Private content the agent read: anything that quotes or restates the content of a message, text/SMS, e-mail, calendar item, voicemail or notification, and personal details of a third person taken from one (names with contact details, addresses, account, case or incident numbers). A lesson learned while handling such content may be kept only if it can be stated without any of it.
 If you are not sure it will still be true in a month, do not keep it. Most turns produce ZERO insights. That is correct and expected.
 
 ATTRIBUTION:
@@ -182,7 +183,7 @@ function connectionTarget(conn) {
   return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
-async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, agentSession = false }) {
+async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, agentSession = false, agentOrigin = 'agent' }) {
   const { session_id, transcript_path, cwd } = req_body;
 
   // Namespace isolation: writes and reinforcement stay inside the session's
@@ -268,7 +269,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         log('summarize', 'info', `SUPERSEDED: ${upd.existing_name}`, {
           detail: `reason: ${upd.reason || 'not specified'}`
         });
-        embedNeuron(upd.existing_name, upd.flash_summary || '').catch(e => log('error', 'warn', e.message));
+        embedNeuron(upd.existing_name, upd.flash_summary || '', ns).catch(e => log('error', 'warn', e.message));
       }
     }
   }
@@ -320,7 +321,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           type: agentSession ? nodeTypeForKind(kind) : coerceNodeType(insight.node_type, 'insight'),
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
           body: insight.body || '', ns: insightNs, eventDate,
-          originSession: session_id || null, originKind: agentSession ? 'agent' : 'human', durableKind: kind
+          originSession: session_id || null, originKind: agentSession ? agentOrigin : 'human', durableKind: kind
         });
 
         // Create connections for insights (never from an agent session: a held
@@ -361,7 +362,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           log('summarize', 'info', `held insight (${kind}) ${String(uid).slice(0, 8)}`);
         } else {
           log('summarize', 'info', `insight: ${insight.name}`);
-          embedNeuron(insight.name, insight.flash_summary).catch(e => log('error', 'warn', e.message));
+          embedNeuron(insight.name, insight.flash_summary, insightNs).catch(e => log('error', 'warn', e.message));
         }
       }
     }
@@ -725,9 +726,24 @@ async function summarizeForTurn(deps, keeper) {
   // rosters are asked first (the Stop response is already sent), so a session a
   // launcher lists is known as an agent before it is classed. With the Keeper's
   // agentInsights on, an agent session is summarized like a person's.
-  await keeper.resolveAgent(sid, deps.req_body.cwd);
-  const agentSession = !keeper.agentInsightsEnabled() && keeper.sessionKind(sid, deps.req_body.cwd).kind === 'agent';
-  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', agentSession });
+  // When a roster did not answer and nothing else says who the session is, the
+  // turn is held too, marked origin 'unknown': a held insight can be released,
+  // one written live cannot be taken back. The session is not flagged, so the
+  // next turn asks again.
+  const roster = await keeper.askRoster(sid);
+  const who = keeper.sessionKind(sid, deps.req_body.cwd);
+  let agentSession = false;
+  let agentOrigin = 'agent';
+  if (!keeper.agentInsightsEnabled()) {
+    if (who.kind === 'agent') agentSession = true;
+    else if (roster === 'unknown' && who.why !== 'declared') {
+      agentSession = true;
+      agentOrigin = 'unknown';
+      countHeld('heldOnUnknownTurns');
+      deps.log('keeper', 'info', `a launcher roster did not answer: turn of ${String(sid).slice(0, 8)} is held as unknown`);
+    }
+  }
+  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', agentSession, agentOrigin });
   return { skipped: false };
 }
 

@@ -24,6 +24,7 @@ const counters = {
   droppedNoKind: 0,       // offered without a durable kind: not written
   skippedNameTaken: 0,    // offered, but a live or held neuron already has the name
   heldWritten: 0,         // written into the held tier
+  heldOnUnknownTurns: 0,  // ...turns held because a launcher roster did not answer (the session may be a person's)
   released: 0,            // moved to the live graph by a human session
   releaseRefused: 0,      // release asked for and refused (no session, agent session, unknown session)
 };
@@ -59,32 +60,43 @@ export async function isHeld({ runCypher, name }) {
 }
 
 /**
- * May this caller release a held neuron? Only a session the Keeper knows and
- * classes as human. No session id, an id the Keeper has never seen, or an
- * agent session: no. The launcher rosters are asked first, so an agent a
- * roster lists cannot release before its first Stop; and when a roster did
- * not answer, a session that is not declared human is refused (it may be an
- * agent nobody could vouch for; a person can try again). Returns { ok, reason }.
- * (The id is whatever the caller sent: this stops an agent releasing its own
- * insight through ordinary tool use, not a caller that forges a human id.)
+ * May this caller release a held neuron? Only a session that is known to be a
+ * person's, which takes all of:
+ *   - a session id, with a ledger entry that real hook traffic made (an entry
+ *     created by a bare POST does not qualify);
+ *   - a launcher roster is configured, answered, and does not list the session
+ *     (asked on every path, also for a session declared human: a roster's fact
+ *     beats a declaration, and when no roster is configured nobody can vouch
+ *     that the caller is not an agent, so nothing is released);
+ *   - the session is not an agent by declaration or by its cwd (the request's
+ *     cwd when given, else the one in the ledger).
+ * Returns { ok, reason }.
+ * (The id is whatever the caller sent. This stops an agent releasing its own
+ * insight through ordinary tool use; a caller on the loopback interface that
+ * sends a person's session id, or forges hook payloads, is not stopped.)
  */
-export async function canRelease(keeper, sessionId, fetchImpl) {
+export async function canRelease(keeper, sessionId, { cwd = null, fetchImpl } = {}) {
   if (!sessionId || typeof sessionId !== 'string') {
     return { ok: false, reason: 'no session_id: a held neuron is released only by a human session' };
   }
   if (!keeper.knows(sessionId)) {
     return { ok: false, reason: 'session_id is not a session the Keeper has seen' };
   }
-  const declared = keeper.sessionKind(sessionId);
-  if (declared.why === 'declared') {
-    return declared.kind === 'human' ? { ok: true, reason: null } : { ok: false, reason: 'agent session (declared): an agent cannot release a held neuron' };
+  if (!keeper.fromHooks(sessionId)) {
+    return { ok: false, reason: 'no hook traffic has been seen for this session_id: a held neuron is released only by a session whose hooks reach Undertow' };
   }
   const roster = await keeper.askRoster(sessionId, fetchImpl);
-  const { kind, why } = keeper.sessionKind(sessionId);
-  if (kind !== 'human') return { ok: false, reason: `agent session (${why}): an agent cannot release a held neuron` };
-  if (roster === 'unknown') {
-    return { ok: false, reason: 'a launcher roster did not answer, so this session cannot be confirmed as human: try again, or declare it with POST /undertow/keeper {"kind":"human"}' };
+  if (roster === 'none') {
+    return { ok: false, reason: 'no launcher roster is configured (keeper.agentRosters), so no session can be confirmed as human: held neurons cannot be released through this endpoint' };
   }
+  if (roster === 'agent' || roster === 'flagged') {
+    return { ok: false, reason: 'agent session (a launcher roster lists it): an agent cannot release a held neuron' };
+  }
+  if (roster === 'unknown') {
+    return { ok: false, reason: 'a launcher roster did not answer, so this session cannot be confirmed as human: try again' };
+  }
+  const { kind, why } = keeper.sessionKind(sessionId, cwd);
+  if (kind !== 'human') return { ok: false, reason: `agent session (${why}): an agent cannot release a held neuron` };
   return { ok: true, reason: null };
 }
 

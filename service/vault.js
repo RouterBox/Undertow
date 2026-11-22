@@ -131,7 +131,7 @@ export async function importFile({ filePath, namespace = null, project = 'vault'
   }
 
   ledger.files[abs] = { hash, neuron: note.name, namespace, importedAt: new Date().toISOString() };
-  embedNeuron(note.name, note.flash).catch((e) => log('vault', 'warn', `embed failed for ${note.name}: ${e.message}`));
+  embedNeuron(note.name, note.flash, namespace).catch((e) => log('vault', 'warn', `embed failed for ${note.name}: ${e.message}`));
   return { action, name: note.name, links: note.links };
 }
 

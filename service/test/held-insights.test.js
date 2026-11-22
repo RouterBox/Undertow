@@ -10,7 +10,8 @@ import assert from 'node:assert/strict';
 import keeper from '../daemons/keeper.js';
 import { handleSummarize, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT } from '../daemons/dreamer.js';
 import { handleIngest } from '../daemons/gobble.js';
-import { resetRosterCache } from '../agent-roster.js';
+import { resetRosterCache, lookupAgent } from '../agent-roster.js';
+import { rewardChase } from '../chase.js';
 import { HELD_NAMESPACE, DURABLE_KINDS, durableKind, nodeTypeForKind, isHeld, releaseHeld, canRelease, listHeld, heldCounters } from '../held.js';
 
 // Small thresholds so a test can reach both promotion paths. Session ids are
@@ -62,14 +63,15 @@ test('a cwd on the agent list marks the session as agent, case-insensitively', (
   assert.equal(keeper.sessionKind(other).kind, 'human');
 });
 
-test('a declared kind beats the flag and the cwd list, can be cleared, and rejects anything else', () => {
+test('a declared kind beats the cwd list but not a roster flag, can be cleared, and rejects anything else', () => {
   const sid = id('declared');
   keeper.recordPrompt(sid, 'C:/github/AgentPlace', 'conscious', 'hello there');
-  keeper.markAgent(sid, 'worker');
   assert.equal(keeper.setKind(sid, 'human'), true);
-  assert.deepEqual(keeper.sessionKind(sid), { kind: 'human', why: 'declared' });
+  assert.deepEqual(keeper.sessionKind(sid), { kind: 'human', why: 'declared' }, 'declared human beats the cwd list');
+  keeper.markAgent(sid, 'worker');
+  assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'flagged (worker)' }, 'a roster fact beats a declared human');
   assert.equal(keeper.setKind(sid, null), true);
-  assert.equal(keeper.sessionKind(sid).why, 'flagged (worker)', 'back to the flag');
+  assert.equal(keeper.sessionKind(sid).why, 'flagged (worker)', 'still the flag');
   assert.equal(keeper.setKind(sid, 'robot'), false);
   const plain = id('declared-agent');
   keeper.recordPrompt(plain, 'C:/github/elsewhere', 'conscious', 'hello again');
@@ -273,53 +275,285 @@ test('releaseHeld reports released:false and logs nothing when no held neuron ma
   assert.deepEqual(logs, []);
 });
 
-test('only a human session the Keeper knows may release: not an agent, not a stranger, not nobody', async () => {
-  const agent = id('rel-agent');
-  keeper.recordPrompt(agent, 'C:/work/app', 'conscious', 'an agent that wrote an insight');
-  keeper.markAgent(agent, 'worker');
-  const human = id('rel-human');
-  keeper.recordPrompt(human, 'C:/work/app', 'conscious', 'a person looking at the held list');
+// The release tests run with a roster configured and restore the file's Keeper config afterwards.
+const BASE_CFG = { agenticToolEvents: 2, agenticMinHours: 1e-9, minCadenceSeconds: 0.001, agentCwdPatterns: ['AgentPlace'] };
+const rosterUp = (listed) => async () => ({ ok: true, json: async () => ({ contexts: listed.map((sessionId, i) => ({ name: `worker-${i}`, sessionId, kind: 'spawned' })) }) });
+const rosterDown = async () => { throw new Error('connection refused'); };
+// A session as real hooks make it: a prompt, then the hook event noted.
+const hookSession = (sid, cwd = 'C:/work/app') => {
+  keeper.recordPrompt(sid, cwd, 'conscious', `a prompt from ${sid}`);
+  keeper.noteHook(sid, 'UserPromptSubmit');
+};
 
-  assert.deepEqual(await canRelease(keeper, human), { ok: true, reason: null });
-  const a = await canRelease(keeper, agent);
-  assert.equal(a.ok, false);
-  assert.match(a.reason, /agent session \(flagged \(worker\)\)/);
-  assert.equal((await canRelease(keeper, undefined)).ok, false);
-  assert.match((await canRelease(keeper, '')).reason, /no session_id/);
-  assert.match((await canRelease(keeper, 'made-up-' + run)).reason, /not a session the Keeper has seen/);
-  assert.equal((await canRelease(keeper, 42)).ok, false);
+test('with no roster configured nothing is released, and the reason says so', async () => {
+  const human = id('rel-noroster');
+  hookSession(human);
+  const r = await canRelease(keeper, human);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no launcher roster is configured/);
 });
 
-// Runs with a roster configured; restores the file's Keeper config afterwards.
-test('release asks the roster first: a listed agent that has not hit a Stop cannot release; a roster that does not answer refuses all but a declared human', async () => {
-  const base = { agenticToolEvents: 2, agenticMinHours: 1e-9, minCadenceSeconds: 0.001, agentCwdPatterns: ['AgentPlace'] };
-  keeper.init({ daemonConfig: { ...base, agentRosters: ['http://roster/'] } });
+test('release needs a session id the Keeper has seen through real hook traffic', async () => {
+  keeper.init({ daemonConfig: { ...BASE_CFG, agentRosters: ['http://roster/'] } });
+  try {
+    resetRosterCache();
+    const fetchImpl = rosterUp([]);
+    assert.equal((await canRelease(keeper, undefined, { fetchImpl })).ok, false);
+    assert.match((await canRelease(keeper, '', { fetchImpl })).reason, /no session_id/);
+    assert.equal((await canRelease(keeper, 42, { fetchImpl })).ok, false);
+    assert.match((await canRelease(keeper, 'made-up-' + run, { fetchImpl })).reason, /not a session the Keeper has seen/);
+
+    // An invented id made "known" by one bare POST to the query route (no hook fields).
+    const bare = id('rel-bare');
+    keeper.recordPrompt(bare, 'C:/work/app', 'conscious', 'one plain query call');
+    keeper.noteHook(bare, undefined);
+    keeper.noteHook(bare, 'NotAHookEvent');
+    const b = await canRelease(keeper, bare, { fetchImpl });
+    assert.equal(b.ok, false);
+    assert.match(b.reason, /no hook traffic/);
+
+    const human = id('rel-human');
+    hookSession(human);
+    assert.deepEqual(await canRelease(keeper, human, { fetchImpl }), { ok: true, reason: null });
+    // noteHook never creates an entry: a stranger stays a stranger.
+    keeper.noteHook('stranger-' + run, 'Stop');
+    assert.equal(keeper.knows('stranger-' + run), false);
+  } finally {
+    resetRosterCache();
+    keeper.init({ daemonConfig: BASE_CFG });
+  }
+});
+
+test('the roster is asked on every release path: listed means agent even when declared human; no answer refuses everyone', async () => {
+  keeper.init({ daemonConfig: { ...BASE_CFG, agentRosters: ['http://roster/'] } });
   try {
     const listed = id('rel-listed');
+    const listedDeclared = id('rel-listed-declared');
     const person = id('rel-person');
     const declared = id('rel-declared');
-    for (const s of [listed, person, declared]) keeper.recordPrompt(s, 'C:/work/app', 'conscious', `a prompt from ${s}`);
-    const up = async () => ({ ok: true, json: async () => ({ contexts: [{ name: 'worker-b', sessionId: listed, kind: 'spawned' }] }) });
-    const down = async () => { throw new Error('connection refused'); };
+    for (const s of [listed, listedDeclared, person, declared]) hookSession(s);
+    keeper.setKind(listedDeclared, 'human');
+    keeper.setKind(declared, 'human');
+    const up = rosterUp([listed, listedDeclared]);
 
     // Not yet flagged (no Stop has asked the roster): sessionKind alone would say human.
     assert.equal(keeper.sessionKind(listed).kind, 'human');
     resetRosterCache();
-    const l = await canRelease(keeper, listed, up);
+    const l = await canRelease(keeper, listed, { fetchImpl: up });
     assert.equal(l.ok, false);
-    assert.match(l.reason, /agent session \(flagged \(worker-b\)\)/);
-    assert.deepEqual(await canRelease(keeper, person, up), { ok: true, reason: null }, 'the roster answered and does not list a person');
+    assert.match(l.reason, /a launcher roster lists it/);
+    const ld = await canRelease(keeper, listedDeclared, { fetchImpl: up });
+    assert.equal(ld.ok, false, 'a declaration does not outrank the roster');
+    assert.equal(keeper.sessionKind(listedDeclared).kind, 'agent');
+    assert.deepEqual(await canRelease(keeper, person, { fetchImpl: up }), { ok: true, reason: null }, 'the roster answered and does not list a person');
+    assert.deepEqual(await canRelease(keeper, declared, { fetchImpl: up }), { ok: true, reason: null });
 
     resetRosterCache();
-    const p = await canRelease(keeper, person, down);
-    assert.equal(p.ok, false, 'nobody could vouch for the session');
-    assert.match(p.reason, /roster did not answer/);
-    keeper.setKind(declared, 'human');
-    assert.deepEqual(await canRelease(keeper, declared, down), { ok: true, reason: null }, 'a declared human does not need the roster');
+    for (const s of [person, declared]) {
+      const r = await canRelease(keeper, s, { fetchImpl: rosterDown });
+      assert.equal(r.ok, false, 'nobody could vouch for the session, declared or not');
+      assert.match(r.reason, /roster did not answer/);
+    }
   } finally {
     resetRosterCache();
-    keeper.init({ daemonConfig: base });
+    keeper.init({ daemonConfig: BASE_CFG });
   }
+});
+
+test('release classifies by the request cwd when one is given', async () => {
+  keeper.init({ daemonConfig: { ...BASE_CFG, agentRosters: ['http://roster/'] } });
+  try {
+    resetRosterCache();
+    const sid = id('rel-cwd');
+    hookSession(sid, 'C:/work/app');
+    const fetchImpl = rosterUp([]);
+    assert.equal((await canRelease(keeper, sid, { fetchImpl })).ok, true);
+    const r = await canRelease(keeper, sid, { cwd: 'C:/github/AgentPlace/worker', fetchImpl });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /agent session \(cwd matches "AgentPlace"\)/);
+  } finally {
+    resetRosterCache();
+    keeper.init({ daemonConfig: BASE_CFG });
+  }
+});
+
+test('declaring a session human asks the roster first: refused when listed or when the roster does not answer', async () => {
+  keeper.init({ daemonConfig: { ...BASE_CFG, agentRosters: ['http://roster/'] } });
+  try {
+    const listed = id('decl-listed');
+    const person = id('decl-person');
+    const later = id('decl-later');
+    for (const s of [listed, person, later]) hookSession(s);
+    resetRosterCache();
+    const up = rosterUp([listed]);
+    const l = await keeper.declareHuman(listed, up);
+    assert.equal(l.ok, false);
+    assert.match(l.reason, /roster lists this session/);
+    assert.equal(keeper.sessionKind(listed).kind, 'agent');
+    assert.deepEqual(await keeper.declareHuman(person, up), { ok: true, reason: null });
+    assert.deepEqual(keeper.sessionKind(person), { kind: 'human', why: 'declared' });
+    resetRosterCache();
+    const d = await keeper.declareHuman(later, rosterDown);
+    assert.equal(d.ok, false);
+    assert.match(d.reason, /did not answer/);
+    assert.equal(keeper.sessionKind(later).why, 'default', 'nothing was declared');
+  } finally {
+    resetRosterCache();
+    keeper.init({ daemonConfig: BASE_CFG });
+  }
+});
+
+// ---------- Stop: hold on unknown ----------
+
+function stopDeps(sid, cwd = 'C:/work/app') {
+  const calls = [];
+  const prompts = [];
+  const reply = { insights: [
+    { name: 'Gate needs a timeout', kind: 'lesson', flash_summary: 'A gate with no timeout blocks forever', body: 'Two sentences of body. Enough to pass.' },
+    { name: 'Service restarted', node_type: 'fact', flash_summary: 'Restarted at noon', body: 'Two sentences of body. Enough to pass.' }
+  ], train_of_thought: [], flash_results: [] };
+  return {
+    calls, prompts,
+    deps: {
+      req_body: { session_id: sid, cwd },
+      session: { activeTopics: [], pendingFlashes: [] },
+      runCypher: async (q, p) => { calls.push({ q, p }); return []; },
+      callAnthropic: async (m, system) => { prompts.push(system); return { model: m, response: { content: [{ text: JSON.stringify(reply) }] } }; },
+      embedNeuron: async () => {}, randomUUID: () => 'u',
+      isDaemonEnabled: () => false, getDaemonConfig: () => ({}),
+      wonder: {}, spider: {}, janitor: {}, prowler: {},
+      log: () => {}
+    }
+  };
+}
+const createdBy = (h) => h.calls.filter(c => /CREATE \(n:Neuron/.test(c.q)).map(c => c.p);
+
+test('Stop with a roster that does not answer: the turn is held as unknown and the session is not flagged', async () => {
+  const realFetch = globalThis.fetch;
+  keeper.init({ daemonConfig: { ...BASE_CFG, agentRosters: ['http://roster/'] } });
+  try {
+    resetRosterCache();
+    globalThis.fetch = rosterDown;
+    const before = heldCounters().heldOnUnknownTurns;
+    const sid = id('stop-unknown');
+    hookSession(sid);
+    const h = stopDeps(sid);
+    await summarizeForTurn(h.deps, keeper);
+    assert.deepEqual(h.prompts, [AGENT_SUMMARIZE_SYSTEM_PROMPT], 'the strict rule');
+    const created = createdBy(h);
+    assert.equal(created.length, 1, 'only the durable kind');
+    assert.equal(created[0].ns, HELD_NAMESPACE);
+    assert.equal(created[0].originKind, 'unknown');
+    assert.equal(heldCounters().heldOnUnknownTurns - before, 1);
+    assert.equal(keeper.isAgentSession(sid).agent, false, 'an unknown answer flags nobody');
+    assert.equal(keeper.sessionKind(sid).kind, 'human');
+
+    // A declared human is a person's session whatever the roster does.
+    const declared = id('stop-unknown-declared');
+    hookSession(declared);
+    keeper.setKind(declared, 'human');
+    resetRosterCache();
+    const d = stopDeps(declared);
+    await summarizeForTurn(d.deps, keeper);
+    assert.deepEqual(d.prompts, [SUMMARIZE_SYSTEM_PROMPT]);
+    assert.ok(createdBy(d).every(p => p.ns === null && p.originKind === 'human'));
+
+    // The roster answers again: the same undeclared session is a person's.
+    resetRosterCache();
+    globalThis.fetch = rosterUp([]);
+    const again = stopDeps(sid);
+    await summarizeForTurn(again.deps, keeper);
+    assert.deepEqual(again.prompts, [SUMMARIZE_SYSTEM_PROMPT]);
+  } finally {
+    globalThis.fetch = realFetch;
+    resetRosterCache();
+    keeper.init({ daemonConfig: BASE_CFG });
+  }
+});
+
+test('Stop with no roster configured is unchanged: an undeclared, unlisted session is a person\'s', async () => {
+  const sid = id('stop-noroster');
+  hookSession(sid);
+  const h = stopDeps(sid);
+  await summarizeForTurn(h.deps, keeper);
+  assert.deepEqual(h.prompts, [SUMMARIZE_SYSTEM_PROMPT]);
+  assert.ok(createdBy(h).length >= 1 && createdBy(h).every(p => p.ns === null && p.originKind === 'human'));
+});
+
+test('roster: when a refresh fails the last good list still counts; unknown is only for ids it does not have', async () => {
+  resetRosterCache();
+  let t = 1_000_000;
+  const now = () => t;
+  const up = rosterUp(['sess-known']);
+  assert.equal((await lookupAgent('sess-known', { urls: ['http://r/'], fetchImpl: up, now })).status, 'agent');
+  t += 61_000; // cache expired; the launcher is restarting
+  assert.deepEqual(await lookupAgent('sess-known', { urls: ['http://r/'], fetchImpl: rosterDown, now }), { status: 'agent', label: 'worker-0' });
+  assert.deepEqual(await lookupAgent('sess-new', { urls: ['http://r/'], fetchImpl: rosterDown, now }), { status: 'unknown' });
+  // A failed refresh is retried after 5 seconds, not 60.
+  let fetched = 0;
+  const counting = async (...a) => { fetched++; return up(...a); };
+  t += 2_000;
+  await lookupAgent('sess-new', { urls: ['http://r/'], fetchImpl: counting, now });
+  assert.equal(fetched, 0, 'still inside the retry window');
+  t += 4_000;
+  assert.deepEqual(await lookupAgent('sess-new', { urls: ['http://r/'], fetchImpl: counting, now }), { status: 'not-listed' });
+  assert.equal(fetched, 1);
+  resetRosterCache();
+  assert.deepEqual(await lookupAgent('sess-known', { urls: ['http://r/'], fetchImpl: rosterDown, now }), { status: 'unknown' }, 'never a good list: unknown');
+  resetRosterCache();
+});
+
+test('the agent prompt excludes private content the agent read', () => {
+  const p = AGENT_SUMMARIZE_SYSTEM_PROMPT;
+  assert.match(p, /NEVER KEEP/);
+  const never = p.slice(p.indexOf('NEVER KEEP'), p.indexOf('ATTRIBUTION'));
+  for (const word of ['message', 'text/SMS', 'e-mail', 'calendar item', 'voicemail', 'notification', 'third person', 'contact details', 'addresses', 'account, case or incident numbers']) {
+    assert.ok(never.includes(word), `the NEVER KEEP list names: ${word}`);
+  }
+  assert.match(never, /quotes or restates/);
+  assert.ok(!SUMMARIZE_SYSTEM_PROMPT.includes('text/SMS'), 'the human prompt is unchanged');
+});
+
+// ---------- Query gate and chase ----------
+
+test('an undertow_query MCP call is answered whatever the tier, earns no turn-taking credit and makes no ledger entry', () => {
+  const fresh = id('mcp-only');
+  const g = keeper.gateQuery(fresh, 'C:/work/app', undefined, 'what do we know about the gate', 'mcp');
+  assert.deepEqual(g, { tier: 'conscious', promoted: false, habituated: false, reason: null });
+  assert.equal(keeper.knows(fresh), false, 'no ledger entry: an MCP call cannot make an id known');
+  // The same prompt again is not habituated, and a candidate session is still answered.
+  const cand = id('mcp-candidate');
+  keeper.recordPrompt(cand, 'C:/work/app', undefined, 'a first real prompt');
+  assert.equal(keeper.tierOf(cand), 'candidate');
+  for (let i = 0; i < 3; i++) assert.equal(keeper.gateQuery(cand, 'C:/work/app', undefined, 'same question', 'mcp').tier, 'conscious');
+  assert.equal(keeper.tierOf(cand), 'candidate', 'no promotion from MCP calls');
+  // A session set off stays off.
+  const off = id('mcp-off');
+  keeper.setTier(off, 'off');
+  assert.equal(keeper.gateQuery(off, null, undefined, 'q', 'mcp').tier, 'off');
+  // A hook prompt goes through recordPrompt as before.
+  assert.equal(keeper.gateQuery(id('hook-prompt'), 'C:/work/app', undefined, 'a person asks').tier, 'candidate');
+});
+
+test('a chase rewards the neuron in the caller\'s namespace only, the live graph by default', async () => {
+  const seen = [];
+  const runCypher = async (q, p) => { seen.push({ q, p }); return [{ 'n.name': 'x' }]; };
+  assert.equal(await rewardChase({ runCypher, name: 'x' }), true);
+  assert.equal(seen.length, 2, 'reward, then synapses');
+  for (const c of seen) {
+    assert.deepEqual(c.p, { name: 'x', ns: null });
+    assert.match(c.q, /\(\$ns IS NULL AND n\.namespace IS NULL\) OR n\.namespace = \$ns/);
+    assert.match(c.q, /n\.superseded IS NULL/);
+  }
+  seen.length = 0;
+  assert.equal(await rewardChase({ runCypher, name: 'x', ns: 'work' }), true);
+  assert.ok(seen.every(c => c.p.ns === 'work'), 'a client in its own namespace chases its own neuron');
+  // Nothing by that name there: say so, and touch no synapse.
+  seen.length = 0;
+  assert.equal(await rewardChase({ runCypher: async (q, p) => { seen.push({ q, p }); return []; }, name: 'x', ns: 'work' }), false);
+  assert.equal(seen.length, 1);
+  // A failed query is not a "not found".
+  assert.equal(await rewardChase({ runCypher: async () => { throw new Error('boom'); }, name: 'x' }), null);
 });
 
 test('listHeld asks only the held namespace, newest first, with a bounded limit', async () => {
@@ -344,7 +578,7 @@ test('what an agent session offered, dropped and had held is counted', async () 
   const d = Object.fromEntries(Object.keys(after).map(k => [k, after[k] - before[k]]));
   assert.deepEqual(d, {
     agentTurns: 2, zeroInsightTurns: 1, insightsOffered: 5, droppedNoKind: 2,
-    skippedNameTaken: 0, heldWritten: 3, released: 1, releaseRefused: 0
+    skippedNameTaken: 0, heldWritten: 3, heldOnUnknownTurns: 0, released: 1, releaseRefused: 0
   });
 });
 

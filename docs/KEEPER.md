@@ -179,8 +179,12 @@ fact someone states, never inferred from how the session behaves: three varied
 prompts a few seconds apart look like a conversation whoever sends them.
 
 1. **Declared:** `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
-   (or `"human"`; `null` clears it). A declaration beats everything below, so
-   a person working in a listed directory can declare their session `human`.
+   (or `"human"`; `null` clears it). A declaration beats the directory list,
+   so a person working in a listed directory can declare their session
+   `human`. It does not beat a roster: declaring `human` asks the rosters
+   first and is refused (HTTP 409) when a roster lists the session or does not
+   answer, and a session a roster has listed stays an agent whatever was
+   declared.
 2. **A launcher's roster lists the session id.** A launcher that starts agent
    sessions publishes a URL returning JSON with the sessions it runs:
    `{"contexts": [...]}`, `{"sessions": [...]}` or a bare array, each entry
@@ -188,12 +192,21 @@ prompts a few seconds apart look like a conversation whoever sends them.
    `kind`. An entry that has a `kind` counts only when it is one of
    `agentRosterKinds`. The Keeper asks at Stop, after the hook response has
    been sent, and before deciding a release; each roster gets 1.5 seconds and
-   the combined answer is cached for 60. A hit is remembered in the ledger
-   (`keeper.markAgent` sets `agentFlag`), so a later roster outage does not
-   un-flag the session.
+   the combined answer is cached for 60 (5 when a roster did not answer). A
+   hit is remembered in the ledger (`keeper.markAgent` sets `agentFlag`), so a
+   later roster outage does not un-flag the session. A roster that does not
+   answer keeps counting with the last list it gave, so a session it listed a
+   minute ago is still an agent while the launcher restarts.
 3. **Its cwd contains an entry of `agentCwdPatterns`** (case-insensitive
-   substrings). This is for an agent that is on no roster, and it is the only
-   test left when no roster is configured or one does not answer.
+   substrings). This is for an agent that is on no roster.
+
+**When a roster does not answer** and the session is on its last good list
+neither, nobody can say who the session is. Its turn is then **held as
+unknown**: summarized by the agent rule below and written to the held tier with
+`origin_kind: 'unknown'`. A held insight can be released; one written live
+cannot be taken back. The session is not flagged, so its next turn asks again,
+and a session declared `human` is not affected. With no roster configured at
+all, nothing is unknown: declaration and the directory list decide.
 
 Everything else is a human session and behaves exactly as before. A person's
 own session is on no roster, so they can work in any directory without being
@@ -218,14 +231,14 @@ human.** `agentInsights` is the off switch for this whole mechanism: `false`
 described below; `true` summarizes an agent session like a person's, as
 before this mechanism existed.
 
-**Known gaps.** A session that has not yet registered with its launcher is not
-on the roster for its first moments; a turn that ends in that window is
-summarized as a person's would be. If a roster does not answer at a Stop, a
-session not yet flagged is treated as human for that turn unless its cwd is
-listed.
+**Known gap.** A session that has not yet registered with its launcher is not
+on the roster for its first moments; a turn that ends in that window, while
+the roster answers, is summarized as a person's would be.
 
-A call from the `undertow_query` MCP tool is the agent asking, not a person
-prompting: it is not counted as a prompt by the Keeper.
+A call from the `undertow_query` MCP tool is a deliberate request, not a
+person prompting: the Keeper does not count it as a prompt (no turn-taking
+credit, no habituation, no ledger entry), and it is answered whatever the
+session's tier, unless that tier is `off`.
 
 **Seeing it.** The service logs one line when a roster flags a session, and
 one the first time a session is classed agent, saying by which rule.
@@ -233,7 +246,8 @@ one the first time a session is classed agent, saying by which rule.
 sessions with their `kind` and `why`, and a `held` block of counters since
 the last restart: agent turns summarized, turns where the model offered no
 insight, insights offered, dropped for no durable kind, skipped because the
-name was taken, written to the held tier, released, and releases refused.
+name was taken, written to the held tier, turns held as unknown, released,
+and releases refused.
 
 **What does not change for an agent session:** its tier, its flashes, pursuit
 detection, train of thought, and Gobble's ingest.
@@ -246,7 +260,12 @@ detection, train of thought, and Gobble's ingest.
   something that will need doing again), or a `decision` (a design or policy
   choice with its reason). Never written: the state of work (pull requests,
   branches, commits, merges, deploys, restarts, queues, to-do lists), a review
-  verdict on one commit, forecasts and plans, anything only true "now". The
+  verdict on one commit, forecasts and plans, anything only true "now". Also
+  never written: private content the agent read, meaning anything that quotes
+  or restates a message, text/SMS, e-mail, calendar item, voicemail or
+  notification, or personal details of a third person taken from one (names
+  with contact details, addresses, account, case or incident numbers). That
+  exclusion is stated in the prompt only; no code detects such content. The
   prompt states this, and the code drops any insight that does not declare one
   of the three kinds. The kind is stored as `durable_kind`.
 - **Held, not live.** The insight is written into the `quarantine` namespace,
@@ -259,7 +278,8 @@ detection, train of thought, and Gobble's ingest.
   neurons; that would put its text into the live graph past the hold.
 - **No actor names.** The prompt tells the model not to say who did, said or
   decided something. Who wrote it is recorded by the system instead:
-  `origin_session` (the session id) and `origin_kind: 'agent'`. A person's
+  `origin_session` (the session id) and `origin_kind: 'agent'` (or
+  `'unknown'` for a turn held because a roster did not answer). A person's
   words relayed inside an agent session are therefore marked as coming from an
   agent session, and are held like the rest.
 
@@ -274,16 +294,33 @@ embedding check count the live graph only; stats reports `held` separately.
 
 **Release.** A held neuron joins the live graph when a **human session** uses
 it: `POST /undertow/chase {neuron, session_id}`, or `POST /undertow/feedback`
-with verdict `used` or `useful` and a `session_id`. The session id must be one
-the Keeper knows and classes as human, and the rosters are asked first: an
-agent a roster lists cannot release even before its first Stop, and when a
-roster does not answer, a session that is not declared human is refused (try
-again, or declare it). A chase or verdict from an agent
-session, from a session the Keeper has never seen, or with no session id
-releases nothing: the response says the neuron is held and why (a chase
-answers `status: "held"` and rewards nothing). Release sets `namespace` to
-live, records `released_at` and `released_by`, embeds the neuron, and marks
-it un-spidered so Spider links it on its next run.
+with verdict `used` or `useful` and a `session_id`. All of these must hold:
+
+- the session id has a ledger entry that **real hook traffic** made: the
+  Keeper has seen a hook payload (one carrying `hook_event_name`) for it. An id
+  made known by a bare POST does not qualify, and an `undertow_query` MCP call
+  creates no entry at all;
+- **a launcher roster is configured, answers, and does not list the session.**
+  The rosters are asked on every release, also for a session declared human:
+  an agent a roster lists cannot release even before its first Stop, and when
+  a roster does not answer every session is refused (try again);
+- the session is not an agent by declaration or by cwd (the request's `cwd`
+  when it sends one, otherwise the one in the ledger).
+
+**With no roster configured, nothing is released through these endpoints:**
+nobody can vouch that the caller is not an agent. On such a deployment a held
+neuron reaches the live graph only when an operator changes its `namespace` in
+the database directly.
+
+A chase or verdict that fails any of this releases nothing: the response says
+the neuron is held and why (`status: "held"`), nothing is rewarded and a
+`used`/`useful` verdict is not applied. Release sets `namespace` to live,
+records `released_at` and `released_by`, embeds the neuron, and marks it
+un-spidered so Spider links it on its next run.
+
+A chase lands in one namespace: the live graph by default, or the caller's own
+(`namespace` in the request, or the session's). A client in its own namespace
+chases its own neurons; holding and release exist only on the live graph.
 
 If a live neuron has taken the name since, a chase by name means the live one.
 Release the held one by uid (`POST /undertow/chase {uid, session_id}`, the uid
@@ -291,9 +328,11 @@ from the listing): it joins the live graph as `<name> (held <first 8 of uid>)`,
 and the response gives the new name.
 
 The limit of this: `session_id` is whatever the caller sends over loopback
-HTTP. It stops an agent releasing its own insight through ordinary tool use;
-it does not stop a caller that deliberately sends a human session's id, or
-that declares itself human through `POST /undertow/keeper`.
+HTTP, and so is a hook payload. The checks above raise the bar: they stop an
+agent releasing its own insight through ordinary tool use, an invented id, and
+a self-declaration. They do not stop a caller on the loopback interface that
+deliberately sends a real human session's id, or that forges hook payloads for
+an id of its own while the roster does not list it.
 
 **Not built:** nothing surfaces held neurons on its own, so one that nobody
 looks up stays held; there is no expiry or sweep of old held neurons yet; two

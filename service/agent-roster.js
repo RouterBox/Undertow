@@ -11,8 +11,13 @@
 
 const TIMEOUT_MS = 1500;
 const CACHE_MS = 60_000;
+const RETRY_MS = 5_000; // a refresh in which a roster did not answer is retried sooner
 
 let cache = null; // { key, at, ids: Map<sessionId, label>, complete }
+// The last answer each roster gave (key: kinds + url). When a refresh fails,
+// its last good list still counts: a session a launcher listed a minute ago is
+// still that launcher's while the launcher restarts.
+const lastGood = new Map();
 
 function entriesOf(body) {
   if (Array.isArray(body)) return body;
@@ -49,22 +54,32 @@ async function fetchRoster(url, kinds, fetchImpl) {
  *   { status: 'agent', label }  — the id is on a roster
  *   { status: 'not-listed' }    — every roster answered and none lists the id
  *   { status: 'unknown' }       — no roster configured, or one did not answer
- * The combined id set is cached for 60s; each roster gets 1.5s to answer.
+ * The combined id set is cached for 60s (5s when a roster did not answer);
+ * each roster gets 1.5s to answer. A roster that does not answer keeps
+ * counting with its last good list, so 'unknown' is only for an id that list
+ * does not have, or when there never was one.
  */
 export async function lookupAgent(sessionId, { urls = [], kinds = ['spawned'], fetchImpl = globalThis.fetch, now = Date.now } = {}) {
   const list = (Array.isArray(urls) ? urls : []).filter(u => typeof u === 'string' && u);
   if (!list.length || typeof fetchImpl !== 'function') return { status: 'unknown' };
   const accepted = Array.isArray(kinds) ? kinds : ['spawned'];
   const key = JSON.stringify([list, accepted]);
-  if (!cache || cache.key !== key || now() - cache.at >= CACHE_MS) {
+  if (!cache || cache.key !== key || now() - cache.at >= (cache.complete ? CACHE_MS : RETRY_MS)) {
     const results = await Promise.all(list.map(u => fetchRoster(u, accepted, fetchImpl)));
     const ids = new Map();
-    for (const r of results) if (r) for (const [id, label] of r) ids.set(id, label);
+    list.forEach((u, i) => {
+      const goodKey = JSON.stringify([accepted, u]);
+      if (results[i]) lastGood.set(goodKey, results[i]);
+      for (const [id, label] of results[i] || lastGood.get(goodKey) || []) ids.set(id, label);
+    });
     cache = { key, at: now(), ids, complete: results.every(Boolean) };
   }
   if (cache.ids.has(sessionId)) return { status: 'agent', label: cache.ids.get(sessionId) };
   return { status: cache.complete ? 'not-listed' : 'unknown' };
 }
 
-/** Test hook: forget the cached roster. */
-export function resetRosterCache() { cache = null; }
+/** Test hook: forget the cached roster (and, unless told to keep them, the last good lists). */
+export function resetRosterCache({ keepLastGood = false } = {}) {
+  cache = null;
+  if (!keepLastGood) lastGood.clear();
+}

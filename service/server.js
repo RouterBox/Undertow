@@ -30,6 +30,7 @@ import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
 import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
 import { HELD_NAMESPACE, isHeld, releaseHeld, canRelease, listHeld, countHeld, heldCounters, countHeldNeurons } from './held.js';
+import { rewardChase } from './chase.js';
 import { importVault, reverseTapestry } from './vault.js';
 import vaultwatch from './daemons/vaultwatch.js';
 import { resolve as pathResolve } from 'path';
@@ -38,12 +39,14 @@ import { homedir } from 'os';
 // Embed a neuron's full text (name + flash + body) and store the vector.
 // Full-text embedding outperforms summary-only by ~14 points Recall@8
 // (eval 2026-09-01); the flashSummary arg remains as a fallback.
-async function embedNeuron(name, flashSummary) {
+// Only the current version in the given namespace (the live graph by default)
+// is read and written: a neuron of the same name elsewhere is left alone.
+async function embedNeuron(name, flashSummary, ns = null) {
   if (!embeddingsAvailable()) return;
   try {
     const rows = await runCypher(
-      'MATCH (n:Neuron {name: $name}) RETURN n.flash_summary AS flash, n.body AS body LIMIT 1',
-      { name }
+      `MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} RETURN n.flash_summary AS flash, n.body AS body LIMIT 1`,
+      { name, ns }
     );
     const flash = rows[0]?.flash || flashSummary || '';
     const body = rows[0]?.body || '';
@@ -51,8 +54,8 @@ async function embedNeuron(name, flashSummary) {
     const embedding = await getEmbedding(text);
     if (embedding) {
       await runCypher(
-        'MATCH (n:Neuron {name: $name}) SET n.embedding = $embedding',
-        { name, embedding: Array.from(embedding) }
+        `MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} SET n.embedding = $embedding`,
+        { name, ns, embedding: Array.from(embedding) }
       );
     }
   } catch {}
@@ -230,11 +233,11 @@ app.post('/undertow/query', async (req, res) => {
   req.body.namespace = sanitizeNamespace(req.body.namespace);
   // Keeper gate: only conscious sessions get the involuntary flash pipeline,
   // and habituated (repeated loop-tick) prompts get nothing even then.
-  // A call from the undertow_query MCP tool (mcp.js marks it) is the agent asking,
-  // not a person prompting: it earns no turn-taking credit and no habituation.
-  const gate = req.body.via === 'mcp'
-    ? { tier: keeper.tierOf(req.body.session_id || 'default'), promoted: false, habituated: false, reason: null }
-    : keeper.recordPrompt(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier, req.body.prompt);
+  // A call from the undertow_query MCP tool (mcp.js marks it) is a deliberate
+  // request, not a person prompting: no turn-taking credit, no habituation, and
+  // it is answered whatever the session's tier (keeper.gateQuery).
+  const gate = keeper.gateQuery(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier, req.body.prompt, req.body.via);
+  keeper.noteHook(req.body.session_id || 'default', req.body.hook_event_name);
   const sid = String(req.body.session_id || 'default').slice(0, 8);
   if (gate.habituated) {
     keeper.countFastPath(req.body.session_id || 'default');
@@ -280,6 +283,7 @@ app.post('/undertow/ingest', async (req, res) => {
   // Tool volume is Keeper's corroborating evidence of a live agentic session
   // (and keeps long-lived sessions from expiring out of the ledger mid-flight).
   keeper.recordToolEvent(req.body.session_id || 'default');
+  keeper.noteHook(req.body.session_id || 'default', req.body.hook_event_name);
   const ingestTier = keeper.tierOf(req.body.session_id || 'default');
   if (ingestTier !== 'conscious' && ingestTier !== 'observer') {
     keeper.countFastPath(req.body.session_id || 'default');
@@ -316,6 +320,7 @@ app.post('/undertow/ingest', async (req, res) => {
 app.post('/undertow/summarize', async (req, res) => {
   res.json({});
   if (!undertowEnabled) { log('toggle', 'info', 'Undertow DISABLED'); return; }
+  keeper.noteHook(req.body.session_id || 'default', req.body.hook_event_name);
   if (!keeper.isConscious(req.body.session_id || 'default')) {
     keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `gated: ${keeper.tierOf(req.body.session_id || 'default')} session ${String(req.body.session_id || 'default').slice(0, 8)} — summarize skipped`);
@@ -352,6 +357,7 @@ app.post('/undertow/session-start', async (req, res) => {
   // Keeper: register the session; candidates get no context injection until
   // they earn attachment (or a cwd rule / explicit tier declares them).
   const entry = keeper.register(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier);
+  keeper.noteHook(req.body.session_id || 'default', req.body.hook_event_name);
   if (entry.tier !== 'conscious') {
     keeper.countFastPath(req.body.session_id || 'default');
     log('keeper', 'info', `registered: ${entry.tier} session ${String(req.body.session_id || 'default').slice(0, 8)} — watching, no injection yet`);
@@ -377,6 +383,7 @@ app.post('/undertow/session-start', async (req, res) => {
 
 // POST /undertow/rehydrate — PostCompact hook
 app.post('/undertow/rehydrate', async (req, res) => {
+  keeper.noteHook(req.body.session_id || 'default', req.body.hook_event_name);
   if (!keeper.isConscious(req.body.session_id || 'default')) { keeper.countFastPath(req.body.session_id || 'default'); return res.json({}); }
   log('hook', 'info', 'PostCompact');
   try {
@@ -775,7 +782,7 @@ app.post('/undertow/correct', async (req, res) => {
       let reEmbedded = false;
       // (A held neuron carries no embedding until it is released.)
       if (flash_summary && ns !== HELD_NAMESPACE) {
-        await embedNeuron(neuron, flash_summary);
+        await embedNeuron(neuron, flash_summary, ns);
         reEmbedded = embeddingsAvailable();
       }
       log('correct', 'info', `SUPERSEDED: ${neuron}`, { detail: `reason: ${reason}, changes: ${flash_summary ? 'flash' : ''} ${body !== undefined ? 'body' : ''} ${tier ? 'tier' : ''}${reEmbedded ? ' (re-embedded)' : ''}`.trim() });
@@ -812,17 +819,20 @@ app.post('/undertow/chase', async (req, res) => {
     const heldUid = typeof req.body.uid === 'string' && /^[0-9a-f-]{8,36}$/i.test(req.body.uid.trim()) ? req.body.uid.trim().toLowerCase() : null;
     let neuron = req.body.neuron;
     if (!neuron && !heldUid) return res.status(400).json({ error: 'neuron name required' });
+    // A client in its own namespace chases its own neurons; the live graph by default.
+    const ns = sanitizeNamespace(req.body.namespace) ?? (session_id && sessions.get(session_id)?.namespace) ?? null;
 
     // A chase by a human session is use: a held neuron (written from an agent
     // session) joins the live graph. By name when no live neuron has that name
     // (a chase by name means the live one); by uid, from GET /undertow/held, always.
     // An agent session, an unknown session or no session id releases nothing.
+    // (Held neurons belong to the live graph: none of this applies in a client namespace.)
     let released = null;
-    const liveExists = neuron
+    const liveExists = neuron && ns === null
       ? (await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} RETURN n.name AS name LIMIT 1`, { name: neuron, ns: null })).length > 0
       : false;
-    if (heldUid || (!liveExists && await isHeld({ runCypher, name: neuron }))) {
-      const may = await canRelease(keeper, session_id);
+    if (ns === null && (heldUid || (!liveExists && await isHeld({ runCypher, name: neuron })))) {
+      const may = await canRelease(keeper, session_id, { cwd: req.body.cwd });
       if (!may.ok) {
         countHeld('releaseRefused');
         log('keeper', 'info', 'chase of a held neuron: not released', { detail: may.reason });
@@ -834,30 +844,18 @@ app.post('/undertow/chase', async (req, res) => {
       embedNeuron(released.name, released.flash_summary).catch(e => log('error', 'warn', e.message));
     }
 
-    // Strong pursuit reward: +15 base_score (vs +10 for normal pursuit). Live graph only.
-    const rewarded = await runCypher(`
-      MATCH (n:Neuron {name: $name})
-      WHERE n.namespace IS NULL AND n.superseded IS NULL
-      SET n.times_pursued = n.times_pursued + 1,
-          n.base_score = CASE WHEN n.base_score + 15 > 100 THEN 100 ELSE n.base_score + 15 END,
-          n.last_surfaced = datetime()
-      RETURN n.name, n.base_score
-    `, { name: neuron }).catch(e => { log('error', 'warn', e.message); return null; });
+    // Strong pursuit reward (+15 base_score, synapses +0.08), inside the caller's
+    // namespace only: the current version of the neuron there, never a held one
+    // or a same-named neuron elsewhere.
+    const rewarded = await rewardChase({ runCypher, name: neuron, ns, log });
 
     // MATCH found nothing: don't tell the caller the reward landed.
-    if (Array.isArray(rewarded) && rewarded.length === 0) {
+    if (rewarded === false) {
       return res.status(404).json({ status: 'not_found', error: `no live neuron named "${neuron}"`, neuron });
     }
 
-    // Per-day counter for the health window (chase is always the live graph)
-    await recordPursuitDay({ runCypher, status: 'pursued', ns: null, log });
-
-    // Strengthen outbound synapses more aggressively (+0.08 vs +0.05 for normal pursuit)
-    await runCypher(`
-      MATCH (n:Neuron {name: $name})-[s:SYNAPSE]->()
-      WHERE n.namespace IS NULL AND n.superseded IS NULL
-      SET s.weight = CASE WHEN s.weight + 0.08 > 0.95 THEN 0.95 ELSE s.weight + 0.08 END
-    `, { name: neuron }).catch(e => log('error', 'warn', e.message));
+    // Per-day counter for the health window
+    await recordPursuitDay({ runCypher, status: 'pursued', ns, log });
 
     log('chase', 'info', `chased: ${neuron}`, { detail: 'base_score +15, synapses +0.08' });
     res.json(released
@@ -965,7 +963,7 @@ app.post('/undertow/feedback', async (req, res) => {
     // From an agent session, an unknown session or with no session id it stays held
     // and the verdict is not applied (an agent must not reward what it wrote).
     const positive = verdict === 'used' || verdict === 'useful';
-    const may = ns === HELD_NAMESPACE && positive ? await canRelease(keeper, session_id) : null;
+    const may = ns === HELD_NAMESPACE && positive ? await canRelease(keeper, session_id, { cwd: req.body.cwd }) : null;
     if (may && !may.ok) {
       countHeld('releaseRefused');
       log('keeper', 'info', 'feedback on a held neuron: not released, verdict not applied', { detail: may.reason });
@@ -1318,7 +1316,9 @@ app.get('/undertow/held', async (req, res) => {
 // POST /undertow/keeper — Manual override: {"session_id": "...", "tier": "conscious|observer|drone|off|candidate"}
 // and/or {"session_id": "...", "kind": "agent|human"} to declare who the session is
 // (an agent session's insights are held; "kind": null clears the declaration).
-app.post('/undertow/keeper', (req, res) => {
+// Declaring a session human asks the launcher rosters first: refused when a roster
+// lists the session or does not answer.
+app.post('/undertow/keeper', async (req, res) => {
   const { session_id, tier, kind } = req.body || {};
   if (!session_id || (!tier && kind === undefined)) return res.status(400).json({ error: 'session_id and tier or kind required' });
   if (tier) {
@@ -1326,7 +1326,14 @@ app.post('/undertow/keeper', (req, res) => {
     if (!ok) return res.status(400).json({ error: 'invalid tier' });
     log('keeper', 'info', `manual override: ${String(session_id).slice(0, 8)} → ${tier}`);
   }
-  if (kind !== undefined) {
+  if (kind === 'human') {
+    const declared = await keeper.declareHuman(session_id);
+    if (!declared.ok) {
+      log('keeper', 'info', `manual declaration refused: ${String(session_id).slice(0, 8)} is not declared human`, { detail: declared.reason });
+      return res.status(409).json({ error: declared.reason, session_id });
+    }
+    log('keeper', 'info', `manual declaration: ${String(session_id).slice(0, 8)} is human`);
+  } else if (kind !== undefined) {
     const ok = keeper.setKind(session_id, kind);
     if (!ok) return res.status(400).json({ error: 'invalid kind (agent, human or null)' });
     log('keeper', 'info', `manual declaration: ${String(session_id).slice(0, 8)} is ${kind ?? 'undeclared'}`);
