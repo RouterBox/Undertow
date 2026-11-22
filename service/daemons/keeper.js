@@ -322,7 +322,7 @@ const keeper = {
   sessionIsOff(sessionId) { return config.enabled && !!sessionId && ledger.get(sessionId)?.tier === 'off'; },
 
   /** Record a fast-pathed (rejected) event for the stats panel. */
-  countFastPath(sessionId) {
+  countFastPath(sessionId, fetchImpl) {
     stats.fastPathed++;
     // Silent correctness is indistinguishable from silent breakage: a candidate
     // gated dozens of times with zero promotions deserves one loud hint.
@@ -331,7 +331,16 @@ const keeper = {
       e.gated = (e.gated || 0) + 1;
       dirty = true;
       if (e.gated === 50) {
-        logFn('keeper', 'warn', `session ${String(sessionId).slice(0, 8)} gated ${e.gated}x with no promotion (${e.proseTurns} prose turns, ${e.toolEvents || 0} tool events) — if this is a real human, see promoteAfterTurns/agenticToolEvents in daemon-config or set UNDERTOW_DEFAULT_TIER`);
+        // The hint is for a person gated by mistake. An agent session is gated
+        // by design and passes 50 on its way to agenticToolEvents, so it gets
+        // no hint: a warning that is always false hides the one that is real.
+        const gated = e.gated;
+        return keeper.resolveAgent(sessionId, e.cwd, fetchImpl)
+          .catch(() => ({ agent: false }))
+          .then(({ agent }) => {
+            if (agent) return;
+            logFn('keeper', 'warn', `session ${String(sessionId).slice(0, 8)} gated ${gated}x with no promotion (${e.proseTurns} prose turns, ${e.toolEvents || 0} tool events) — if this is a real human, see promoteAfterTurns/agenticToolEvents in daemon-config or set UNDERTOW_DEFAULT_TIER`);
+          });
       }
     }
   },
