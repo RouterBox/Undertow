@@ -130,6 +130,66 @@ export function _resetLocalEmbeddings() {
   localLoadError = null;
 }
 
+// --- call health ---
+// isAvailable() only says a provider is configured. Whether its calls actually
+// work is tracked here, because a failing provider is otherwise invisible:
+// getEmbedding() returns null, queries quietly fall back to keyword search and
+// new neurons are stored with no embedding. (A depleted prepaid balance did
+// exactly that for a month on one deployment.)
+const FAILURE_LOG_EVERY_MS = 10 * 60 * 1000;
+const callHealth = { failures: 0, lastError: null, lastErrorAt: null, lastSuccessAt: null, lastLoggedAt: 0 };
+let reportEmbeddingEvent = (msg) => console.error(msg);
+
+/** Route failure and recovery lines somewhere visible: fn(message, level). */
+export function setEmbeddingReporter(fn) {
+  reportEmbeddingEvent = typeof fn === 'function' ? fn : (msg) => console.error(msg);
+}
+
+function recordSuccess() {
+  if (callHealth.failures > 0) {
+    reportEmbeddingEvent(`embeddings recovered (${providerName()}) after ${callHealth.failures} failed call(s)`, 'info');
+  }
+  callHealth.failures = 0;
+  callHealth.lastError = null;
+  callHealth.lastSuccessAt = Date.now();
+}
+
+function recordFailure(message) {
+  const now = Date.now();
+  callHealth.failures++;
+  callHealth.lastError = String(message || 'unknown error').replace(/\s+/g, ' ').slice(0, 300);
+  callHealth.lastErrorAt = now;
+  // The first failure is always reported; after that at most one line per window.
+  if (callHealth.failures === 1 || now - callHealth.lastLoggedAt >= FAILURE_LOG_EVERY_MS) {
+    callHealth.lastLoggedAt = now;
+    reportEmbeddingEvent(
+      `EMBEDDINGS FAILING (${providerName()}): ${callHealth.lastError} — vector search is falling back to keywords and new neurons are stored without an embedding (${callHealth.failures} failed call(s) since the last success)`,
+      'error'
+    );
+  }
+}
+
+/**
+ * A short fixed word for why calls fail. The health endpoints are
+ * unauthenticated, so they get this and never the provider's own error text,
+ * which stays in the service log.
+ */
+export function classifyEmbeddingError(message) {
+  const m = String(message || '').toLowerCase();
+  if (/\b(402|429)\b|quota|credit|billing|payment|rate limit|resource_exhausted/.test(m)) return 'quota';
+  if (/\b(401|403)\b|api key|api_key|permission|unauthori[sz]ed|unauthenticated|forbidden/.test(m)) return 'auth';
+  if (/fetch failed|econn|enotfound|eai_again|etimedout|timed out|timeout|network|socket/.test(m)) return 'network';
+  return 'error';
+}
+
+/** Forget call health (tests). */
+export function _resetEmbeddingHealth() {
+  Object.assign(callHealth, { failures: 0, lastError: null, lastErrorAt: null, lastSuccessAt: null, lastLoggedAt: 0 });
+  reportEmbeddingEvent = (msg) => console.error(msg);
+  genAI = null;
+  geminiModel = null;
+}
+
 /**
  * Get embedding for a text string. Returns an array of floats, or null.
  */
@@ -139,14 +199,16 @@ export async function getEmbedding(text) {
       if (localLoadError) return null; // already reported loudly
       const extractor = await getLocalExtractor();
       const out = await extractor(String(text), { pooling: 'mean', normalize: true });
+      recordSuccess();
       return Array.from(out.data);
     }
     const m = getGeminiModel();
     if (!m) return null;
     const result = await m.embedContent(text);
+    recordSuccess();
     return result.embedding.values;
   } catch (e) {
-    console.error(`Embedding error (${providerName()}): ${e.message}`);
+    recordFailure(e?.message);
     return null;
   }
 }
@@ -175,7 +237,17 @@ export function getProviderInfo() {
 /** Embedding status for /health. */
 export function getEmbeddingStatus() {
   const info = getProviderInfo();
-  const status = { provider: info.provider, model: info.model, available: isAvailable() };
+  const configured = isAvailable();
+  // state: unconfigured (no provider usable), degraded (calls are failing),
+  // ok (the last call worked), untested (configured, no call made yet).
+  const state = !configured ? 'unconfigured' : callHealth.failures > 0 ? 'degraded' : callHealth.lastSuccessAt ? 'ok' : 'untested';
+  const status = { provider: info.provider, model: info.model, available: configured && callHealth.failures === 0, state };
   if (info.provider === 'local' && localLoadError) status.error = localLoadError.split('\n')[0];
+  if (callHealth.failures > 0) {
+    status.reason = classifyEmbeddingError(callHealth.lastError); // quota | auth | network | error
+    status.failedCalls = callHealth.failures;
+    status.lastErrorAt = new Date(callHealth.lastErrorAt).toISOString();
+  }
+  if (callHealth.lastSuccessAt) status.lastSuccessAt = new Date(callHealth.lastSuccessAt).toISOString();
   return status;
 }
