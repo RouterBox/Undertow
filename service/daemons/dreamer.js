@@ -31,10 +31,15 @@ PURSUIT DETECTION:
 - "dismissed" = the agent ignored the flash entirely
 - If the agent used information from the flash without quoting it, that's still "pursued"
 
+CONNECTIONS:
+- A connection links a new insight to a neuron that already exists. The only neurons you know exist are the ones named in the injected flashes.
+- target_name must be that neuron's exact name. If you cannot give an exact name, leave connections empty. Never invent a name.
+- Most insights have no connections. That is correct.
+
 Return JSON:
 {
   "insights": [
-    {"name": "2-5 word label", "node_type": "fact|concept|decision|insight", "tier": "T2_working", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "event_date": "YYYY-MM-DD only when the remembered event has a clear date; omit otherwise", "connections": []}
+    {"name": "2-5 word label", "node_type": "fact|concept|decision|insight", "tier": "T2_working", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "event_date": "YYYY-MM-DD only when the remembered event has a clear date; omit otherwise", "connections": [{"target_name": "exact name of an existing neuron", "edge_type": "causal|temporal|elaborates|contradicts|contains|prerequisite|associative", "weight": 0.5, "context": "a few words on why they are linked"}]}
   ],
   "updates": [
     {"existing_name": "neuron to update", "flash_summary": "new summary", "body": "new body", "reason": "what changed", "event_date": "YYYY-MM-DD optional"}

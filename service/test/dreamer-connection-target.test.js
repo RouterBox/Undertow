@@ -65,3 +65,12 @@ test('a connection that names nothing is skipped without a warning', async () =>
   assert.deepEqual(edges, ['A']);
   assert.deepEqual(warns, [], 'no "Expected parameter(s): tgt" from the driver');
 });
+
+test('the summarize prompt tells the model what a connection is and what shape it has', async () => {
+  const { SUMMARIZE_SYSTEM_PROMPT } = await import('../daemons/dreamer.js');
+  assert.match(SUMMARIZE_SYSTEM_PROMPT, /"connections": \[\{"target_name": /);
+  assert.match(SUMMARIZE_SYSTEM_PROMPT, /Never invent a name/);
+  // The example the model is shown must itself be read correctly by the code.
+  const example = JSON.parse(SUMMARIZE_SYSTEM_PROMPT.match(/"connections": (\[\{[^\]]*\}\])/)[1]);
+  assert.equal(connectionTarget(example[0]), 'exact name of an existing neuron');
+});
