@@ -178,6 +178,63 @@ shape:
 This is the same insight as the ingestion plan: intelligence is ~3% of raw
 substrate. Don't ambient-ingest the 97%.
 
+## Agent sessions (stopgap)
+
+A session can be conscious and still not be a person: a long-running agent
+earns promotion by tool volume and then gets the full involuntary write path.
+Measured on one deployment, every insight Dreamer wrote in a day came from
+agent sessions, and about half were status or chatter.
+
+Until the held tier lands (PR 19, which is meant to replace this section's
+skip with a hold), the rule is blunt: **Dreamer writes no insights and applies
+no updates from an agent session.** Flashes, pursuit and dismissal judging,
+explicit feedback, train of thought, Gobble and the downstream daemons are
+unchanged for those sessions.
+
+**Who is an agent session.** Never inferred from behaviour. Either:
+
+- **A launcher's roster lists the session id.** A launcher that starts agent
+  sessions publishes a URL returning JSON with the sessions it runs:
+  `{"contexts": [...]}`, `{"sessions": [...]}` or a bare array, each entry
+  with a string `sessionId` (or `session_id`) and optionally `name` and
+  `kind`. An entry that has a `kind` counts only when it is one of
+  `agentRosterKinds`. The Keeper asks at Stop, after the hook response has been
+  sent; each roster gets 1.5 seconds and the combined answer is cached for 60.
+  A hit is remembered in the ledger, so a later roster outage does not un-flag
+  the session.
+- **Its cwd contains an entry of `agentCwdPatterns`** (case-insensitive). This
+  is for an agent that is on no roster, and it is the only test left when a
+  roster is not configured or does not answer.
+
+A person's own session is on no roster, so they can work in any directory
+without being treated as an agent, unless that directory is listed.
+
+**Config** (`daemons.keeper` in `service/daemon-config.json`; read at service
+start):
+
+```json
+{
+  "agentRosters": ["http://127.0.0.1:8080/sessions"],
+  "agentRosterKinds": ["spawned"],
+  "agentCwdPatterns": [],
+  "agentInsights": false
+}
+```
+
+`agentInsights: true` turns the skip off: an agent session is then summarized
+like any other. All four default to off or empty, so a deployment that sets
+nothing behaves as before.
+
+**What you can see.** `GET /undertow/keeper` lists flagged sessions under
+`agentSessions` and counts `agentTurnsSummarized`, `agentInsightsNotWritten`
+and `agentUpdatesNotApplied` since the service started. The service log has
+one line when a session is flagged and one per turn where something was
+withheld (counts only).
+
+**Known gap.** A session that has not yet registered with its launcher is not
+on the roster for its first moments; a turn that ends in that window is
+summarized as a person's would be.
+
 ## Economics of the fast path
 
 Cost per excluded event must round to zero:

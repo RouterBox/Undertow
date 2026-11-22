@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { lookupAgent } from '../agent-roster.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LEDGER_PATH = join(__dirname, '..', 'keeper-ledger.json');
@@ -47,6 +48,16 @@ const defaults = {
   cwdRules: [
     { pattern: 'agentbox-worktrees', tier: 'drone' },
   ],
+  // Agent sessions (see docs/KEEPER.md). A session is an agent session when a
+  // launcher's roster lists its id, or its cwd contains one of the patterns
+  // below (case-insensitive; for an agent that is on no roster). Never
+  // inferred from behaviour.
+  agentRosters: [],              // URLs, each returning the sessions a launcher runs
+  agentRosterKinds: ['spawned'], // a roster entry with a `kind` counts only if it is one of these
+  agentCwdPatterns: [],
+  // false: Dreamer writes no insights and applies no updates from an agent
+  // session. true: an agent session is summarized like any other.
+  agentInsights: false,
 };
 
 let config = { ...defaults };
@@ -57,7 +68,7 @@ let logFn = () => {};
 // In-memory only (turn-scoped; a stale flag surviving a restart would wrongly
 // skip a later Stop). Absent key = the latest prompt was not habituated.
 const turnReasons = new Map();
-let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0 };
+let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0, agentTurnsSummarized: 0, agentInsightsNotWritten: 0, agentUpdatesNotApplied: 0 };
 
 // A prompt that is harness plumbing rather than a human thought — task
 // notifications, system reminders — never deserves the involuntary layer.
@@ -297,6 +308,52 @@ const keeper = {
     }
   },
 
+  /** Remember that a session is an agent session (sticky; survives a roster outage). */
+  markAgent(sessionId, label) {
+    const e = getEntry(sessionId, null, null);
+    if (e.agentFlag) return;
+    e.agentFlag = String(label || 'agent');
+    dirty = true;
+    persist();
+    logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} flagged as agent (${e.agentFlag})`);
+  },
+
+  /** Is this an agent session, and why. No side effects, no inference from behaviour. */
+  isAgentSession(sessionId, cwd) {
+    if (!config.enabled) return { agent: false, why: 'keeper disabled' };
+    const e = ledger.get(sessionId);
+    if (e && e.agentFlag) return { agent: true, why: `flagged (${e.agentFlag})` };
+    const where = String(cwd || (e && e.cwd) || '').toLowerCase();
+    for (const p of config.agentCwdPatterns || []) {
+      if (p && where && where.includes(String(p).toLowerCase())) return { agent: true, why: `cwd matches "${p}"` };
+    }
+    return { agent: false, why: 'not flagged' };
+  },
+
+  /**
+   * Ask the configured rosters about a session not yet flagged, remember a
+   * hit, then answer as isAgentSession does. Waits at most the roster timeout;
+   * call it only where the hook response has already been sent (Stop).
+   */
+  async resolveAgent(sessionId, cwd, fetchImpl) {
+    if (!config.enabled) return { agent: false, why: 'keeper disabled' };
+    if (!ledger.get(sessionId)?.agentFlag) {
+      const found = await lookupAgent(sessionId, { urls: config.agentRosters, kinds: config.agentRosterKinds, ...(fetchImpl ? { fetchImpl } : {}) });
+      if (found.status === 'agent') keeper.markAgent(sessionId, found.label);
+    }
+    return keeper.isAgentSession(sessionId, cwd);
+  },
+
+  /** Whether Dreamer may write insights from an agent session (config agentInsights). */
+  agentInsightsEnabled() { return config.agentInsights === true; },
+
+  /** Count one summarized agent turn and what was withheld from it. */
+  noteAgentTurn({ insights = 0, updates = 0 } = {}) {
+    stats.agentTurnsSummarized++;
+    stats.agentInsightsNotWritten += insights;
+    stats.agentUpdatesNotApplied += updates;
+  },
+
   /** Manual tier override (POST /undertow/keeper). */
   setTier(sessionId, tier) {
     if (!VALID_TIERS.has(tier) && tier !== 'candidate') return false;
@@ -310,8 +367,12 @@ const keeper = {
 
   snapshot() {
     const byTier = {};
-    for (const e of ledger.values()) byTier[e.tier] = (byTier[e.tier] || 0) + 1;
-    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, ...stats, config };
+    const agentSessions = {};
+    for (const [id, e] of ledger) {
+      byTier[e.tier] = (byTier[e.tier] || 0) + 1;
+      if (e.agentFlag) agentSessions[id] = e.agentFlag;
+    }
+    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, agentSessions, ...stats, config };
   },
 };
 
