@@ -44,7 +44,8 @@
       "agentRosters": [],
       "agentRosterKinds": ["spawned"],
       "agentCwdPatterns": [],
-      "agentInsights": false
+      "agentInsights": false,
+      "agentIngest": false
     },
     "tapestry": {
       "enabled": true,

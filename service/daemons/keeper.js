@@ -58,6 +58,9 @@ const defaults = {
   // false: Dreamer writes no insights and applies no updates from an agent
   // session. true: an agent session is summarized like any other.
   agentInsights: false,
+  // false: Gobble writes nothing from an agent session, nor from a session a
+  // configured roster could not answer for. true: such sessions ingest like any other.
+  agentIngest: false,
 };
 
 let config = { ...defaults };
@@ -68,7 +71,9 @@ let logFn = () => {};
 // In-memory only (turn-scoped; a stale flag surviving a restart would wrongly
 // skip a later Stop). Absent key = the latest prompt was not habituated.
 const turnReasons = new Map();
-let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0, agentTurnsSummarized: 0, agentInsightsNotWritten: 0, agentUpdatesNotApplied: 0 };
+let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0, agentTurnsSummarized: 0, agentInsightsNotWritten: 0, agentUpdatesNotApplied: 0, agentIngestsDropped: 0, unknownIngestsDropped: 0 };
+// Sessions whose first dropped ingest has been logged (PostToolUse fires constantly: one line each).
+const ingestDropLogged = new Set();
 
 // A prompt that is harness plumbing rather than a human thought — task
 // notifications, system reminders — never deserves the involuntary layer.
@@ -331,17 +336,50 @@ const keeper = {
   },
 
   /**
-   * Ask the configured rosters about a session not yet flagged, remember a
-   * hit, then answer as isAgentSession does. Waits at most the roster timeout;
-   * call it only where the hook response has already been sent (Stop).
+   * Ask the configured rosters about a session not yet flagged and remember a
+   * hit. Returns 'flagged' (already known as an agent), 'none' (no roster
+   * configured), or the lookup's 'agent', 'not-listed' or 'unknown' (a roster
+   * did not answer). Waits at most the roster timeout.
+   */
+  async askRoster(sessionId, fetchImpl) {
+    if (ledger.get(sessionId)?.agentFlag) return 'flagged';
+    if (!(config.agentRosters || []).length) return 'none';
+    const found = await lookupAgent(sessionId, { urls: config.agentRosters, kinds: config.agentRosterKinds, ...(fetchImpl ? { fetchImpl } : {}) });
+    if (found.status === 'agent') keeper.markAgent(sessionId, found.label);
+    return found.status;
+  },
+
+  /**
+   * Ask the rosters (askRoster), then answer as isAgentSession does. Call it
+   * only where the hook response has already been sent (Stop).
    */
   async resolveAgent(sessionId, cwd, fetchImpl) {
     if (!config.enabled) return { agent: false, why: 'keeper disabled' };
-    if (!ledger.get(sessionId)?.agentFlag) {
-      const found = await lookupAgent(sessionId, { urls: config.agentRosters, kinds: config.agentRosterKinds, ...(fetchImpl ? { fetchImpl } : {}) });
-      if (found.status === 'agent') keeper.markAgent(sessionId, found.label);
-    }
+    await keeper.askRoster(sessionId, fetchImpl);
     return keeper.isAgentSession(sessionId, cwd);
+  },
+
+  /**
+   * May Gobble write what this session's tool event produced? Not from an
+   * agent session, and not from a session a configured roster could not answer
+   * for: tool output can carry anything the agent read, and a lost tool-output
+   * episode costs nothing. With no roster configured and no cwd match, or with
+   * config agentIngest on, the answer is yes. Counts each refusal and logs the
+   * first one per session. Call it only after the hook response has been sent.
+   * Returns { write, why }.
+   */
+  async ingestDecision(sessionId, cwd, fetchImpl) {
+    if (!config.enabled || config.agentIngest === true) return { write: true, why: 'not gated' };
+    const roster = await keeper.askRoster(sessionId, fetchImpl);
+    const { agent, why } = keeper.isAgentSession(sessionId, cwd);
+    if (!agent && roster !== 'unknown') return { write: true, why: 'not an agent session' };
+    if (agent) stats.agentIngestsDropped++; else stats.unknownIngestsDropped++;
+    const reason = agent ? `agent session: ${why}` : 'a roster did not answer';
+    if (!ingestDropLogged.has(sessionId)) {
+      ingestDropLogged.add(sessionId);
+      logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)}: ingest not written (${reason}); further drops for this session are counted, not logged`);
+    }
+    return { write: false, why: reason };
   },
 
   /** Whether Dreamer may write insights from an agent session (config agentInsights). */

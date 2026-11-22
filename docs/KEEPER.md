@@ -188,8 +188,20 @@ agent sessions, and about half were status or chatter.
 Until the held tier lands (PR 19, which is meant to replace this section's
 skip with a hold), the rule is blunt: **Dreamer writes no insights and applies
 no updates from an agent session.** Flashes, pursuit and dismissal judging,
-explicit feedback, train of thought, Gobble and the downstream daemons are
-unchanged for those sessions.
+explicit feedback, train of thought and the downstream daemons are unchanged
+for those sessions.
+
+**Gobble writes nothing from an agent session either.** A tool event carries
+whatever the agent read: a file, a web page, a message, a notification. Turned
+into a neuron, that text can later be flashed into any other session. So a
+PostToolUse ingest from an agent session is dropped before Gobble sees it, at
+the conscious tier and at the observer tier alike. For Gobble a session that a
+configured roster could not answer for is treated as an agent too: a lost
+tool-output episode costs nothing, and a wrongly kept one cannot be taken
+back. With no roster configured and no cwd match, Gobble behaves as before.
+The explicit ingest endpoints (`/undertow/external-ingest`,
+`/undertow/ingest-url`, `/undertow/ingest-file`) are deliberate calls and are
+not gated by this.
 
 **Who is an agent session.** Never inferred from behaviour. Either:
 
@@ -217,23 +229,28 @@ start):
   "agentRosters": ["http://127.0.0.1:8080/sessions"],
   "agentRosterKinds": ["spawned"],
   "agentCwdPatterns": [],
-  "agentInsights": false
+  "agentInsights": false,
+  "agentIngest": false
 }
 ```
 
 `agentInsights: true` turns the skip off: an agent session is then summarized
-like any other. All four default to off or empty, so a deployment that sets
-nothing behaves as before.
+like any other. `agentIngest: true` does the same for Gobble. Both are read
+at service start, so changing one needs a restart. Everything defaults to off
+or empty, so a deployment that sets nothing behaves as before.
 
 **What you can see.** `GET /undertow/keeper` lists flagged sessions under
 `agentSessions` and counts `agentTurnsSummarized`, `agentInsightsNotWritten`
-and `agentUpdatesNotApplied` since the service started. The service log has
-one line when a session is flagged and one per turn where something was
-withheld (counts only).
+and `agentUpdatesNotApplied` since the service started, and for Gobble
+`agentIngestsDropped` and `unknownIngestsDropped`. The service log has one
+line when a session is flagged, one per turn where something was withheld
+(counts only), and one for the first ingest dropped from each session.
 
 **Known gap.** A session that has not yet registered with its launcher is not
 on the roster for its first moments; a turn that ends in that window is
-summarized as a person's would be.
+summarized as a person's would be, and a tool event in that window is
+ingested. At Stop a roster that does not answer still leaves a session not yet
+flagged summarized as a person's; only Gobble treats that case as an agent.
 
 ## Economics of the fast path
 
