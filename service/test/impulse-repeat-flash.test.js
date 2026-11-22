@@ -1,22 +1,23 @@
-// Impulse: a neuron already flashed to a prompt is not flashed again to the
-// same prompt in the same session.
+// Impulse: a neuron already shown to a prompt is not shown again to the same
+// prompt in the same session, for a limited time.
 // Drives handleQuery with stubbed runCypher / callAnthropic, so no Neo4j or network is needed.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { handleQuery } from '../daemons/impulse.js';
+import { handleQuery, promptKey } from '../daemons/impulse.js';
 
 const SURFACED_RE = /times_surfaced = coalesce\(n\.times_surfaced, 0\) \+ 1/;
 
 let run = 0;
 
-// Prompts that differ only in a number have the same fingerprint (as a scheduled
-// check with a timestamp in it does) but are distinct keys for the 60s query cache.
+// A scheduled prompt carries the time it ran. That makes each run a distinct key
+// for the 60s query cache, while it is still the same prompt for repeat tracking.
 // Kept over 100 characters so the flow-state shortcut for short rapid prompts does not apply.
-const recurring = (topic = 'kettle thermostat') => `Scheduled check ${++run}: confirm the ${topic} tuning is still correct, say what changed since the last check, and list anything that needs attention`;
+const stamp = () => new Date(Date.UTC(2026, 0, 1) + (++run) * 1000).toISOString();
+const recurring = (topic = 'kettle thermostat') => `Scheduled check at ${stamp()}: confirm the ${topic} tuning is still correct, say what changed since the last check, and list anything that needs attention`;
 
-function harness({ candidates, flashMode, haikuText }) {
+function harness({ candidates, flashMode, haikuText, impulseConfig = {} }) {
   const calls = [];
   const logs = [];
   const session = { activeTopics: [], pendingFlashes: [] };
@@ -30,7 +31,7 @@ function harness({ candidates, flashMode, haikuText }) {
     },
     callAnthropic: async () => ({ response: { content: [{ text: typeof haikuText === 'function' ? haikuText() : haikuText }] } }),
     getEmbedding: async () => null, embeddingsAvailable: () => false,
-    isDaemonEnabled: () => false, getDaemonConfig: () => ({ decomposeQueries: false }),
+    isDaemonEnabled: () => false, getDaemonConfig: () => ({ decomposeQueries: false, ...impulseConfig }),
     wonder: {}, prowler: {},
     log: (...a) => logs.push(a),
     flashMode
@@ -101,4 +102,79 @@ test('a session remembers a bounded number of prompts', async () => {
   }
   assert.ok(made > 50);
   assert.ok(Object.keys(h.session.flashedByPrompt).length <= 50);
+});
+
+// --- Review defect 1: prompts that differ in a number are different prompts ---
+
+test('promptKey keeps numbers: "review PR 16" and "review PR 17" are different prompts', () => {
+  assert.notEqual(promptKey('review PR 16'), promptKey('review PR 17'));
+  assert.notEqual(promptKey('check commit 9d58724'), promptKey('check commit 976bf44'));
+});
+
+test('promptKey ignores only what changes between runs of one scheduled prompt', () => {
+  assert.equal(promptKey('Check at 2026-11-22T14:26:34.931Z: is PR 16 merged?'), promptKey('Check at 2026-11-23T02:00:01Z: is PR 16 merged?'));
+  assert.equal(promptKey('tick 14:26 review PR 16'), promptKey('tick  09:05:10 review PR 16'));
+  assert.equal(promptKey('session 8ace41c8-ec8c-4c9c-84dc-c161c2b2a994 done'), promptKey('session 9b10f77a-9fc2-4398-87d3-bdb56a33c47e done'));
+  assert.equal(promptKey('<task-id>bop7nfjwh</task-id> finished'), promptKey('<task-id>bgr1tuyzx</task-id> finished'));
+  assert.equal(promptKey('at 1763821594931 run'), promptKey('at 1763825194000 run'));
+});
+
+test('promptKey hashes the whole prompt, not a prefix', () => {
+  const preamble = 'You are a careful reviewer. '.repeat(40); // over 600 characters
+  assert.ok(preamble.length > 600);
+  assert.notEqual(promptKey(`${preamble}Review the kettle thermostat.`), promptKey(`${preamble}Review the greenhouse irrigation.`));
+});
+
+test('a prompt that differs only in a number still gets the neuron', async () => {
+  const h = harness({ candidates: ['A', 'B'], flashMode: 'raw' });
+  const ask = (pr) => `Review PR ${pr} against the plan at ${stamp()}: confirm the kettle thermostat tuning is still correct and list anything that needs attention`;
+  await handleQuery(h.deps(ask(16)));
+  const other = await handleQuery(h.deps(ask(17)));
+  assert.ok(blockOf(other).includes('A:') && blockOf(other).includes('B:'), 'PR 17 is not PR 16');
+  const again = await handleQuery(h.deps(ask(16)));
+  assert.equal(blockOf(again), '', 'the same prompt again is still recognised');
+});
+
+// --- Review defect 2: only what was shown is remembered ---
+
+test('haiku: nothing is remembered and nothing is left out', async () => {
+  const h = harness({ candidates: ['A', 'B', 'C'], flashMode: 'haiku', haikuText: JSON.stringify({ flashes: ['something about A'], topics_detected: [] }) });
+  const first = await handleQuery(h.deps(recurring()));
+  const second = await handleQuery(h.deps(recurring()));
+  assert.ok(blockOf(first).includes('something about A'));
+  assert.ok(blockOf(second).includes('something about A'), 'the repeat is flashed as before');
+  assert.equal(h.session.flashedByPrompt, undefined, 'which neurons Haiku drew on is unknown, so none is remembered');
+  assert.deepEqual(h.surfacedNames(), [['A', 'B', 'C'], ['A', 'B', 'C']], 'the surfaced count is unchanged');
+  assert.ok(!h.logs.some(l => /already flashed/.test(l[2])));
+});
+
+test('both: only the 8 raw neurons written into the block are remembered, not every candidate', async () => {
+  const names = Array.from({ length: 10 }, (_, i) => `N${i + 1}`);
+  const h = harness({ candidates: names, flashMode: 'both', haikuText: JSON.stringify({ flashes: ['a flash'], topics_detected: [] }) });
+  await handleQuery(h.deps(recurring()));
+  const second = await handleQuery(h.deps(recurring()));
+  const block = blockOf(second);
+  assert.ok(block.includes('N9:') && block.includes('N10:'), 'N9 and N10 were candidates but never shown: they come through');
+  assert.ok(!block.includes('N1:'), 'N1 was shown and is left out');
+});
+
+// --- Review defect 3: it expires ---
+
+test('after the expiry the neuron is shown again', async () => {
+  const h = harness({ candidates: ['A', 'B'], flashMode: 'raw', impulseConfig: { repeatFlashMinutes: 30 } });
+  await handleQuery(h.deps(recurring()));
+  assert.equal(blockOf(await handleQuery(h.deps(recurring()))), '', 'inside the window: left out');
+
+  // Age what the session remembers by 31 minutes.
+  for (const shown of Object.values(h.session.flashedByPrompt)) for (const n of Object.keys(shown)) shown[n] -= 31 * 60_000;
+  const later = await handleQuery(h.deps(recurring()));
+  assert.ok(blockOf(later).includes('A:') && blockOf(later).includes('B:'), 'past the window: shown again');
+});
+
+test('repeatFlashMinutes 0 turns it off', async () => {
+  const h = harness({ candidates: ['A'], flashMode: 'raw', impulseConfig: { repeatFlashMinutes: 0 } });
+  await handleQuery(h.deps(recurring()));
+  const second = await handleQuery(h.deps(recurring()));
+  assert.ok(blockOf(second).includes('A:'));
+  assert.equal(h.session.flashedByPrompt, undefined);
 });

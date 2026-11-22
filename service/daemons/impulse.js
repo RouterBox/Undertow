@@ -6,7 +6,7 @@ import neo4j from 'neo4j-driver';
 import { lexicalSearch } from './lexical.js';
 import { nsPredicate, livePredicate } from '../namespaces.js';
 import { parseCuratedSelection, formatCuratedBlock, MAX_CURATED_PICKS } from './curated.js';
-import { fingerprint } from './keeper.js';
+import { createHash } from 'crypto';
 
 // --- Project helpers ---
 
@@ -124,23 +124,51 @@ function markSurfaced({ runCypher, names, ns, log }) {
     `, { names, ns }).catch(e => log('error', 'warn', e.message));
 }
 
-// A recurring prompt (a scheduled check, a loop tick that got past habituation)
-// retrieves the same neurons every time. The first flash can help; the same
-// flash again to the same prompt in the same session adds nothing. Each session
-// remembers, per prompt fingerprint, which neurons it has already been shown.
+// A recurring prompt (a scheduled check that comes back after Keeper's
+// habituation window has lapsed) retrieves the same neurons every time. The
+// first flash can help; the same flash again to the same prompt in the same
+// session adds nothing. Each session remembers, per prompt, which neurons it
+// was shown and when; a neuron shown within the last repeatFlashMinutes is left
+// out, so the next-best candidate gets its turn.
 const MAX_REMEMBERED_PROMPTS = 50;
 const MAX_REMEMBERED_NEURONS = 200;
+const DEFAULT_REPEAT_FLASH_MINUTES = 720;
 
-function flashedBefore(session, promptFp) {
-  return new Set(session.flashedByPrompt?.[promptFp] || []);
+// The key a prompt is remembered under. Not Keeper's fingerprint(): that one
+// turns every number into the same token, which is right for spotting loop
+// ticks but would make "review PR 16" and "review PR 17" one prompt here.
+// Only what changes between two runs of the same scheduled prompt is removed:
+// task and tool ids, task output paths, UUIDs, dates, clock times and epoch
+// numbers. Other numbers stay, and the whole text is hashed, not a prefix.
+function promptKey(text) {
+  const norm = String(text || '').toLowerCase()
+    .replace(/<task-id>[^<]*<\/task-id>/g, '<task-id>#</task-id>')
+    .replace(/<tool-use-id>[^<]*<\/tool-use-id>/g, '<tool-use-id>#</tool-use-id>')
+    .replace(/tasks[\\/][a-z0-9_-]+\.output/g, 'tasks/#.output')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '#')
+    .replace(/\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?)?/g, '#')
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, '#')
+    .replace(/\b\d{9,}\b/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return createHash('sha1').update(norm).digest('hex').slice(0, 16);
 }
 
-function rememberFlashed(session, promptFp, names) {
+// Names of the neurons shown to this prompt within the expiry window.
+function flashedBefore(session, key, expiryMs, now = Date.now()) {
+  const shown = session.flashedByPrompt?.[key] || {};
+  return new Set(Object.keys(shown).filter(name => now - shown[name] < expiryMs));
+}
+
+function rememberFlashed(session, key, names, now = Date.now()) {
   if (!names.length) return;
   const byPrompt = (session.flashedByPrompt ||= {});
-  const merged = [...new Set([...(byPrompt[promptFp] || []), ...names])].slice(-MAX_REMEMBERED_NEURONS);
-  delete byPrompt[promptFp]; // re-insert so the most recently used prompt is last
-  byPrompt[promptFp] = merged;
+  const shown = { ...(byPrompt[key] || {}) };
+  for (const name of names) { delete shown[name]; shown[name] = now; } // most recently shown last
+  const kept = Object.keys(shown);
+  for (const name of kept.slice(0, Math.max(0, kept.length - MAX_REMEMBERED_NEURONS))) delete shown[name];
+  delete byPrompt[key]; // re-insert so the most recently used prompt is last
+  byPrompt[key] = shown;
   const keys = Object.keys(byPrompt);
   for (const k of keys.slice(0, Math.max(0, keys.length - MAX_REMEMBERED_PROMPTS))) delete byPrompt[k];
 }
@@ -423,8 +451,13 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
 
   // Combine and deduplicate results — wonder first (pre-warmed), then reactive daemons
   const allResults = [...wonderResults, ...keywordResults, ...lexicalResults, ...subqueryResults, ...expansionResults, ...graphResults, ...temporalResults, ...contradictionResults, ...researchResults];
-  const promptFp = fingerprint(prompt);
-  const alreadyFlashed = flashedBefore(session, promptFp);
+  // Haiku mode writes free text with no link back to the neurons it drew on, so
+  // what was shown cannot be known there: nothing is remembered or left out.
+  const cfgMinutes = Number(impulseConfig.repeatFlashMinutes ?? DEFAULT_REPEAT_FLASH_MINUTES);
+  const repeatFlashMinutes = Number.isFinite(cfgMinutes) && cfgMinutes > 0 ? cfgMinutes : 0; // 0 turns it off
+  const trackRepeats = repeatFlashMinutes > 0 && flashMode !== 'haiku';
+  const key = trackRepeats ? promptKey(prompt) : null;
+  const alreadyFlashed = trackRepeats ? flashedBefore(session, key, repeatFlashMinutes * 60_000) : new Set();
   const seen = new Set();
   let repeatsDropped = 0;
   const unique = allResults.filter(r => {
@@ -436,9 +469,11 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
   if (repeatsDropped > 0) {
     log('query', 'info', `already flashed to this prompt in this session: ${repeatsDropped} candidate(s) dropped`);
   }
-  // Counts the neurons as surfaced and remembers them against this prompt.
+  // Remembers the neurons actually written into the block against this prompt.
+  const rememberShown = (names) => { if (trackRepeats) rememberFlashed(session, key, names); };
+  // Counts the neurons as surfaced and remembers them as shown.
   const noteFlashed = (names) => {
-    rememberFlashed(session, promptFp, names);
+    rememberShown(names);
     markSurfaced({ runCypher, names, ns, log });
   };
 
@@ -652,7 +687,9 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
     // Haiku's flashes are free text with no link back to the candidates they drew
     // on, so which neurons were surfaced cannot be told: count every candidate
     // (the same set Dreamer attributes this entry's outcome to). This overcounts.
-    noteFlashed(unique.map(r => r.name));
+    markSurfaced({ runCypher, names: unique.map(r => r.name), ns, log });
+    // "both" mode also writes the first 8 raw neurons into the block: those were shown.
+    if (flashMode === 'both') rememberShown(unique.slice(0, 8).map(r => r.name));
   } else if (flashMode === 'both' && unique.length > 0) {
     // No Haiku flash, but "both" mode still writes the first 8 raw neurons into the block.
     noteFlashed(unique.slice(0, 8).map(r => r.name));
@@ -705,4 +742,5 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
   return { responseJson: {}, session };
 }
 
+export { promptKey };
 export { QUERY_SYSTEM_PROMPT, QUERY_SYSTEM_PROMPT_CURATED, handleQuery, mapCwdToProject, isNeuronInProject };

@@ -315,5 +315,4 @@ const keeper = {
   },
 };
 
-export { fingerprint };
 export default keeper;
