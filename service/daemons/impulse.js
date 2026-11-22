@@ -6,6 +6,7 @@ import neo4j from 'neo4j-driver';
 import { lexicalSearch } from './lexical.js';
 import { nsPredicate, livePredicate } from '../namespaces.js';
 import { parseCuratedSelection, formatCuratedBlock, MAX_CURATED_PICKS } from './curated.js';
+import { fingerprint } from './keeper.js';
 
 // --- Project helpers ---
 
@@ -121,6 +122,27 @@ function markSurfaced({ runCypher, names, ns, log }) {
       WHERE ${nsPredicate('n')}
       SET n.times_surfaced = coalesce(n.times_surfaced, 0) + 1
     `, { names, ns }).catch(e => log('error', 'warn', e.message));
+}
+
+// A recurring prompt (a scheduled check, a loop tick that got past habituation)
+// retrieves the same neurons every time. The first flash can help; the same
+// flash again to the same prompt in the same session adds nothing. Each session
+// remembers, per prompt fingerprint, which neurons it has already been shown.
+const MAX_REMEMBERED_PROMPTS = 50;
+const MAX_REMEMBERED_NEURONS = 200;
+
+function flashedBefore(session, promptFp) {
+  return new Set(session.flashedByPrompt?.[promptFp] || []);
+}
+
+function rememberFlashed(session, promptFp, names) {
+  if (!names.length) return;
+  const byPrompt = (session.flashedByPrompt ||= {});
+  const merged = [...new Set([...(byPrompt[promptFp] || []), ...names])].slice(-MAX_REMEMBERED_NEURONS);
+  delete byPrompt[promptFp]; // re-insert so the most recently used prompt is last
+  byPrompt[promptFp] = merged;
+  const keys = Object.keys(byPrompt);
+  for (const k of keys.slice(0, Math.max(0, keys.length - MAX_REMEMBERED_PROMPTS))) delete byPrompt[k];
 }
 
 // --- Query handler ---
@@ -401,12 +423,24 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
 
   // Combine and deduplicate results — wonder first (pre-warmed), then reactive daemons
   const allResults = [...wonderResults, ...keywordResults, ...lexicalResults, ...subqueryResults, ...expansionResults, ...graphResults, ...temporalResults, ...contradictionResults, ...researchResults];
+  const promptFp = fingerprint(prompt);
+  const alreadyFlashed = flashedBefore(session, promptFp);
   const seen = new Set();
+  let repeatsDropped = 0;
   const unique = allResults.filter(r => {
     if (seen.has(r.name)) return false;
     seen.add(r.name);
+    if (alreadyFlashed.has(r.name)) { repeatsDropped++; return false; }
     return true;
   });
+  if (repeatsDropped > 0) {
+    log('query', 'info', `already flashed to this prompt in this session: ${repeatsDropped} candidate(s) dropped`);
+  }
+  // Counts the neurons as surfaced and remembers them against this prompt.
+  const noteFlashed = (names) => {
+    rememberFlashed(session, promptFp, names);
+    markSurfaced({ runCypher, names, ns, log });
+  };
 
   // Domain scoring: boost same-project neurons, mark cross-project ones
   if (session.currentProject) {
@@ -493,7 +527,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
       neuronDomains: shown.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: shown.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
     });
-    markSurfaced({ runCypher, names: shown.map(r => r.name), ns, log });
+    noteFlashed(shown.map(r => r.name));
 
     const rawResult = { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: flashBlock } };
     setCachedQuery(prompt, cacheScope, rawResult);
@@ -564,7 +598,7 @@ Select the candidates worth surfacing (possibly none). Return JSON.`);
       neuronDomains: picks.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: picks.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
     });
-    markSurfaced({ runCypher, names: picks.map((p) => p.name), ns, log });
+    noteFlashed(picks.map((p) => p.name));
 
     const flashBlock = formatCuratedBlock(picks, unique.length, elapsed);
     log('query', 'info', 'flashes injected', { detail: picks.map((p) => `${p.name}: ${p.flash}`).join(' | ') });
@@ -618,10 +652,10 @@ Evaluate these candidates. Which are worth surfacing? Craft flash summaries for 
     // Haiku's flashes are free text with no link back to the candidates they drew
     // on, so which neurons were surfaced cannot be told: count every candidate
     // (the same set Dreamer attributes this entry's outcome to). This overcounts.
-    markSurfaced({ runCypher, names: unique.map(r => r.name), ns, log });
+    noteFlashed(unique.map(r => r.name));
   } else if (flashMode === 'both' && unique.length > 0) {
     // No Haiku flash, but "both" mode still writes the first 8 raw neurons into the block.
-    markSurfaced({ runCypher, names: unique.slice(0, 8).map(r => r.name), ns, log });
+    noteFlashed(unique.slice(0, 8).map(r => r.name));
   }
 
   const elapsed = Date.now() - startTime;
