@@ -238,7 +238,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     log('summarize', 'warn', `used fallback model: ${result.model}`);
   }
 
-  const blocks = Array.isArray(message.content) ? message.content : [];
+  const blocks = message.content; // a response with no content array throws here, as before
   const firstText = blocks[0]?.text;
   const responseText = firstText || '{}';
   const replyShape = `blocks [${blocks.map(b => b?.type || '?').join(', ')}], first block text ${typeof firstText === 'string' ? firstText.length : 0} chars, stop_reason ${message.stop_reason || 'unknown'}`;
