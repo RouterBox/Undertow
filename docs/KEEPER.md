@@ -179,12 +179,14 @@ fact someone states, never inferred from how the session behaves: three varied
 prompts a few seconds apart look like a conversation whoever sends them.
 
 1. **Declared:** `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
-   (or `"human"`; `null` clears it). A declaration beats the directory list,
-   so a person working in a listed directory can declare their session
-   `human`. It does not beat a roster: declaring `human` asks the rosters
-   first and is refused (HTTP 409) when a roster lists the session or does not
-   answer, and a session a roster has listed stays an agent whatever was
-   declared.
+   (or `"human"`; `null` clears it). Declaring `human` beats neither the
+   directory list nor a roster: it is refused (HTTP 409, with the reason) when
+   the session's cwd is in `agentCwdPatterns`, when a roster lists the session,
+   or when a roster does not answer; and a session that is in a listed
+   directory or on a roster stays an agent whatever an earlier declaration
+   said. So an agent cannot declare itself human. The cost: a person who works
+   in a listed directory is treated as an agent there (their insights are held
+   under the durable-kinds rule) until the directory is taken off the list.
 2. **A launcher's roster lists the session id.** A launcher that starts agent
    sessions publishes a URL returning JSON with the sessions it runs:
    `{"contexts": [...]}`, `{"sessions": [...]}` or a bare array, each entry
@@ -206,13 +208,23 @@ is then **held as unknown**: summarized by the ordinary prompt, and
 **everything it offers is written to the held tier, whatever its kind**, with
 `origin_kind: 'unknown'` and no `durable_kind`. The durable-kinds rule and the
 agent prompt below apply only to a session known to be an agent. A held insight
-can be released; one written live cannot be taken back. Two things from such a
-turn are not kept: an **update to an existing neuron is not applied** (an update
-cannot be held, it would rewrite a live neuron) and is counted, and a held
-insight gets no connections (Spider links it once it is released). The session
-is not flagged, so its next turn asks again, and a session declared `human` is
-not affected. With no roster configured at all, nothing is unknown: declaration
-and the directory list decide.
+can be released; one written live cannot be taken back. **Nothing such a turn
+offers is dropped, and nothing of it goes live:**
+
+- An **update to an existing neuron** is held as a carrier neuron named
+  `Update: <target> (<uid8>)`, with `held_update_of` naming the neuron it
+  would update. The live neuron is not touched. Releasing the carrier applies
+  it as the usual supersession of the live target and removes the carrier; if
+  the target no longer exists, the carrier is released as an ordinary neuron.
+  `GET /undertow/held` marks these with `update_of`.
+- The **connections** an insight offered are kept as data on the held neuron
+  (`held_connections`). On release the edges are made to the targets that
+  exist in the live graph, and the release answer says how many
+  (`connections_created`). Spider links the neuron as well on its next run.
+
+The session is not flagged, so its next turn asks again, and a session declared
+`human` is not affected. With no roster configured at all, nothing is unknown:
+declaration and the directory list decide.
 
 Everything else is a human session and behaves exactly as before. A person's
 own session is on no roster, so they can work in any directory without being
@@ -254,8 +266,7 @@ sessions with their `kind` and `why`, and a `held` block of counters since
 the last restart: agent turns summarized, turns where the model offered no
 insight, insights offered, dropped for no durable kind, skipped because the
 name was taken, written to the held tier, turns held as unknown with the
-insights held and the updates not applied on those turns, released, and
-releases refused.
+insights and the updates held on those turns, released, and releases refused.
 
 **What does not change for an agent session:** its tier, its flashes, pursuit
 detection and train of thought.

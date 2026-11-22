@@ -10,7 +10,7 @@ import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
 import { gateRun } from '../downstream-gate.js';
 import { recordPursuitDay } from '../pursuit-day.js';
-import { HELD_NAMESPACE, durableKind, nodeTypeForKind, countHeld } from '../held.js';
+import { HELD_NAMESPACE, durableKind, nodeTypeForKind, countHeld, heldUpdateName, packConnections } from '../held.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -255,15 +255,38 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // Process updates to existing neurons — supersession, not overwrite:
   // the old version is archived and linked via SUPERSEDES.
   // (An agent session rewrites nothing: an update would put its text straight
-  // into the live graph, past the held tier. The same goes for a turn held
-  // because nobody could say whose session it is: an update cannot be held, so
-  // it is not applied, and that loss is counted.)
-  // holdAll: a turn of unknown origin in the live graph. Everything it offers
-  // is held, whatever its kind; a session in its own namespace is already apart.
+  // into the live graph, past the held tier.)
+  // holdAll: a turn of unknown origin in the live graph. Nothing it offers is
+  // dropped and nothing goes live: insights of every kind are held, and an
+  // update is held too, as a carrier neuron that names its target and is
+  // applied as the usual supersession when a person releases it (held.js).
+  // A session in its own namespace is already apart.
   const holdAll = holdUnknown && !agentSession && !ns;
   if (holdAll && parsed.updates?.length) {
-    countHeld('unknownUpdatesNotApplied', parsed.updates.length);
-    log('summarize', 'info', `turn of unknown origin: ${parsed.updates.length} update(s) not applied`);
+    for (const upd of parsed.updates) {
+      if (!upd?.existing_name) continue;
+      const uid = randomUUID();
+      await runCypher(`
+          CREATE (n:Neuron {
+            uid: $uid, name: $name, node_type: 'fact', tier: 'T2_working',
+            flash_summary: $flash, body: $body,
+            source: 'conversation', decay_score: 50, base_score: 50,
+            times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
+            created_at: datetime(), last_surfaced: datetime(),
+            namespace: $ns, origin_session: $originSession, origin_kind: 'unknown',
+            held_update_of: $target, held_update_reason: $reason, held_update_event_date: $eventDate
+          })
+        `, {
+        uid, name: heldUpdateName(upd.existing_name, uid), target: upd.existing_name,
+        flash: upd.flash_summary || '', body: upd.body || '', ns: HELD_NAMESPACE,
+        originSession: session_id || null,
+        reason: String(upd.reason || 'updated at turn summarize').slice(0, 300),
+        eventDate: typeof upd.event_date === 'string' ? upd.event_date : null
+      }).then(() => {
+        countHeld('heldWritten'); countHeld('heldUpdates');
+        log('summarize', 'info', `held update ${String(uid).slice(0, 8)}`);
+      }).catch(e => log('error', 'warn', e.message));
+    }
   }
   if (!agentSession && !holdAll && parsed.updates?.length) {
     for (const upd of parsed.updates) {
@@ -332,6 +355,18 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           body: insight.body || '', ns: insightNs, eventDate,
           originSession: session_id || null, originKind: agentSession ? 'agent' : (holdUnknown ? 'unknown' : 'human'), durableKind: kind
         });
+        // A held insight of unknown origin keeps the connections it offered as
+        // data: edges cannot cross into the live graph, so they are made when
+        // the neuron is released (held.js). Nothing the turn offered is lost.
+        if (holdAll) {
+          const heldConns = packConnections(insight.connections, connectionTarget, insight.name);
+          if (heldConns) {
+            await runCypher(
+              `MATCH (n:Neuron {uid: $uid}) WHERE n.namespace = $held SET n.held_connections = $conns`,
+              { uid, held: HELD_NAMESPACE, conns: heldConns }
+            ).catch(e => log('error', 'warn', e.message));
+          }
+        }
 
         // Create connections for insights (never for a held one: a held neuron
         // has no edges into the live graph; Spider links it once released)

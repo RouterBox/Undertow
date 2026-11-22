@@ -843,7 +843,7 @@ app.post('/undertow/chase', async (req, res) => {
         log('keeper', 'info', 'chase of a held neuron: not released', { detail: may.reason });
         return res.json({ status: 'held', neuron: neuron || null, released: false, reason: may.reason, note: 'this neuron is held (written from an agent session); it was not released or rewarded. See GET /undertow/held' });
       }
-      released = await releaseHeld({ runCypher, name: heldUid ? null : neuron, uid: heldUid, by: 'chase', log });
+      released = await releaseHeld({ runCypher, name: heldUid ? null : neuron, uid: heldUid, by: 'chase', log, randomUUID });
       if (!released.released) return res.status(404).json({ status: 'not_found', error: 'no held neuron matched', neuron: neuron || null });
       neuron = released.name;
       embedNeuron(released.name, released.flash_summary).catch(e => log('error', 'warn', e.message));
@@ -864,7 +864,10 @@ app.post('/undertow/chase', async (req, res) => {
 
     log('chase', 'info', `chased: ${neuron}`, { detail: 'base_score +15, synapses +0.08' });
     res.json(released
-      ? { status: 'chased', neuron, released: true, ...(released.renamed ? { renamed: true, note: 'a live neuron already had this name; the released neuron carries the name shown here' } : {}) }
+      ? { status: 'chased', neuron, released: true, connections_created: released.connections_created || 0,
+          ...(released.applied_update_to ? { applied_update_to: released.applied_update_to, note: 'this was a held update: it was applied to the live neuron named here' } : {}),
+          ...(released.update_target_missing ? { update_target_missing: released.update_target_missing } : {}),
+          ...(released.renamed ? { renamed: true, note: 'a live neuron already had this name; the released neuron carries the name shown here' } : {}) }
       : { status: 'chased', neuron });
   } catch (e) {
     log('chase', 'error', e.message);
@@ -979,9 +982,9 @@ app.post('/undertow/feedback', async (req, res) => {
     if (ns === HELD_NAMESPACE) {
       held = { held: true, released: false };
       if (positive) {
-        const r = await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log });
+        const r = await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log, randomUUID });
         if (r.released) {
-          held = { held: false, released: true };
+          held = { held: false, released: true, connections_created: r.connections_created || 0, ...(r.applied_update_to ? { applied_update_to: r.applied_update_to } : {}) };
           embedNeuron(r.name, r.flash_summary).catch(e => log('error', 'warn', e.message));
         }
       }
@@ -1332,7 +1335,7 @@ app.post('/undertow/keeper', async (req, res) => {
     log('keeper', 'info', `manual override: ${String(session_id).slice(0, 8)} → ${tier}`);
   }
   if (kind === 'human') {
-    const declared = await keeper.declareHuman(session_id);
+    const declared = await keeper.declareHuman(session_id, undefined, req.body.cwd);
     if (!declared.ok) {
       log('keeper', 'info', `manual declaration refused: ${String(session_id).slice(0, 8)} is not declared human`, { detail: declared.reason });
       return res.status(409).json({ error: declared.reason, session_id });

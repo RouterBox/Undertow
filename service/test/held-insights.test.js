@@ -63,11 +63,19 @@ test('a cwd on the agent list marks the session as agent, case-insensitively', (
   assert.equal(keeper.sessionKind(other).kind, 'human');
 });
 
-test('a declared kind beats the cwd list but not a roster flag, can be cleared, and rejects anything else', () => {
+test('a declared human does not beat the cwd list or a roster flag; a declaration can be cleared, and anything else is rejected', async () => {
   const sid = id('declared');
   keeper.recordPrompt(sid, 'C:/github/AgentPlace', 'conscious', 'hello there');
+  // An old declaration of human on a session in a listed directory: still an agent.
   assert.equal(keeper.setKind(sid, 'human'), true);
-  assert.deepEqual(keeper.sessionKind(sid), { kind: 'human', why: 'declared' }, 'declared human beats the cwd list');
+  assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'cwd matches "AgentPlace"' }, 'the cwd list beats a declared human');
+  // And it cannot declare itself human: refused before any roster is asked.
+  const refused = await keeper.declareHuman(sid);
+  assert.equal(refused.ok, false);
+  assert.match(refused.reason, /agent session \(cwd matches "AgentPlace"\).*cannot be declared human/);
+  const byRequestCwd = id('declared-req-cwd');
+  keeper.recordPrompt(byRequestCwd, 'C:/github/elsewhere', 'conscious', 'hello from elsewhere');
+  assert.equal((await keeper.declareHuman(byRequestCwd, undefined, 'C:/github/AgentPlace/sub')).ok, false, 'the request cwd counts too');
   keeper.markAgent(sid, 'worker');
   assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'flagged (worker)' }, 'a roster fact beats a declared human');
   assert.equal(keeper.setKind(sid, null), true);
@@ -244,10 +252,13 @@ test('releaseHeld moves a held neuron to the live graph and says what released i
     runCypher: async (q, p) => { calls.push({ q, p }); return [{ name: p.name, held_name: p.name, uid: 'abcdef0123', flash_summary: 'f' }]; },
     name: 'Restore a backup', by: 'chase', log: (...a) => logs.push(a)
   });
-  assert.deepEqual(r, { released: true, name: 'Restore a backup', uid: 'abcdef0123', flash_summary: 'f', renamed: false });
-  assert.deepEqual(calls[0].p, { name: 'Restore a backup', uid: null, held: HELD_NAMESPACE, by: 'chase' });
-  assert.match(calls[0].q, /n\.namespace = \$held AND n\.superseded IS NULL/);
-  assert.match(calls[0].q, /n\.namespace = null, n\.released_at = datetime\(\), n\.released_by = \$by, n\.spidered = false/);
+  assert.deepEqual(r, { released: true, name: 'Restore a backup', uid: 'abcdef0123', flash_summary: 'f', renamed: false, connections_created: 0 });
+  // calls[0] reads the held neuron (is it an update?); calls[1] moves it.
+  assert.doesNotMatch(calls[0].q, /SET /, 'the first query only reads');
+  assert.deepEqual(calls[1].p, { name: 'Restore a backup', uid: null, held: HELD_NAMESPACE, by: 'chase' });
+  assert.match(calls[1].q, /n\.namespace = \$held AND n\.superseded IS NULL/);
+  assert.match(calls[1].q, /n\.namespace = null, n\.released_at = datetime\(\), n\.released_by = \$by, n\.spidered = false/);
+  assert.equal(calls.length, 2, 'no held connections, no edge queries');
   assert.ok(logs.some(l => /held neuron released to the live graph: Restore a backup/.test(l[2])));
 });
 
@@ -261,11 +272,76 @@ test('a name a live neuron has since taken does not block release: the held one 
   assert.equal(r.released, true);
   assert.equal(r.renamed, true);
   assert.equal(r.name, 'Restore a backup (held abcdef01)');
-  assert.doesNotMatch(calls[0].q, /NOT EXISTS/, 'no clause that refuses the release on a collision');
-  assert.match(calls[0].q, /OPTIONAL MATCH \(l:Neuron \{name: n\.name\}\) WHERE l\.namespace IS NULL/);
-  assert.match(calls[0].q, /CASE WHEN taken > 0 THEN n\.name \+ ' \(held ' \+ substring\(coalesce\(n\.uid, ''\), 0, 8\) \+ '\)' ELSE n\.name END/);
-  assert.match(calls[0].q, /toLower\(n\.uid\) STARTS WITH \$uid/, 'released by uid');
-  assert.equal(calls[0].p.uid, 'abcdef01');
+  assert.doesNotMatch(calls[1].q, /NOT EXISTS/, 'no clause that refuses the release on a collision');
+  assert.match(calls[1].q, /OPTIONAL MATCH \(l:Neuron \{name: n\.name\}\) WHERE l\.namespace IS NULL/);
+  assert.match(calls[1].q, /CASE WHEN taken > 0 THEN n\.name \+ ' \(held ' \+ substring\(coalesce\(n\.uid, ''\), 0, 8\) \+ '\)' ELSE n\.name END/);
+  assert.match(calls[1].q, /toLower\(n\.uid\) STARTS WITH \$uid/, 'released by uid');
+  assert.equal(calls[1].p.uid, 'abcdef01');
+});
+
+test('release makes the connections a held insight kept, to targets that exist live, and says how many', async () => {
+  const calls = [];
+  const conns = JSON.stringify([
+    { target: 'Backups', weight: 0.7, edge_type: 'causal', context: 'why' },
+    { target: 'Gone since', weight: 0.5, edge_type: 'associative', context: '' }
+  ]);
+  const r = await releaseHeld({
+    runCypher: async (q, p) => {
+      calls.push({ q, p });
+      if (/held_update_of AS target/.test(q)) return [{ uid: 'abcdef0123', target: null }];
+      if (/REMOVE n\.held_connections/.test(q)) return [{ name: 'Restore a backup', held_name: 'Restore a backup', uid: 'abcdef0123', flash_summary: 'f', held_connections: conns }];
+      if (/CREATE \(src\)-\[:SYNAPSE/.test(q)) return p.tgt === 'Backups' ? [{ linked: 'Backups' }] : [];
+      return [];
+    },
+    name: 'Restore a backup', by: 'chase'
+  });
+  assert.equal(r.released, true);
+  assert.equal(r.connections_created, 1, 'one target exists live, the other does not');
+  const edges = calls.filter(c => /CREATE \(src\)-\[:SYNAPSE/.test(c.q));
+  assert.equal(edges.length, 2);
+  assert.ok(edges.every(c => /src\.namespace IS NULL/.test(c.q) && /tgt\.namespace IS NULL AND tgt\.superseded IS NULL/.test(c.q)), 'live to live only');
+  assert.deepEqual(edges[0].p, { uid: 'abcdef0123', tgt: 'Backups', weight: 0.7, edgeType: 'causal', context: 'why' });
+});
+
+test('releasing a held update applies it as the usual supersession of its live target and removes the carrier', async () => {
+  const calls = [];
+  const run = async (q, p) => {
+    calls.push({ q, p });
+    if (/held_update_of AS target/.test(q)) return [{ uid: 'cafe0000-1', target: 'Deploy window', flash_summary: 'Deploys now run at noon', body: 'New body.', reason: 'moved', event_date: null }];
+    if (/RETURN n\.node_type AS type, n\.tier AS tier/.test(q)) return [{ type: 'fact', tier: 'T2_working', flash: 'old', body: 'old body', project: 'app' }];
+    return [];
+  };
+  const before = heldCounters().released;
+  const r = await releaseHeld({ runCypher: run, uid: 'CAFE0000', by: 'chase', randomUUID: () => 'new-uid' });
+  assert.equal(r.released, true);
+  assert.equal(r.applied_update_to, 'Deploy window');
+  assert.equal(r.name, 'Deploy window', 'the caller embeds and rewards the live target');
+  assert.ok(calls.some(c => /SET n\.name = \$archivedName, n\.superseded = true/.test(c.q) && c.p.name === 'Deploy window' && c.p.ns === null), 'the live target was archived');
+  const created = calls.find(c => /source: 'supersession'/.test(c.q));
+  assert.equal(created.p.flash, 'Deploys now run at noon');
+  assert.equal(created.p.body, 'New body.');
+  assert.equal(created.p.ns, null);
+  assert.ok(calls.some(c => /SUPERSEDES/.test(c.q) && c.p.reason === 'moved'));
+  const removed = calls.find(c => /DETACH DELETE n/.test(c.q));
+  assert.deepEqual(removed.p, { uid: 'cafe0000-1', held: HELD_NAMESPACE });
+  assert.match(removed.q, /n\.namespace = \$held/, 'only ever the held carrier');
+  assert.ok(!calls.some(c => /n\.namespace = null, n\.released_at/.test(c.q)), 'the carrier itself never goes live');
+  assert.equal(heldCounters().released - before, 1);
+});
+
+test('a held update whose target is gone is released as an ordinary neuron, so its text is not lost', async () => {
+  const calls = [];
+  const run = async (q, p) => {
+    calls.push({ q, p });
+    if (/held_update_of AS target/.test(q)) return [{ uid: 'cafe0000-2', target: 'Deleted since', flash_summary: 'f', body: 'b', reason: 'r', event_date: null }];
+    if (/REMOVE n\.held_connections/.test(q)) return [{ name: 'Update: Deleted since (cafe0000)', held_name: 'Update: Deleted since (cafe0000)', uid: 'cafe0000-2', flash_summary: 'f', held_connections: null }];
+    return []; // supersedeNeuron finds no live target
+  };
+  const r = await releaseHeld({ runCypher: run, uid: 'cafe0000', by: 'chase', randomUUID: () => 'x' });
+  assert.equal(r.released, true);
+  assert.equal(r.applied_update_to, undefined);
+  assert.equal(r.update_target_missing, 'Deleted since');
+  assert.ok(!calls.some(c => /DETACH DELETE/.test(c.q)));
 });
 
 test('releaseHeld reports released:false and logs nothing when no held neuron matched', async () => {
@@ -437,21 +513,44 @@ test('Stop with a roster that does not answer: everything the turn offers is hel
     const before = heldCounters();
     const sid = id('stop-unknown');
     hookSession(sid);
-    const h = stopDeps(sid, 'C:/work/app', { updates: [{ existing_name: 'Old fact', flash_summary: 'New text', body: 'Two sentences of body. Enough to pass.', reason: 'changed' }] });
+    const h = stopDeps(sid, 'C:/work/app', {
+      insights: [
+        { name: 'Gate needs a timeout', kind: 'lesson', flash_summary: 'A gate with no timeout blocks forever', body: 'Two sentences of body. Enough to pass.',
+          connections: [{ target: 'Downstream gate', weight: 0.8, edge_type: 'causal', context: 'same gate' }, { target: 'Gate needs a timeout' }, { weight: 0.3 }] },
+        { name: 'Service restarted', node_type: 'fact', flash_summary: 'Restarted at noon', body: 'Two sentences of body. Enough to pass.' }
+      ],
+      updates: [{ existing_name: 'Old fact', flash_summary: 'New text', body: 'Two sentences of body. Enough to pass.', reason: 'changed' }]
+    });
     await summarizeForTurn(h.deps, keeper);
     // The session may be a person's: the ordinary prompt, and no kind rule.
     assert.deepEqual(h.prompts, [SUMMARIZE_SYSTEM_PROMPT], 'the ordinary prompt, not the agent one');
-    const created = createdBy(h);
+    const all = createdBy(h);
+    assert.ok(all.every(p => p.ns === HELD_NAMESPACE), 'nothing from the turn goes live');
+    const created = all.filter(p => !p.target);
     assert.equal(created.length, 2, 'both insights, the one with no durable kind too');
-    assert.ok(created.every(p => p.ns === HELD_NAMESPACE && p.originKind === 'unknown' && p.durableKind === null));
+    assert.ok(created.every(p => p.originKind === 'unknown' && p.durableKind === null));
     assert.deepEqual(created.map(p => p.type), ['insight', 'fact'], 'node_type as the ordinary path sets it');
-    // An update cannot be held: it is not applied, and it is counted. No edges either.
-    assert.ok(!h.calls.some(c => /Old fact/.test(JSON.stringify(c.p || {}))), 'the update never reached the graph');
+    // The update is held as a carrier that names its target; the live neuron is not touched.
+    const carriers = all.filter(p => p.target);
+    assert.equal(carriers.length, 1);
+    assert.equal(carriers[0].target, 'Old fact');
+    assert.equal(carriers[0].name, 'Update: Old fact (u)');
+    assert.equal(carriers[0].flash, 'New text');
+    assert.equal(carriers[0].reason, 'changed');
+    const carrierQ = h.calls.find(c => c.p === carriers[0]).q;
+    assert.match(carrierQ, /held_update_of: \$target/);
+    assert.match(carrierQ, /origin_kind: 'unknown'/);
+    assert.ok(!h.calls.some(c => /superseded = true|SUPERSEDES/.test(c.q)), 'no supersession on an unknown turn');
+    // Connections are kept as data on the held insight, not made as edges.
     assert.ok(!h.calls.some(c => /SYNAPSE/.test(c.q) && /CREATE/.test(c.q)), 'no edges from a held turn');
+    const kept = h.calls.filter(c => /SET n\.held_connections = \$conns/.test(c.q));
+    assert.equal(kept.length, 1, 'only the insight that offered usable connections');
+    assert.deepEqual(JSON.parse(kept[0].p.conns), [{ target: 'Downstream gate', weight: 0.8, edge_type: 'causal', context: 'same gate' }], 'self-link and target-less entries left out');
     const after = heldCounters();
     assert.equal(after.heldOnUnknownTurns - before.heldOnUnknownTurns, 1);
     assert.equal(after.heldOnUnknownInsights - before.heldOnUnknownInsights, 2);
-    assert.equal(after.unknownUpdatesNotApplied - before.unknownUpdatesNotApplied, 1);
+    assert.equal(after.heldUpdates - before.heldUpdates, 1);
+    assert.equal(after.heldWritten - before.heldWritten, 3);
     assert.equal(after.droppedNoKind, before.droppedNoKind, 'the kind rule did not run');
     assert.equal(keeper.isAgentSession(sid).agent, false, 'an unknown answer flags nobody');
     assert.equal(keeper.sessionKind(sid).kind, 'human');
@@ -494,7 +593,8 @@ test('Stop for a session known to be an agent: the strict prompt, and an insight
   assert.equal(created[0].durableKind, 'lesson');
   const after = heldCounters();
   assert.equal(after.droppedNoKind - before.droppedNoKind, 1);
-  assert.equal(after.unknownUpdatesNotApplied, before.unknownUpdatesNotApplied, 'that counter is for unknown turns only');
+  assert.equal(after.heldUpdates, before.heldUpdates, 'a known agent rewrites nothing and holds no update');
+  assert.ok(!h.calls.some(c => /held_update_of|held_connections/.test(c.q)));
   assert.equal(after.heldOnUnknownInsights, before.heldOnUnknownInsights);
 });
 
@@ -583,6 +683,13 @@ test('a chase rewards the neuron in the caller\'s namespace only, the live graph
   assert.equal(await rewardChase({ runCypher: async () => { throw new Error('boom'); }, name: 'x' }), null);
 });
 
+test('listHeld marks a held update with the neuron it would update, and says the origin', async () => {
+  let q = '';
+  await listHeld({ runCypher: async (query) => { q = query; return []; } });
+  assert.match(q, /n\.held_update_of AS update_of/);
+  assert.match(q, /n\.origin_kind AS origin_kind/);
+});
+
 test('listHeld asks only the held namespace, newest first, with a bounded limit', async () => {
   const seen = [];
   const rows = [{ name: 'Restore a backup', uid: 'u1', durable_kind: 'procedure', type: 'insight', flash_summary: 'f', origin_session: 's1', created_at: '2026-11-22T15:00:00Z', name_taken: false }];
@@ -606,7 +713,7 @@ test('what an agent session offered, dropped and had held is counted', async () 
   assert.deepEqual(d, {
     agentTurns: 2, zeroInsightTurns: 1, insightsOffered: 5, droppedNoKind: 2,
     skippedNameTaken: 0, heldWritten: 3, heldOnUnknownTurns: 0, heldOnUnknownInsights: 0,
-    unknownUpdatesNotApplied: 0, released: 1, releaseRefused: 0
+    heldUpdates: 0, released: 1, releaseRefused: 0
   });
 });
 

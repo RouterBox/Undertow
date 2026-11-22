@@ -454,8 +454,11 @@ const keeper = {
     const e = ledger.get(sessionId);
     // A launcher's roster is a fact: it beats a declaration of human.
     if (e && e.agentFlag && e.declaredKind === 'human') return noteKind(e, sessionId, { kind: 'agent', why: `flagged (${e.agentFlag})` });
-    if (e && VALID_KINDS.has(e.declaredKind)) return noteKind(e, sessionId, { kind: e.declaredKind, why: 'declared' });
+    // So is the directory list: a session working in a listed directory is an
+    // agent session whatever an (old) declaration of human says.
     const a = keeper.isAgentSession(sessionId, cwd);
+    if (a.agent && e?.declaredKind === 'human') return noteKind(e, sessionId, { kind: 'agent', why: a.why });
+    if (e && VALID_KINDS.has(e.declaredKind)) return noteKind(e, sessionId, { kind: e.declaredKind, why: 'declared' });
     if (a.agent) return noteKind(e, sessionId, { kind: 'agent', why: a.why });
     return { kind: 'human', why: 'default' };
   },
@@ -470,7 +473,9 @@ const keeper = {
    * lists the session (it is an agent) or did not answer (it cannot be told).
    * Returns { ok, reason }.
    */
-  async declareHuman(sessionId, fetchImpl) {
+  async declareHuman(sessionId, fetchImpl, cwd) {
+    const listed = keeper.isAgentSession(sessionId, cwd);
+    if (listed.agent) return { ok: false, reason: `this is an agent session (${listed.why}): it cannot be declared human` };
     const roster = await keeper.askRoster(sessionId, fetchImpl);
     if (roster === 'agent' || roster === 'flagged') return { ok: false, reason: 'a launcher roster lists this session: it is an agent session' };
     if (roster === 'unknown') return { ok: false, reason: 'a launcher roster did not answer, so this session cannot be confirmed as human: try again' };
