@@ -99,7 +99,7 @@ test('/mcp mutating tools run when allowMutations is on', async () => {
   const client = await connect(new URL(`${b}/mcp`));
   const r = await client.callTool({ name: 'undertow_spider', arguments: { mode: 'full' } });
   assert.equal(r.isError, false);
-  assert.deepEqual(calls.at(-1).body, { mode: 'full' });
+  assert.deepEqual(calls.at(-1).body, { mode: 'full', via: 'mcp' });
   await client.close();
 });
 
@@ -126,7 +126,7 @@ test('/mcp held tier: query is marked as a tool call, held items can be listed, 
   assert.equal(calls.at(-1).body.via, 'mcp', 'the Keeper must not count a tool call as a prompt');
   const listed = await client.callTool({ name: 'undertow_held', arguments: { limit: 5 } });
   assert.equal(listed.isError, false);
-  assert.deepEqual({ method: calls.at(-1).method, path: calls.at(-1).path, query: calls.at(-1).query }, { method: 'GET', path: '/undertow/held', query: { limit: 5 } });
+  assert.deepEqual({ method: calls.at(-1).method, path: calls.at(-1).path, query: calls.at(-1).query }, { method: 'GET', path: '/undertow/held', query: { limit: 5, via: 'mcp' } });
   await client.callTool({ name: 'undertow_neighbors', arguments: { name: 'x', held: true } });
   assert.equal(calls.at(-1).query.namespace, 'quarantine');
   // Reads of the held tier are logged with the caller's session id when the caller gives one.
@@ -141,4 +141,31 @@ test('/mcp held tier: query is marked as a tool call, held items can be listed, 
   const none = await client.callTool({ name: 'undertow_chase', arguments: { session_id: 's1' } });
   assert.equal(none.isError, true);
   await client.close();
+});
+
+test('/mcp says where a call comes from: via on every tool call, and the folder the client declared', async () => {
+  // No header: via only, and a cwd the tool was given is passed through.
+  const plain = await connect();
+  await plain.callTool({ name: 'undertow_query', arguments: { session_id: 's1', prompt: 'q', cwd: '/work/app' } });
+  assert.equal(calls.at(-1).body.via, 'mcp');
+  assert.equal(calls.at(-1).body.cwd, '/work/app');
+  await plain.callTool({ name: 'undertow_stats', arguments: {} });
+  assert.deepEqual(calls.at(-1).query, { via: 'mcp' });
+  await plain.close();
+
+  // The client declares its folder in the X-Undertow-Cwd header: every call carries it,
+  // in the body for POST and the query string for GET, and it wins over a tool argument.
+  const placed = await connect(url, { headers: { 'X-Undertow-Cwd': '/places/excluded' } });
+  await placed.callTool({ name: 'undertow_query', arguments: { session_id: 's1', prompt: 'q', cwd: '/somewhere/else' } });
+  assert.equal(calls.at(-1).body.cwd, '/places/excluded');
+  assert.equal(calls.at(-1).body.via, 'mcp');
+  await placed.callTool({ name: 'undertow_chase', arguments: { session_id: 's1', neuron: 'n' } });
+  assert.equal(calls.at(-1).body.cwd, '/places/excluded');
+  for (const [name, args] of [['undertow_stats', {}], ['undertow_patterns', {}], ['undertow_health_check', {}], ['undertow_logs', { lines: 5 }], ['undertow_held', {}], ['undertow_neighbors', { name: 'n' }]]) {
+    await placed.callTool({ name, arguments: args });
+    assert.equal(calls.at(-1).method, 'GET', name);
+    assert.equal(calls.at(-1).query.cwd, '/places/excluded', name);
+    assert.equal(calls.at(-1).query.via, 'mcp', name);
+  }
+  await placed.close();
 });

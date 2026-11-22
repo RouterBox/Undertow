@@ -28,6 +28,12 @@ export const MCP_TOOL_NAMES = Object.freeze([
   'undertow_logs', 'undertow_neighbors', 'undertow_feedback', 'undertow_held',
 ]);
 
+// Request header an MCP client sets to say which folder its session runs in.
+// This endpoint runs inside the service, so it cannot see the session's folder
+// itself; a client that wants a Keeper cwd rule honoured for its tool calls
+// sends it (in a Claude Code MCP entry: "headers": { "X-Undertow-Cwd": "<folder>" }).
+export const CALLER_CWD_HEADER = 'x-undertow-cwd';
+
 /** Build a dispatch() that calls this service's own HTTP routes at baseUrl. */
 export function createHttpDispatch(getBaseUrl, { headers: extraHeaders = {} } = {}) {
   return async function dispatch(method, path, { query, body } = {}) {
@@ -72,8 +78,22 @@ function mutationsDisabled(what) {
 }
 
 /** Create an McpServer with the Undertow tools registered. */
-export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMutations = false }) {
-  const call = async (...args) => toolResult(await dispatch(...args));
+export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMutations = false, callerCwd = null }) {
+  // Every tool call says where it comes from: via 'mcp', and the caller's folder
+  // when the client declared one (mountMcp reads it from the X-Undertow-Cwd
+  // request header). The service uses it to refuse a place the Keeper excludes.
+  // In the body for POST, in the query string for GET. A cwd the tool itself
+  // was given (undertow_query) is kept only when the client declared none.
+  const call = async (method, path, opts = {}) => {
+    if (method === 'GET') {
+      const query = { ...(opts.query || {}), via: 'mcp' };
+      if (callerCwd) query.cwd = callerCwd;
+      return toolResult(await dispatch(method, path, { ...opts, query }));
+    }
+    const body = { ...(opts.body || {}), via: 'mcp' };
+    if (callerCwd) body.cwd = callerCwd;
+    return toolResult(await dispatch(method, path, { ...opts, body }));
+  };
   const server = new McpServer({ name: 'undertow', version });
 
   server.registerTool(
@@ -111,7 +131,7 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
     },
     // via: 'mcp' tells the service this is a tool call, not a person's prompt:
     // the Keeper gives it no turn-taking credit.
-    async ({ session_id, prompt, cwd }) => call('POST', '/undertow/query', { body: { session_id, prompt, cwd, via: 'mcp' } })
+    async ({ session_id, prompt, cwd }) => call('POST', '/undertow/query', { body: { session_id, prompt, cwd } })
   );
 
   server.registerTool(
@@ -371,7 +391,10 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
 /** Mount the stateless Streamable HTTP MCP endpoint at /mcp. */
 export function mountMcp(app, { dispatch, version, allowMutations = false, log = () => {} }) {
   app.post('/mcp', async (req, res) => {
-    const server = createUndertowMcpServer({ dispatch, version, allowMutations });
+    // The client may declare the folder its session runs in (see CALLER_CWD_HEADER).
+    const h = req.headers?.[CALLER_CWD_HEADER];
+    const callerCwd = typeof h === 'string' && h.trim() ? h.trim().slice(0, 1024) : null;
+    const server = createUndertowMcpServer({ dispatch, version, allowMutations, callerCwd });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {
