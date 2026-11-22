@@ -39,11 +39,11 @@ async function connect(target = url, requestInit) {
   return client;
 }
 
-test('/mcp lists the 11 Undertow tools', async () => {
+test('/mcp lists the 12 Undertow tools', async () => {
   const client = await connect();
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map(t => t.name).sort(), [...MCP_TOOL_NAMES].sort());
-  assert.equal(tools.length, 11);
+  assert.equal(tools.length, 12);
   for (const t of tools) assert.doesNotMatch(t.description, /RouterBox/);
   await client.close();
 });
@@ -116,6 +116,24 @@ test('UNDERTOW_API_TOKEN: /mcp and mutating routes require the bearer token', as
   await assert.rejects(connect(new URL(`${b}/mcp`)));
   const client = await connect(new URL(`${b}/mcp`), { headers: { Authorization: `Bearer ${token}` } });
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 11);
+  assert.equal(tools.length, 12);
+  await client.close();
+});
+
+test('/mcp held tier: query is marked as a tool call, held items can be listed, read and chased by uid', async () => {
+  const client = await connect();
+  await client.callTool({ name: 'undertow_query', arguments: { session_id: 's1', prompt: 'hello' } });
+  assert.equal(calls.at(-1).body.via, 'mcp', 'the Keeper must not count a tool call as a prompt');
+  const listed = await client.callTool({ name: 'undertow_held', arguments: { limit: 5 } });
+  assert.equal(listed.isError, false);
+  assert.deepEqual({ method: calls.at(-1).method, path: calls.at(-1).path, query: calls.at(-1).query }, { method: 'GET', path: '/undertow/held', query: { limit: 5 } });
+  await client.callTool({ name: 'undertow_neighbors', arguments: { name: 'x', held: true } });
+  assert.equal(calls.at(-1).query.namespace, 'quarantine');
+  await client.callTool({ name: 'undertow_neighbors', arguments: { name: 'x' } });
+  assert.equal(calls.at(-1).query.namespace, undefined);
+  await client.callTool({ name: 'undertow_chase', arguments: { session_id: 's1', uid: 'abcdef01' } });
+  assert.equal(calls.at(-1).body.uid, 'abcdef01');
+  const none = await client.callTool({ name: 'undertow_chase', arguments: { session_id: 's1' } });
+  assert.equal(none.isError, true);
   await client.close();
 });

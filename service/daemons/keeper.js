@@ -55,13 +55,18 @@ const defaults = {
   agentRosters: [],              // URLs, each returning the sessions a launcher runs
   agentRosterKinds: ['spawned'], // a roster entry with a `kind` counts only if it is one of these
   agentCwdPatterns: [],
-  // false: Dreamer writes no insights and applies no updates from an agent
-  // session. true: an agent session is summarized like any other.
+  // false: what Dreamer writes from an agent session goes through the held
+  // tier (durable kinds only, held until a human session uses it).
+  // true: an agent session is summarized like a person's.
   agentInsights: false,
   // false: Gobble writes nothing from an agent session, nor from a session a
   // configured roster could not answer for. true: such sessions ingest like any other.
   agentIngest: false,
 };
+
+const VALID_KINDS = new Set(['agent', 'human']);
+// The hook events a Claude Code session sends (the payload's hook_event_name).
+const HOOK_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'PostCompact']);
 
 let config = { ...defaults };
 let ledger = new Map(); // sessionId → entry
@@ -71,7 +76,7 @@ let logFn = () => {};
 // In-memory only (turn-scoped; a stale flag surviving a restart would wrongly
 // skip a later Stop). Absent key = the latest prompt was not habituated.
 const turnReasons = new Map();
-let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0, agentTurnsSummarized: 0, agentInsightsNotWritten: 0, agentUpdatesNotApplied: 0, agentIngestsDropped: 0, unknownIngestsDropped: 0 };
+let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0, agentIngestsDropped: 0, unknownIngestsDropped: 0 };
 // Sessions whose first dropped ingest has been logged (PostToolUse fires constantly: one line each).
 const ingestDropLogged = new Set();
 
@@ -119,6 +124,7 @@ function maybePromote(e, sessionId) {
   if (!conversational && !agentic) return false;
   e.tier = 'conscious';
   e.promotedAt = now();
+  e.promotedVia = conversational ? 'turn-taking' : 'agentic';
   stats.promoted++;
   dirty = true;
   logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} promoted to conscious via ${conversational ? 'turn-taking' : 'agentic volume'} (${e.proseTurns} turns, ${e.humanGaps} human gaps, ${e.toolEvents || 0} tool events)`);
@@ -149,6 +155,17 @@ function expireOld() {
     if ((e.lastSeen || 0) < cutoff && e.tier !== 'conscious') { ledger.delete(id); dirty = true; }
     else if ((e.lastSeen || 0) < consciousCutoff) { ledger.delete(id); dirty = true; }
   }
+}
+
+// One log line the first time a session is classed agent (and again only if
+// the rule changes), so an operator can see why their session is being held.
+function noteKind(e, sessionId, result) {
+  if (e && result.kind === 'agent' && e.kindLogged !== result.why) {
+    e.kindLogged = result.why;
+    dirty = true;
+    logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} is an agent session (${result.why}): its insights are held`);
+  }
+  return result;
 }
 
 function cwdRuleTier(cwd) {
@@ -313,6 +330,38 @@ const keeper = {
     }
   },
 
+  /**
+   * The gate for POST /undertow/query. A call from the undertow_query MCP tool
+   * (via 'mcp') is a deliberate request, not a person's prompt: it earns no
+   * turn-taking credit and no habituation, creates no ledger entry, and is
+   * answered whatever the session's tier (unless that tier is 'off').
+   */
+  gateQuery(sessionId, cwd, explicitTier, promptText, via) {
+    if (via !== 'mcp') return keeper.recordPrompt(sessionId, cwd, explicitTier, promptText);
+    const off = config.enabled && ledger.get(sessionId)?.tier === 'off';
+    return { tier: off ? 'off' : 'conscious', promoted: false, habituated: false, reason: null };
+  },
+
+  /**
+   * Note that a real hook payload was seen for a session the ledger already
+   * has (the payload of a Claude Code hook carries hook_event_name). Release
+   * of a held neuron needs this: an entry made by a bare POST does not qualify.
+   */
+  noteHook(sessionId, hookEventName) {
+    if (!config.enabled || !HOOK_EVENTS.has(hookEventName)) return;
+    const e = ledger.get(sessionId);
+    if (!e) return;
+    e.hookEvents = e.hookEvents || {};
+    if (!e.hookEvents[hookEventName]) { e.hookEvents[hookEventName] = now(); dirty = true; }
+  },
+
+  /** True when the session's ledger entry has seen real hook traffic (or the Keeper is disabled). */
+  fromHooks(sessionId) {
+    if (!config.enabled) return true;
+    const e = ledger.get(sessionId);
+    return !!(e && e.hookEvents && Object.keys(e.hookEvents).length);
+  },
+
   /** Remember that a session is an agent session (sticky; survives a roster outage). */
   markAgent(sessionId, label) {
     const e = getEntry(sessionId, null, null);
@@ -342,6 +391,7 @@ const keeper = {
    * did not answer). Waits at most the roster timeout.
    */
   async askRoster(sessionId, fetchImpl) {
+    if (!config.enabled) return 'none';
     if (ledger.get(sessionId)?.agentFlag) return 'flagged';
     if (!(config.agentRosters || []).length) return 'none';
     const found = await lookupAgent(sessionId, { urls: config.agentRosters, kinds: config.agentRosterKinds, ...(fetchImpl ? { fetchImpl } : {}) });
@@ -382,14 +432,64 @@ const keeper = {
     return { write: false, why: reason };
   },
 
-  /** Whether Dreamer may write insights from an agent session (config agentInsights). */
+  /** True when an agent session is to be summarized like a person's (config agentInsights); false sends it through the held tier. */
   agentInsightsEnabled() { return config.agentInsights === true; },
 
-  /** Count one summarized agent turn and what was withheld from it. */
-  noteAgentTurn({ insights = 0, updates = 0 } = {}) {
-    stats.agentTurnsSummarized++;
-    stats.agentInsightsNotWritten += insights;
-    stats.agentUpdatesNotApplied += updates;
+  /**
+   * Who is on the other end of a session: 'agent' or 'human', and why.
+   * Agent sessions keep their flashes; what Dreamer writes from them is held
+   * apart (see docs/KEEPER.md, "Agent sessions"). It is a declared fact, never
+   * inferred from behaviour. In order:
+   *   1. declared with setKind (POST /undertow/keeper {kind}); except that a
+   *      session a roster listed stays an agent even when declared human
+   *   2. flagged as an agent: a launcher's roster listed its id (markAgent)
+   *   3. cwd matches one of config.agentCwdPatterns
+   * (2 and 3 are isAgentSession. The rosters are asked by resolveAgent, which
+   * is async: call it first wherever the answer matters.)
+   * Anything else is human, which is the behaviour without this feature.
+   * The first time a session is classed agent, one log line says by which rule.
+   */
+  sessionKind(sessionId, cwd) {
+    if (!config.enabled) return { kind: 'human', why: 'keeper disabled' };
+    const e = ledger.get(sessionId);
+    // A launcher's roster is a fact: it beats a declaration of human.
+    if (e && e.agentFlag && e.declaredKind === 'human') return noteKind(e, sessionId, { kind: 'agent', why: `flagged (${e.agentFlag})` });
+    // So is the directory list: a session working in a listed directory is an
+    // agent session whatever an (old) declaration of human says.
+    const a = keeper.isAgentSession(sessionId, cwd);
+    if (a.agent && e?.declaredKind === 'human') return noteKind(e, sessionId, { kind: 'agent', why: a.why });
+    if (e && VALID_KINDS.has(e.declaredKind)) return noteKind(e, sessionId, { kind: e.declaredKind, why: 'declared' });
+    if (a.agent) return noteKind(e, sessionId, { kind: 'agent', why: a.why });
+    return { kind: 'human', why: 'default' };
+  },
+
+  /** True when the Keeper has a ledger entry for this session (or is disabled). */
+  knows(sessionId) {
+    return !config.enabled || ledger.has(sessionId);
+  },
+
+  /**
+   * Declare a session human, after asking the rosters: refused when a roster
+   * lists the session (it is an agent) or did not answer (it cannot be told).
+   * Returns { ok, reason }.
+   */
+  async declareHuman(sessionId, fetchImpl, cwd) {
+    const listed = keeper.isAgentSession(sessionId, cwd);
+    if (listed.agent) return { ok: false, reason: `this is an agent session (${listed.why}): it cannot be declared human` };
+    const roster = await keeper.askRoster(sessionId, fetchImpl);
+    if (roster === 'agent' || roster === 'flagged') return { ok: false, reason: 'a launcher roster lists this session: it is an agent session' };
+    if (roster === 'unknown') return { ok: false, reason: 'a launcher roster did not answer, so this session cannot be confirmed as human: try again' };
+    return { ok: keeper.setKind(sessionId, 'human'), reason: null };
+  },
+
+  /** Manual declaration of who a session is: 'agent' | 'human', or null to clear. (For 'human' over HTTP use declareHuman.) */
+  setKind(sessionId, kind) {
+    if (kind !== null && !VALID_KINDS.has(kind)) return false;
+    const e = getEntry(sessionId, null, null);
+    if (kind === null) delete e.declaredKind; else e.declaredKind = kind;
+    dirty = true;
+    persist();
+    return true;
   },
 
   /** Manual tier override (POST /undertow/keeper). */
@@ -406,11 +506,18 @@ const keeper = {
   snapshot() {
     const byTier = {};
     const agentSessions = {};
+    // Who each recent session is, and why (newest first; ids shortened).
+    const byKind = { agent: 0, human: 0 };
+    const sessions = [];
     for (const [id, e] of ledger) {
       byTier[e.tier] = (byTier[e.tier] || 0) + 1;
       if (e.agentFlag) agentSessions[id] = e.agentFlag;
+      const k = keeper.sessionKind(id);
+      byKind[k.kind] = (byKind[k.kind] || 0) + 1;
+      sessions.push({ session: String(id).slice(0, 8), tier: e.tier, kind: k.kind, why: k.why, cwd: e.cwd || null, lastSeen: e.lastSeen || 0 });
     }
-    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, agentSessions, ...stats, config };
+    sessions.sort((a, b) => b.lastSeen - a.lastSeen);
+    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, byKind, agentSessions, ...stats, sessions: sessions.slice(0, 50), config };
   },
 };
 

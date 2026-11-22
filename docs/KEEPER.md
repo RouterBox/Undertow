@@ -1,6 +1,6 @@
 # The Keeper — Session Attachment & Memory Formation Gating
 
-**Status:** designed 2026-08-30; core built 2026-08-31 (`service/daemons/keeper.js` + server gating). Live behavior verified: one-shot sessions fast-pathed, `agentbox-worktrees` cwd rule → drone, human-cadence session promoted to conscious on prompt 3. Ledger persists to `service/keeper-ledger.json`; status at `GET /undertow/keeper`, manual override via `POST /undertow/keeper {session_id, tier}`. Observer writes quarantine via `namespace: 'quarantine'` (excluded from all recall paths). NOT yet done: retro-attach on promotion (Wonder catches up on the next Stop instead), and the machine-wide hooks remain **disabled** in `~/.claude/settings.json` — re-enabling them (from `settings.backupHooks.json`) is the deliberate final switch now that the Keeper makes it safe.
+**Status:** designed 2026-08-30; core built 2026-08-31 (`service/daemons/keeper.js` + server gating). Live behavior verified: one-shot sessions fast-pathed, `agentbox-worktrees` cwd rule → drone, human-cadence session promoted to conscious on prompt 3. Ledger persists to `service/keeper-ledger.json`; status at `GET /undertow/keeper`, manual override via `POST /undertow/keeper {session_id, tier}`. Observer writes quarantine via `namespace: 'quarantine'` (excluded from all recall paths). Agent sessions (built 2026-11-22, see "Agent sessions: held insights" below): Dreamer writes only durable kinds from them, into the same quarantine namespace, released on use. NOT yet done: retro-attach on promotion (Wonder catches up on the next Stop instead), and the machine-wide hooks remain **disabled** in `~/.claude/settings.json` — re-enabling them (from `settings.backupHooks.json`) is the deliberate final switch now that the Keeper makes it safe.
 
 ## The problem, measured
 
@@ -127,7 +127,9 @@ Independent of tiering, the write path gets a constitutional rule: **only
 `conscious` sessions form live memories directly.**
 
 - Every neuron records `origin_session`, `origin_tier` (feeds the planned
-  Source/`DERIVED_FROM` provenance model).
+  Source/`DERIVED_FROM` provenance model). *Built so far:* the insights Dreamer
+  writes record `origin_session` and `origin_kind` (`agent` or `human`);
+  Gobble's neurons do not yet.
 - Writes from `observer`/`drone` sessions land in **quarantine** — a namespace
   (or `tier: T4_quarantine`) that is excluded from flash recall. Quarantined
   neurons that later prove useful (pursued via voluntary queries, or promoted by
@@ -162,6 +164,215 @@ only Wonder's pre-warm, because task notifications often carry real work that
 Dreamer should still process. The flag is per session id and in memory only, so
 parallel turns in one session share it (last prompt wins).
 
+### 5. Agent sessions: held insights
+
+Added 2026-11-22 after an audit of 53 insights Dreamer wrote in one day: all 53
+came from agent sessions (long-running agents promoted to `conscious` by tool
+volume), none from a person. About half were status or chatter, ten were
+already false within a day, two credited the wrong actor, and one of the 53 was
+ever flashed. Tiers decide whether a session is attended to at all; this
+mechanism decides what a *conscious* session may write when the one on the
+other end is an agent.
+
+**Who is an agent session** (`keeper.sessionKind`, first match wins). It is a
+fact someone states, never inferred from how the session behaves: three varied
+prompts a few seconds apart look like a conversation whoever sends them.
+
+1. **Declared:** `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
+   (or `"human"`; `null` clears it). Declaring `human` beats neither the
+   directory list nor a roster: it is refused (HTTP 409, with the reason) when
+   the session's cwd is in `agentCwdPatterns`, when a roster lists the session,
+   or when a roster does not answer; and a session that is in a listed
+   directory or on a roster stays an agent whatever an earlier declaration
+   said. So an agent cannot declare itself human. The cost: a person who works
+   in a listed directory is treated as an agent there (their insights are held
+   under the durable-kinds rule) until the directory is taken off the list.
+2. **A launcher's roster lists the session id.** A launcher that starts agent
+   sessions publishes a URL returning JSON with the sessions it runs:
+   `{"contexts": [...]}`, `{"sessions": [...]}` or a bare array, each entry
+   with a string `sessionId` (or `session_id`) and optionally `name` and
+   `kind`. An entry that has a `kind` counts only when it is one of
+   `agentRosterKinds`. The Keeper asks at Stop, after the hook response has
+   been sent, and before deciding a release; each roster gets 1.5 seconds and
+   the combined answer is cached for 60 (5 when a roster did not answer). A
+   hit is remembered in the ledger (`keeper.markAgent` sets `agentFlag`), so a
+   later roster outage does not un-flag the session. A roster that does not
+   answer keeps counting with the last list it gave, so a session it listed a
+   minute ago is still an agent while the launcher restarts.
+3. **Its cwd contains an entry of `agentCwdPatterns`** (case-insensitive
+   substrings). This is for an agent that is on no roster.
+
+**When a roster does not answer** and the session is on its last good list
+neither, nobody can say who the session is, and it may be a person's. Its turn
+is then **held as unknown**: summarized by the ordinary prompt, and
+**everything it offers is written to the held tier, whatever its kind**, with
+`origin_kind: 'unknown'` and no `durable_kind`. The durable-kinds rule and the
+agent prompt below apply only to a session known to be an agent. A held insight
+can be released; one written live cannot be taken back. **Nothing such a turn
+offers is dropped, and nothing of it goes live:**
+
+- An **update to an existing neuron** is held as a carrier neuron named
+  `Update: <target> (<uid8>)`, with `held_update_of` naming the neuron it
+  would update. The live neuron is not touched. Releasing the carrier applies
+  it as the usual supersession of the live target and removes the carrier; if
+  the target no longer exists, the carrier is released as an ordinary neuron.
+  `GET /undertow/held` marks these with `update_of`.
+- The **connections** an insight offered are kept as data on the held neuron
+  (`held_connections`). On release the edges are made to the targets that
+  exist in the live graph, and the release answer says how many
+  (`connections_created`). Spider links the neuron as well on its next run.
+
+The session is not flagged, so its next turn asks again, and a session declared
+`human` is not affected. With no roster configured at all, nothing is unknown:
+declaration and the directory list decide.
+
+Everything else is a human session and behaves exactly as before. A person's
+own session is on no roster, so they can work in any directory without being
+treated as an agent, unless that directory is listed.
+
+**Config** (`daemons.keeper` in `service/daemon-config.json`; read at service
+start, so a change needs a restart):
+
+```json
+{
+  "agentRosters": ["http://127.0.0.1:8080/sessions"],
+  "agentRosterKinds": ["spawned"],
+  "agentCwdPatterns": [],
+  "agentInsights": false,
+  "agentIngest": false
+}
+```
+
+The lists ship empty: **a deployment that runs agents must configure a roster,
+list a directory, or declare the sessions, or every session is treated as
+human.** `agentInsights` is the off switch for this whole mechanism: `false`
+(the default) sends what an agent session writes through the held tier
+described below; `true` summarizes an agent session like a person's, as
+before this mechanism existed.
+
+**Known gap.** A session that has not yet registered with its launcher is not
+on the roster for its first moments; a turn that ends in that window, while
+the roster answers, is summarized as a person's would be.
+
+A call from the `undertow_query` MCP tool is a deliberate request, not a
+person prompting: the Keeper does not count it as a prompt (no turn-taking
+credit, no habituation, no ledger entry), and it is answered whatever the
+session's tier, unless that tier is `off`.
+
+**Seeing it.** The service logs one line when a roster flags a session, and
+one the first time a session is classed agent, saying by which rule.
+`GET /undertow/keeper` lists flagged sessions under `agentSessions`, recent
+sessions with their `kind` and `why`, and a `held` block of counters since
+the last restart: agent turns summarized, turns where the model offered no
+insight, insights offered, dropped for no durable kind, skipped because the
+name was taken, written to the held tier, turns held as unknown with the
+insights and the updates held on those turns, released, and releases refused.
+
+**What does not change for an agent session:** its tier, its flashes, pursuit
+detection and train of thought.
+
+**Gobble writes nothing from an agent session.** A tool event carries whatever
+the agent read: a file, a web page, a message, a notification. Turned into a
+neuron, that text can later be flashed into any other session. So a
+PostToolUse ingest from an agent session is dropped before Gobble sees it, at
+the conscious tier and at the observer tier alike, and so is one from a
+session a configured roster could not answer for: a lost tool-output episode
+costs nothing, and a wrongly kept one cannot be taken back. With no roster
+configured and no cwd match, Gobble behaves as before. `agentIngest: true`
+turns this off. The explicit ingest endpoints (`/undertow/external-ingest`,
+`/undertow/ingest-url`, `/undertow/ingest-file`) are deliberate calls and are
+not gated. `GET /undertow/keeper` counts `agentIngestsDropped` and
+`unknownIngestsDropped`; the log has one line for the first ingest dropped
+from each session.
+
+**What changes, at Stop (Dreamer):**
+
+- **The rule.** An insight is written only if it is one of three kinds and will
+  still be true and useful a month from now: a `lesson` (a root cause or a way
+  something fails, and how to recognise or avoid it), a `procedure` (how to do
+  something that will need doing again), or a `decision` (a design or policy
+  choice with its reason). Never written: the state of work (pull requests,
+  branches, commits, merges, deploys, restarts, queues, to-do lists), a review
+  verdict on one commit, forecasts and plans, anything only true "now". Also
+  never written: private content the agent read, meaning anything that quotes
+  or restates a message, text/SMS, e-mail, calendar item, voicemail or
+  notification, or personal details of a third person taken from one (names
+  with contact details, addresses, account, case or incident numbers). That
+  exclusion is stated in the prompt only; no code detects such content. The
+  prompt states this, and the code drops any insight that does not declare one
+  of the three kinds. The kind is stored as `durable_kind`.
+- **Held, not live.** The insight is written into the `quarantine` namespace,
+  which no recall path reads, so it is never flashed. It has no edges: edges do
+  not cross a namespace boundary. It has no embedding either until it is
+  released, so it cannot take a vector-search slot from a live neuron (the same
+  now holds for observer ingest into quarantine). Its name is not printed in
+  the service log.
+- **No rewrites.** An agent session does not update (supersede) existing
+  neurons; that would put its text into the live graph past the hold.
+- **No actor names.** The prompt tells the model not to say who did, said or
+  decided something. Who wrote it is recorded by the system instead:
+  `origin_session` (the session id) and `origin_kind: 'agent'` (or
+  `'unknown'` for a turn held because a roster did not answer). A person's
+  words relayed inside an agent session are therefore marked as coming from an
+  agent session, and are held like the rest.
+
+**Finding what is held.** `GET /undertow/held` (MCP: `undertow_held`) lists
+held neurons newest first: name, uid, kind, flash summary, the session that
+wrote it, when, and `name_taken` when a live neuron now has the same name.
+Read one in full with `GET /undertow/neuron?name=...&namespace=quarantine`
+(MCP: `undertow_neighbors` with `held: true`). Listing and reading are open
+to any caller. `/undertow/stats`, `/undertow/health` and the boot-time
+embedding check count the live graph only; stats reports `held` separately.
+`POST /undertow/correct` acts on the live graph unless given a `namespace`.
+
+**Release.** A held neuron joins the live graph when a **human session** uses
+it: `POST /undertow/chase {neuron, session_id}`, or `POST /undertow/feedback`
+with verdict `used` or `useful` and a `session_id`. All of these must hold:
+
+- the session id has a ledger entry that **real hook traffic** made: the
+  Keeper has seen a hook payload (one carrying `hook_event_name`) for it. An id
+  made known by a bare POST does not qualify, and an `undertow_query` MCP call
+  creates no entry at all;
+- **a launcher roster is configured, answers, and does not list the session.**
+  The rosters are asked on every release, also for a session declared human:
+  an agent a roster lists cannot release even before its first Stop, and when
+  a roster does not answer every session is refused (try again);
+- the session is not an agent by declaration or by cwd (the request's `cwd`
+  when it sends one, otherwise the one in the ledger).
+
+**With no roster configured, nothing is released through these endpoints:**
+nobody can vouch that the caller is not an agent. On such a deployment a held
+neuron reaches the live graph only when an operator changes its `namespace` in
+the database directly.
+
+A chase or verdict that fails any of this releases nothing: the response says
+the neuron is held and why (`status: "held"`), nothing is rewarded and a
+`used`/`useful` verdict is not applied. Release sets `namespace` to live,
+records `released_at` and `released_by`, embeds the neuron, and marks it
+un-spidered so Spider links it on its next run.
+
+A chase lands in one namespace: the live graph by default, or the caller's own
+(`namespace` in the request, or the session's). A client in its own namespace
+chases its own neurons; holding and release exist only on the live graph.
+
+If a live neuron has taken the name since, a chase by name means the live one.
+Release the held one by uid (`POST /undertow/chase {uid, session_id}`, the uid
+from the listing): it joins the live graph as `<name> (held <first 8 of uid>)`,
+and the response gives the new name.
+
+The limit of this: `session_id` is whatever the caller sends over loopback
+HTTP, and so is a hook payload. The checks above raise the bar: they stop an
+agent releasing its own insight through ordinary tool use, an invented id, and
+a self-declaration. They do not stop a caller on the loopback interface that
+deliberately sends a real human session's id, or that forges hook payloads for
+an id of its own while the roster does not list it.
+
+**Not built:** nothing surfaces held neurons on its own, so one that nobody
+looks up stays held; there is no expiry or sweep of old held neurons yet; two
+insights about the same event are not detected as duplicates; and train of
+thought is unchanged, so an agent session's topics and temporal edges still go
+to the live graph with no origin recorded (issues #20 and #21).
+
 ### The voluntary path is how automation participates
 
 The "we want future agents to know why we did what we did" use case is real —
@@ -177,80 +388,6 @@ shape:
 
 This is the same insight as the ingestion plan: intelligence is ~3% of raw
 substrate. Don't ambient-ingest the 97%.
-
-## Agent sessions (stopgap)
-
-A session can be conscious and still not be a person: a long-running agent
-earns promotion by tool volume and then gets the full involuntary write path.
-Measured on one deployment, every insight Dreamer wrote in a day came from
-agent sessions, and about half were status or chatter.
-
-Until the held tier lands (PR 19, which is meant to replace this section's
-skip with a hold), the rule is blunt: **Dreamer writes no insights and applies
-no updates from an agent session.** Flashes, pursuit and dismissal judging,
-explicit feedback, train of thought and the downstream daemons are unchanged
-for those sessions.
-
-**Gobble writes nothing from an agent session either.** A tool event carries
-whatever the agent read: a file, a web page, a message, a notification. Turned
-into a neuron, that text can later be flashed into any other session. So a
-PostToolUse ingest from an agent session is dropped before Gobble sees it, at
-the conscious tier and at the observer tier alike. For Gobble a session that a
-configured roster could not answer for is treated as an agent too: a lost
-tool-output episode costs nothing, and a wrongly kept one cannot be taken
-back. With no roster configured and no cwd match, Gobble behaves as before.
-The explicit ingest endpoints (`/undertow/external-ingest`,
-`/undertow/ingest-url`, `/undertow/ingest-file`) are deliberate calls and are
-not gated by this.
-
-**Who is an agent session.** Never inferred from behaviour. Either:
-
-- **A launcher's roster lists the session id.** A launcher that starts agent
-  sessions publishes a URL returning JSON with the sessions it runs:
-  `{"contexts": [...]}`, `{"sessions": [...]}` or a bare array, each entry
-  with a string `sessionId` (or `session_id`) and optionally `name` and
-  `kind`. An entry that has a `kind` counts only when it is one of
-  `agentRosterKinds`. The Keeper asks at Stop, after the hook response has been
-  sent; each roster gets 1.5 seconds and the combined answer is cached for 60.
-  A hit is remembered in the ledger, so a later roster outage does not un-flag
-  the session.
-- **Its cwd contains an entry of `agentCwdPatterns`** (case-insensitive). This
-  is for an agent that is on no roster, and it is the only test left when a
-  roster is not configured or does not answer.
-
-A person's own session is on no roster, so they can work in any directory
-without being treated as an agent, unless that directory is listed.
-
-**Config** (`daemons.keeper` in `service/daemon-config.json`; read at service
-start):
-
-```json
-{
-  "agentRosters": ["http://127.0.0.1:8080/sessions"],
-  "agentRosterKinds": ["spawned"],
-  "agentCwdPatterns": [],
-  "agentInsights": false,
-  "agentIngest": false
-}
-```
-
-`agentInsights: true` turns the skip off: an agent session is then summarized
-like any other. `agentIngest: true` does the same for Gobble. Both are read
-at service start, so changing one needs a restart. Everything defaults to off
-or empty, so a deployment that sets nothing behaves as before.
-
-**What you can see.** `GET /undertow/keeper` lists flagged sessions under
-`agentSessions` and counts `agentTurnsSummarized`, `agentInsightsNotWritten`
-and `agentUpdatesNotApplied` since the service started, and for Gobble
-`agentIngestsDropped` and `unknownIngestsDropped`. The service log has one
-line when a session is flagged, one per turn where something was withheld
-(counts only), and one for the first ingest dropped from each session.
-
-**Known gap.** A session that has not yet registered with its launcher is not
-on the roster for its first moments; a turn that ends in that window is
-summarized as a person's would be, and a tool event in that window is
-ingested. At Stop a roster that does not answer still leaves a session not yet
-flagged summarized as a person's; only Gobble treats that case as an agent.
 
 ## Economics of the fast path
 

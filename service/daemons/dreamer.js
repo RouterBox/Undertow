@@ -10,6 +10,7 @@ import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
 import { gateRun } from '../downstream-gate.js';
 import { recordPursuitDay } from '../pursuit-day.js';
+import { HELD_NAMESPACE, durableKind, nodeTypeForKind, countHeld, heldUpdateName, packConnections } from '../held.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -51,6 +52,53 @@ Return JSON:
 }
 
 Empty arrays are the right answer most of the time. Zero insights, empty train, zero updates = a routine turn correctly assessed.`;
+
+// The summarizer for an agent session (Keeper: sessionKind 'agent'). Same train
+// of thought and pursuit detection; a much narrower rule for what may be kept,
+// no updates to existing neurons, no connections, and no actor names.
+const AGENT_SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer for an AUTOMATED AGENT session: no person is typing, an agent is working through tasks. Almost nothing from such a session belongs in long-term memory.
+
+WHAT MAY BE KEPT - only knowledge that will still be true and useful a month from now, of exactly three kinds:
+- "lesson": a root cause, or a way something fails, and how to recognise or avoid it.
+- "procedure": how to do something that will need doing again, with the steps or the command.
+- "decision": a design or policy choice together with its reason.
+
+NEVER KEEP:
+- The state of work: pull requests, branches, commits, merges, deploys, restarts, queues, to-do lists, who is waiting on whom, what comes next.
+- A review verdict on one commit or one pull request.
+- Forecasts, plans, intentions, or anything that is only true "today", "now", "currently" or "pending".
+- Counts and measurements that will be different next week, unless they are the evidence inside a lesson.
+- Tool usage, git operations, file reads, hook events, status confirmations, conversation flow, or anything that is just "X happened".
+- Private content the agent read: anything that quotes or restates the content of a message, text/SMS, e-mail, calendar item, voicemail or notification, and personal details of a third person taken from one (names with contact details, addresses, account, case or incident numbers). A lesson learned while handling such content may be kept only if it can be stated without any of it.
+If you are not sure it will still be true in a month, do not keep it. Most turns produce ZERO insights. That is correct and expected.
+
+ATTRIBUTION:
+- Do not say who did, said, found or decided something: no agent names, no "the user", no "the operator". State the knowledge itself. The system records which session wrote it.
+
+QUALITY:
+- Only create an insight if you can write a meaningful body with 2-5 sentences of real content.
+
+TRAIN OF THOUGHT:
+- Use CONCEPTUAL topic names, not action labels.
+- If the turn was routine (debugging, file edits, small fixes), return an EMPTY train.
+
+PURSUIT DETECTION:
+- "pursued" = the agent's response clearly referenced, built on, or asked about the flash content
+- "dismissed" = the agent ignored the flash entirely
+- If the agent used information from the flash without quoting it, that's still "pursued"
+
+Return JSON:
+{
+  "insights": [
+    {"name": "2-5 word label", "kind": "lesson|procedure|decision", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "event_date": "YYYY-MM-DD only when the remembered event has a clear date; omit otherwise"}
+  ],
+  "train_of_thought": ["conceptual topic 1", "conceptual topic 2"],
+  "flash_results": [
+    {"flash_text": "...", "status": "pursued" | "dismissed"}
+  ]
+}
+
+Empty arrays are the right answer most of the time.`;
 
 const SESSION_START_SYSTEM_PROMPT = `You are Undertow. A new session is starting. Given the working directory and the T1 index neurons from the memory graph, select the most relevant memories for this session context.
 
@@ -135,7 +183,7 @@ function connectionTarget(conn) {
   return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
-async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, withholdInsights = false, noteAgentTurn = null }) {
+async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, agentSession = false, holdUnknown = false }) {
   const { session_id, transcript_path, cwd } = req_body;
 
   // Namespace isolation: writes and reinforcement stay inside the session's
@@ -169,7 +217,7 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   const SUMMARIZE_MODEL = resolveModel('summarize');
   let parsed;
   try {
-  const result = await callAnthropic(SUMMARIZE_MODEL, SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
+  const result = await callAnthropic(SUMMARIZE_MODEL, agentSession ? AGENT_SUMMARIZE_SYSTEM_PROMPT : SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
 ${transcript}
 
 Flashes that were injected this turn:
@@ -204,21 +252,43 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     for (const entry of evaluated) entry.judged = true;
   }
 
-  // An agent session with agent insights off (Keeper config agentInsights):
-  // nothing it says becomes a neuron or rewrites one. Judging, feedback, train
-  // of thought and the downstream daemons below run as for any session.
-  if (withholdInsights) {
-    const insights = Array.isArray(parsed.insights) ? parsed.insights.length : 0;
-    const updates = Array.isArray(parsed.updates) ? parsed.updates.length : 0;
-    if (noteAgentTurn) noteAgentTurn({ insights, updates });
-    if (insights || updates) log('summarize', 'info', `agent session: ${insights} insight(s) not written, ${updates} update(s) not applied`);
-    parsed.insights = [];
-    parsed.updates = [];
-  }
-
   // Process updates to existing neurons — supersession, not overwrite:
   // the old version is archived and linked via SUPERSEDES.
-  if (parsed.updates?.length) {
+  // (An agent session rewrites nothing: an update would put its text straight
+  // into the live graph, past the held tier.)
+  // holdAll: a turn of unknown origin in the live graph. Nothing it offers is
+  // dropped and nothing goes live: insights of every kind are held, and an
+  // update is held too, as a carrier neuron that names its target and is
+  // applied as the usual supersession when a person releases it (held.js).
+  // A session in its own namespace is already apart.
+  const holdAll = holdUnknown && !agentSession && !ns;
+  if (holdAll && parsed.updates?.length) {
+    for (const upd of parsed.updates) {
+      if (!upd?.existing_name) continue;
+      const uid = randomUUID();
+      await runCypher(`
+          CREATE (n:Neuron {
+            uid: $uid, name: $name, node_type: 'fact', tier: 'T2_working',
+            flash_summary: $flash, body: $body,
+            source: 'conversation', decay_score: 50, base_score: 50,
+            times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
+            created_at: datetime(), last_surfaced: datetime(),
+            namespace: $ns, origin_session: $originSession, origin_kind: 'unknown',
+            held_update_of: $target, held_update_reason: $reason, held_update_event_date: $eventDate
+          })
+        `, {
+        uid, name: heldUpdateName(upd.existing_name, uid), target: upd.existing_name,
+        flash: upd.flash_summary || '', body: upd.body || '', ns: HELD_NAMESPACE,
+        originSession: session_id || null,
+        reason: String(upd.reason || 'updated at turn summarize').slice(0, 300),
+        eventDate: typeof upd.event_date === 'string' ? upd.event_date : null
+      }).then(() => {
+        countHeld('heldWritten'); countHeld('heldUpdates');
+        log('summarize', 'info', `held update ${String(uid).slice(0, 8)}`);
+      }).catch(e => log('error', 'warn', e.message));
+    }
+  }
+  if (!agentSession && !holdAll && parsed.updates?.length) {
     for (const upd of parsed.updates) {
       const superseded = await supersedeNeuron({
         runCypher, callAnthropic, randomUUID, log,
@@ -231,19 +301,41 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         log('summarize', 'info', `SUPERSEDED: ${upd.existing_name}`, {
           detail: `reason: ${upd.reason || 'not specified'}`
         });
-        embedNeuron(upd.existing_name, upd.flash_summary || '').catch(e => log('error', 'warn', e.message));
+        embedNeuron(upd.existing_name, upd.flash_summary || '', ns).catch(e => log('error', 'warn', e.message));
       }
     }
   }
 
-  // Create insight neurons
+  // Create insight neurons. From an agent session only a lesson, procedure or
+  // decision is written, and it is held: it goes into the quarantine namespace,
+  // which no recall path reads, until a chase or a used/useful verdict releases
+  // it (held.js). A session that declared its own namespace is already apart
+  // from the live graph, so its insights stay in that namespace.
+  const held = (agentSession && !ns) || holdAll;
+  const insightNs = held ? HELD_NAMESPACE : ns;
+  if (agentSession) {
+    // Counted, not only logged: a turn where the model offered nothing is
+    // otherwise invisible (GET /undertow/keeper shows these).
+    countHeld('agentTurns');
+    countHeld('insightsOffered', parsed.insights?.length || 0);
+    if (!parsed.insights?.length) countHeld('zeroInsightTurns');
+  }
   if (parsed.insights?.length) {
     for (const insight of parsed.insights) {
+      const kind = agentSession ? durableKind(insight) : null;
+      if (agentSession && !kind) {
+        countHeld('droppedNoKind');
+        log('summarize', 'info', 'agent session: insight not written, no durable kind', { detail: `kind: ${insight?.kind ?? 'none'}` });
+        continue;
+      }
+      // A held insight must not take a name a live neuron has, or it could never be released.
       const existing = await runCypher(
-        `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} RETURN n.name LIMIT 1`,
-        { name: insight.name, ns }
+        `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')}${held ? ' OR n.namespace = $held' : ''} RETURN n.name LIMIT 1`,
+        held ? { name: insight.name, ns, held: HELD_NAMESPACE } : { name: insight.name, ns }
       );
+      if (existing.length > 0 && agentSession) countHeld('skippedNameTaken');
       if (existing.length === 0) {
+        const uid = randomUUID();
         const eventDate = typeof insight.event_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(insight.event_date) ? insight.event_date : null;
         await runCypher(`
             CREATE (n:Neuron {
@@ -253,16 +345,32 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
               created_at: datetime(), last_surfaced: datetime(),
               namespace: $ns,
+              origin_session: $originSession, origin_kind: $originKind, durable_kind: $durableKind,
               event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
             })
           `, {
-          uid: randomUUID(), name: insight.name, type: coerceNodeType(insight.node_type, 'insight'),
+          uid, name: insight.name,
+          type: agentSession ? nodeTypeForKind(kind) : coerceNodeType(insight.node_type, 'insight'),
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
-          body: insight.body || '', ns, eventDate
+          body: insight.body || '', ns: insightNs, eventDate,
+          originSession: session_id || null, originKind: agentSession ? 'agent' : (holdUnknown ? 'unknown' : 'human'), durableKind: kind
         });
+        // A held insight of unknown origin keeps the connections it offered as
+        // data: edges cannot cross into the live graph, so they are made when
+        // the neuron is released (held.js). Nothing the turn offered is lost.
+        if (holdAll) {
+          const heldConns = packConnections(insight.connections, connectionTarget, insight.name);
+          if (heldConns) {
+            await runCypher(
+              `MATCH (n:Neuron {uid: $uid}) WHERE n.namespace = $held SET n.held_connections = $conns`,
+              { uid, held: HELD_NAMESPACE, conns: heldConns }
+            ).catch(e => log('error', 'warn', e.message));
+          }
+        }
 
-        // Create connections for insights
-        if (insight.connections?.length) {
+        // Create connections for insights (never for a held one: a held neuron
+        // has no edges into the live graph; Spider links it once released)
+        if (!agentSession && !held && insight.connections?.length) {
           for (const conn of insight.connections) {
             // No usable target: nothing to link. Sending the query anyway failed in
             // the driver ("Expected parameter(s): tgt") and logged a warning per edge.
@@ -291,8 +399,16 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
             }
           }
         }
-        log('summarize', 'info', `insight: ${insight.name}`);
-        embedNeuron(insight.name, insight.flash_summary).catch(e => log('error', 'warn', e.message));
+        // A held insight is logged by kind and uid, never by name, and gets no
+        // embedding until it is released: it must not take a vector-search slot.
+        if (held) {
+          countHeld('heldWritten');
+          if (holdAll) countHeld('heldOnUnknownInsights');
+          log('summarize', 'info', `held insight (${kind || 'unknown origin'}) ${String(uid).slice(0, 8)}`);
+        } else {
+          log('summarize', 'info', `insight: ${insight.name}`);
+          embedNeuron(insight.name, insight.flash_summary, insightNs).catch(e => log('error', 'warn', e.message));
+        }
       }
     }
   }
@@ -651,13 +767,31 @@ async function summarizeForTurn(deps, keeper) {
     deps.log('keeper', 'info', `habituated turn (repeat) - skipped (${String(sid).slice(0, 8)})`);
     return { skipped: true };
   }
-  // An agent session (on a launcher's roster, or by cwd) writes no insights
-  // unless the Keeper's agentInsights is on. The Stop response is already sent.
-  const agent = await keeper.resolveAgent(sid, deps.req_body.cwd);
-  const withholdInsights = agent.agent && !keeper.agentInsightsEnabled();
-  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', withholdInsights, noteAgentTurn: withholdInsights ? keeper.noteAgentTurn : null });
+  // Who is on the other end decides what Dreamer may write (see held.js). The
+  // rosters are asked first (the Stop response is already sent), so a session a
+  // launcher lists is known as an agent before it is classed. With the Keeper's
+  // agentInsights on, an agent session is summarized like a person's.
+  // When a roster did not answer and nothing else says who the session is, the
+  // session may be a person's: the turn is summarized by the ordinary prompt and
+  // EVERYTHING it offers is held, whatever its kind, marked origin 'unknown'.
+  // A held insight can be released; one written live cannot be taken back. The
+  // kind rule and the agent prompt apply only to a session known to be an agent.
+  // The session is not flagged, so the next turn asks again.
+  const roster = await keeper.askRoster(sid);
+  const who = keeper.sessionKind(sid, deps.req_body.cwd);
+  let agentSession = false;
+  let holdUnknown = false;
+  if (!keeper.agentInsightsEnabled()) {
+    if (who.kind === 'agent') agentSession = true;
+    else if (roster === 'unknown' && who.why !== 'declared') {
+      holdUnknown = true;
+      countHeld('heldOnUnknownTurns');
+      deps.log('keeper', 'info', `a launcher roster did not answer: turn of ${String(sid).slice(0, 8)} is held as unknown`);
+    }
+  }
+  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', agentSession, holdUnknown });
   return { skipped: false };
 }
 
 export { connectionTarget };
-export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
+export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };

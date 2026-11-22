@@ -1,8 +1,9 @@
 // Built-in MCP endpoint (Streamable HTTP) at /mcp.
 //
-// Exposes Undertow's HTTP API as typed MCP tools, with the same 11 tool names,
-// input schemas and result shape as the standalone undertow-mcp 1.1.0 stdio
-// server: each result is JSON text `{ http_status, ...payload }`, and isError
+// Exposes Undertow's HTTP API as typed MCP tools, with the 11 tool names,
+// input schemas and result shape of the standalone undertow-mcp 1.1.0 stdio
+// server, plus undertow_held and two optional inputs for the held tier
+// (undertow_chase uid, undertow_neighbors held): each result is JSON text `{ http_status, ...payload }`, and isError
 // is set when the underlying route returned non-2xx.
 //
 // Tools don't reach into server internals: they call a `dispatch(method, path,
@@ -24,7 +25,7 @@ import { z } from 'zod';
 export const MCP_TOOL_NAMES = Object.freeze([
   'undertow_health_check', 'undertow_query', 'undertow_chase', 'undertow_stats',
   'undertow_patterns', 'undertow_correct', 'undertow_ingest', 'undertow_spider',
-  'undertow_logs', 'undertow_neighbors', 'undertow_feedback',
+  'undertow_logs', 'undertow_neighbors', 'undertow_feedback', 'undertow_held',
 ]);
 
 /** Build a dispatch() that calls this service's own HTTP routes at baseUrl. */
@@ -70,7 +71,7 @@ function mutationsDisabled(what) {
   });
 }
 
-/** Create an McpServer with the 11 Undertow tools registered. */
+/** Create an McpServer with the Undertow tools registered. */
 export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMutations = false }) {
   const call = async (...args) => toolResult(await dispatch(...args));
   const server = new McpServer({ name: 'undertow', version });
@@ -108,7 +109,9 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
         cwd: z.string().optional().describe('Optional working directory, used to auto-detect project context.'),
       },
     },
-    async ({ session_id, prompt, cwd }) => call('POST', '/undertow/query', { body: { session_id, prompt, cwd } })
+    // via: 'mcp' tells the service this is a tool call, not a person's prompt:
+    // the Keeper gives it no turn-taking credit.
+    async ({ session_id, prompt, cwd }) => call('POST', '/undertow/query', { body: { session_id, prompt, cwd, via: 'mcp' } })
   );
 
   server.registerTool(
@@ -119,13 +122,22 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
         'Pursue a specific neuron deeper: expands connections/synapses around it and records this as ' +
         "the strongest positive pursuit signal (rewards the neuron's base_score by +15 and strengthens " +
         'its outbound synapses more aggressively than a normal pursuit). Use this as a follow-up when a ' +
-        'neuron surfaced by a flash or query looks important and you want to explore what it connects to.',
+        'neuron surfaced by a flash or query looks important and you want to explore what it connects to. ' +
+        'A held neuron (see undertow_held) is released to the live graph only when the chase carries the ' +
+        "session_id of a human session; otherwise the response has status 'held' and nothing changes.",
       inputSchema: {
         session_id: z.string().describe('Identifier for the calling session/conversation.'),
-        neuron: z.string().describe('Exact name of the neuron to chase.'),
+        neuron: z.string().optional().describe('Exact name of the neuron to chase. Give this or uid.'),
+        uid: z
+          .string()
+          .optional()
+          .describe('uid (or its first 8+ characters) of a HELD neuron, from undertow_held. Use it when a live neuron has the same name.'),
       },
     },
-    async ({ session_id, neuron }) => call('POST', '/undertow/chase', { body: { session_id, neuron } })
+    async ({ session_id, neuron, uid }) => {
+      if (!neuron && !uid) return toolResult({ ok: false, text: 'undertow_chase needs a `neuron` name or a held `uid`.' });
+      return call('POST', '/undertow/chase', { body: { session_id, neuron, uid } });
+    }
   );
 
   server.registerTool(
@@ -292,12 +304,33 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
           .max(30)
           .optional()
           .describe('Max connected neurons to return (default 12, max 30).'),
+        held: z
+          .boolean()
+          .optional()
+          .describe('true = read a HELD neuron (one listed by undertow_held) instead of a live one.'),
       },
     },
-    async ({ name, uid, limit }) => {
+    async ({ name, uid, limit, held }) => {
       if (!name && !uid) return toolResult({ ok: false, text: 'undertow_neighbors needs a `name` or a `uid`.' });
-      return call('GET', '/undertow/neuron', { query: { name, uid, limit } });
+      return call('GET', '/undertow/neuron', { query: { name, uid, limit, ...(held ? { namespace: 'quarantine' } : {}) } });
     }
+  );
+
+  server.registerTool(
+    'undertow_held',
+    {
+      title: 'List held neurons',
+      description:
+        'Read-only list of what Undertow is holding apart from the live graph: insights written from agent ' +
+        'sessions (lessons, procedures, decisions) and observer ingest. Held neurons are never flashed. Each ' +
+        'entry has name, uid, kind, flash summary, the session that wrote it and when; name_taken means a ' +
+        'live neuron now has the same name. Read one in full with undertow_neighbors (held: true). A held ' +
+        'neuron joins the live graph only when a human session chases it or gives it a used/useful verdict.',
+      inputSchema: {
+        limit: z.number().int().positive().max(200).optional().describe('Max held neurons to return, newest first (default 50, max 200).'),
+      },
+    },
+    async ({ limit }) => call('GET', '/undertow/held', { query: { limit } })
   );
 
   server.registerTool(

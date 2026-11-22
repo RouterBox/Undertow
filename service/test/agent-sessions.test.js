@@ -1,5 +1,5 @@
 // Agent sessions: a launcher's roster (or a cwd pattern) says a session is an
-// agent, and Dreamer then writes no insights from it unless agentInsights is on.
+// agent, and what Dreamer writes from it goes through the held tier unless agentInsights is on.
 // Stubs only: no Neo4j, no Anthropic, no network (fetch is stubbed).
 
 import { test } from 'node:test';
@@ -158,21 +158,26 @@ function dreamerHarness(extra = {}) {
   return { deps, calls, logs, wrote, superseded, pursued };
 }
 
-test('dreamer: withholdInsights writes no insight and applies no update; judging and train of thought still run', async () => {
+const HELD_QUERY = (c) => /CREATE \(n:Neuron/.test(c.q) && c.p?.ns === 'quarantine';
+
+test('dreamer: from an agent session an insight with no durable kind is not written, a durable one is held, no update is applied; judging and train of thought still run', async () => {
   const h = dreamerHarness();
-  const noted = [];
-  await handleSummarize({ ...h.deps, withholdInsights: true, noteAgentTurn: (c) => noted.push(c) });
-  assert.equal(h.wrote('Gate design'), false, 'no insight neuron');
+  await handleSummarize({ ...h.deps, agentSession: true });
+  assert.equal(h.wrote('Gate design'), false, 'no durable kind: not written');
   assert.equal(h.superseded(), false, 'no query touches the neuron an update named');
   assert.equal(h.pursued(), true, 'the flash result is still applied');
   assert.equal(h.wrote('Topic one') && h.wrote('Topic two'), true, 'train of thought still runs');
-  assert.deepEqual(noted, [{ insights: 1, updates: 1 }]);
-  const line = h.logs.map(l => l[2]).find(m => /agent session:/.test(m));
-  assert.equal(line, 'agent session: 1 insight(s) not written, 1 update(s) not applied');
-  assert.equal(/Gate design|Old fact/.test(line), false, 'the log line carries counts, not names');
+
+  const d = dreamerHarness();
+  d.deps.callAnthropic = async () => ({ model: 'claude-sonnet-5', response: { content: [{ text: JSON.stringify({ insights: [{ ...INSIGHT, kind: 'lesson' }], train_of_thought: [], flash_results: [] }) }] } });
+  await handleSummarize({ ...d.deps, agentSession: true });
+  const created = d.calls.filter(c => /CREATE \(n:Neuron/.test(c.q) && c.p?.name === 'Gate design');
+  assert.equal(created.length, 1);
+  assert.equal(HELD_QUERY(created[0]), true, 'a durable insight lands in the held namespace');
+  assert.equal(created[0].p.originKind, 'agent');
 });
 
-test('dreamer: without withholdInsights the same turn writes the insight and applies the update', async () => {
+test("dreamer: from a person's session the same turn writes the insight live and applies the update", async () => {
   const h = dreamerHarness();
   await handleSummarize(h.deps);
   assert.equal(h.wrote('Gate design'), true);
@@ -180,28 +185,25 @@ test('dreamer: without withholdInsights the same turn writes the insight and app
   assert.equal(h.pursued(), true);
 });
 
-test('stop: an agent session writes no insight by default, and does when agentInsights is on', async () => {
+test("stop: an agent session goes through the held tier by default, and is summarized like a person's when agentInsights is on", async () => {
   resetRosterCache();
   initKeeper({});
   keeper.recordPrompt(DREAMER_SID, 'C:/work/other', 'conscious', `do the long task please ${RUN}`);
   keeper.markAgent(DREAMER_SID, 'worker-a');
-  const before = keeper.snapshot();
 
   const off = dreamerHarness();
   await summarizeForTurn(off.deps, keeper);
   assert.equal(off.wrote('Gate design'), false);
   assert.equal(off.superseded(), false);
   assert.equal(off.pursued(), true);
-  const after = keeper.snapshot();
-  assert.equal(after.agentTurnsSummarized - before.agentTurnsSummarized, 1);
-  assert.equal(after.agentInsightsNotWritten - before.agentInsightsNotWritten, 1);
-  assert.equal(after.agentUpdatesNotApplied - before.agentUpdatesNotApplied, 1);
+  assert.equal(off.calls.some(HELD_QUERY), false, 'the offered insight has no durable kind, so nothing is held either');
 
   initKeeper({ agentInsights: true });
   const on = dreamerHarness();
   await summarizeForTurn(on.deps, keeper);
-  assert.equal(on.wrote('Gate design'), true, 'agentInsights true restores the write');
-  assert.equal(keeper.snapshot().agentTurnsSummarized, after.agentTurnsSummarized, 'nothing withheld, nothing counted');
+  assert.equal(on.wrote('Gate design'), true, 'agentInsights true restores the live write');
+  assert.equal(on.calls.some(HELD_QUERY), false);
+  assert.equal(on.superseded(), true);
 
   // A session that is not an agent is untouched by the default.
   initKeeper({});
