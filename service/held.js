@@ -25,6 +25,8 @@ const counters = {
   skippedNameTaken: 0,    // offered, but a live or held neuron already has the name
   heldWritten: 0,         // written into the held tier
   heldOnUnknownTurns: 0,  // ...turns held because a launcher roster did not answer (the session may be a person's)
+  heldOnUnknownInsights: 0,    // ...insights of any kind held from such turns
+  unknownUpdatesNotApplied: 0, // ...updates to existing neurons such turns offered: not applied (an update cannot be held)
   released: 0,            // moved to the live graph by a human session
   releaseRefused: 0,      // release asked for and refused (no session, agent session, unknown session)
 };

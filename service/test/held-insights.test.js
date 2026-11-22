@@ -405,13 +405,13 @@ test('declaring a session human asks the roster first: refused when listed or wh
 
 // ---------- Stop: hold on unknown ----------
 
-function stopDeps(sid, cwd = 'C:/work/app') {
+function stopDeps(sid, cwd = 'C:/work/app', extra = {}) {
   const calls = [];
   const prompts = [];
   const reply = { insights: [
     { name: 'Gate needs a timeout', kind: 'lesson', flash_summary: 'A gate with no timeout blocks forever', body: 'Two sentences of body. Enough to pass.' },
     { name: 'Service restarted', node_type: 'fact', flash_summary: 'Restarted at noon', body: 'Two sentences of body. Enough to pass.' }
-  ], train_of_thought: [], flash_results: [] };
+  ], train_of_thought: [], flash_results: [], ...extra };
   return {
     calls, prompts,
     deps: {
@@ -428,23 +428,31 @@ function stopDeps(sid, cwd = 'C:/work/app') {
 }
 const createdBy = (h) => h.calls.filter(c => /CREATE \(n:Neuron/.test(c.q)).map(c => c.p);
 
-test('Stop with a roster that does not answer: the turn is held as unknown and the session is not flagged', async () => {
+test('Stop with a roster that does not answer: everything the turn offers is held as unknown, and the session is not flagged', async () => {
   const realFetch = globalThis.fetch;
   keeper.init({ daemonConfig: { ...BASE_CFG, agentRosters: ['http://roster/'] } });
   try {
     resetRosterCache();
     globalThis.fetch = rosterDown;
-    const before = heldCounters().heldOnUnknownTurns;
+    const before = heldCounters();
     const sid = id('stop-unknown');
     hookSession(sid);
-    const h = stopDeps(sid);
+    const h = stopDeps(sid, 'C:/work/app', { updates: [{ existing_name: 'Old fact', flash_summary: 'New text', body: 'Two sentences of body. Enough to pass.', reason: 'changed' }] });
     await summarizeForTurn(h.deps, keeper);
-    assert.deepEqual(h.prompts, [AGENT_SUMMARIZE_SYSTEM_PROMPT], 'the strict rule');
+    // The session may be a person's: the ordinary prompt, and no kind rule.
+    assert.deepEqual(h.prompts, [SUMMARIZE_SYSTEM_PROMPT], 'the ordinary prompt, not the agent one');
     const created = createdBy(h);
-    assert.equal(created.length, 1, 'only the durable kind');
-    assert.equal(created[0].ns, HELD_NAMESPACE);
-    assert.equal(created[0].originKind, 'unknown');
-    assert.equal(heldCounters().heldOnUnknownTurns - before, 1);
+    assert.equal(created.length, 2, 'both insights, the one with no durable kind too');
+    assert.ok(created.every(p => p.ns === HELD_NAMESPACE && p.originKind === 'unknown' && p.durableKind === null));
+    assert.deepEqual(created.map(p => p.type), ['insight', 'fact'], 'node_type as the ordinary path sets it');
+    // An update cannot be held: it is not applied, and it is counted. No edges either.
+    assert.ok(!h.calls.some(c => /Old fact/.test(JSON.stringify(c.p || {}))), 'the update never reached the graph');
+    assert.ok(!h.calls.some(c => /SYNAPSE/.test(c.q) && /CREATE/.test(c.q)), 'no edges from a held turn');
+    const after = heldCounters();
+    assert.equal(after.heldOnUnknownTurns - before.heldOnUnknownTurns, 1);
+    assert.equal(after.heldOnUnknownInsights - before.heldOnUnknownInsights, 2);
+    assert.equal(after.unknownUpdatesNotApplied - before.unknownUpdatesNotApplied, 1);
+    assert.equal(after.droppedNoKind, before.droppedNoKind, 'the kind rule did not run');
     assert.equal(keeper.isAgentSession(sid).agent, false, 'an unknown answer flags nobody');
     assert.equal(keeper.sessionKind(sid).kind, 'human');
 
@@ -469,6 +477,25 @@ test('Stop with a roster that does not answer: the turn is held as unknown and t
     resetRosterCache();
     keeper.init({ daemonConfig: BASE_CFG });
   }
+});
+
+test('Stop for a session known to be an agent: the strict prompt, and an insight with no durable kind is still dropped', async () => {
+  const sid = id('stop-known-agent');
+  hookSession(sid);
+  keeper.markAgent(sid, 'worker');
+  const before = heldCounters();
+  const h = stopDeps(sid, 'C:/work/app', { updates: [{ existing_name: 'Old fact', flash_summary: 'New text', body: 'b' }] });
+  await summarizeForTurn(h.deps, keeper);
+  assert.deepEqual(h.prompts, [AGENT_SUMMARIZE_SYSTEM_PROMPT]);
+  const created = createdBy(h);
+  assert.equal(created.length, 1, 'only the lesson');
+  assert.equal(created[0].ns, HELD_NAMESPACE);
+  assert.equal(created[0].originKind, 'agent');
+  assert.equal(created[0].durableKind, 'lesson');
+  const after = heldCounters();
+  assert.equal(after.droppedNoKind - before.droppedNoKind, 1);
+  assert.equal(after.unknownUpdatesNotApplied, before.unknownUpdatesNotApplied, 'that counter is for unknown turns only');
+  assert.equal(after.heldOnUnknownInsights, before.heldOnUnknownInsights);
 });
 
 test('Stop with no roster configured is unchanged: an undeclared, unlisted session is a person\'s', async () => {
@@ -578,7 +605,8 @@ test('what an agent session offered, dropped and had held is counted', async () 
   const d = Object.fromEntries(Object.keys(after).map(k => [k, after[k] - before[k]]));
   assert.deepEqual(d, {
     agentTurns: 2, zeroInsightTurns: 1, insightsOffered: 5, droppedNoKind: 2,
-    skippedNameTaken: 0, heldWritten: 3, heldOnUnknownTurns: 0, released: 1, releaseRefused: 0
+    skippedNameTaken: 0, heldWritten: 3, heldOnUnknownTurns: 0, heldOnUnknownInsights: 0,
+    unknownUpdatesNotApplied: 0, released: 1, releaseRefused: 0
   });
 });
 

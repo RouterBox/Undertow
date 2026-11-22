@@ -183,7 +183,7 @@ function connectionTarget(conn) {
   return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
-async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, agentSession = false, agentOrigin = 'agent' }) {
+async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, agentSession = false, holdUnknown = false }) {
   const { session_id, transcript_path, cwd } = req_body;
 
   // Namespace isolation: writes and reinforcement stay inside the session's
@@ -255,8 +255,17 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // Process updates to existing neurons — supersession, not overwrite:
   // the old version is archived and linked via SUPERSEDES.
   // (An agent session rewrites nothing: an update would put its text straight
-  // into the live graph, past the held tier.)
-  if (!agentSession && parsed.updates?.length) {
+  // into the live graph, past the held tier. The same goes for a turn held
+  // because nobody could say whose session it is: an update cannot be held, so
+  // it is not applied, and that loss is counted.)
+  // holdAll: a turn of unknown origin in the live graph. Everything it offers
+  // is held, whatever its kind; a session in its own namespace is already apart.
+  const holdAll = holdUnknown && !agentSession && !ns;
+  if (holdAll && parsed.updates?.length) {
+    countHeld('unknownUpdatesNotApplied', parsed.updates.length);
+    log('summarize', 'info', `turn of unknown origin: ${parsed.updates.length} update(s) not applied`);
+  }
+  if (!agentSession && !holdAll && parsed.updates?.length) {
     for (const upd of parsed.updates) {
       const superseded = await supersedeNeuron({
         runCypher, callAnthropic, randomUUID, log,
@@ -279,7 +288,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // which no recall path reads, until a chase or a used/useful verdict releases
   // it (held.js). A session that declared its own namespace is already apart
   // from the live graph, so its insights stay in that namespace.
-  const held = agentSession && !ns;
+  const held = (agentSession && !ns) || holdAll;
   const insightNs = held ? HELD_NAMESPACE : ns;
   if (agentSession) {
     // Counted, not only logged: a turn where the model offered nothing is
@@ -321,12 +330,12 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           type: agentSession ? nodeTypeForKind(kind) : coerceNodeType(insight.node_type, 'insight'),
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
           body: insight.body || '', ns: insightNs, eventDate,
-          originSession: session_id || null, originKind: agentSession ? agentOrigin : 'human', durableKind: kind
+          originSession: session_id || null, originKind: agentSession ? 'agent' : (holdUnknown ? 'unknown' : 'human'), durableKind: kind
         });
 
-        // Create connections for insights (never from an agent session: a held
-        // neuron has no edges into the live graph; Spider links it once released)
-        if (!agentSession && insight.connections?.length) {
+        // Create connections for insights (never for a held one: a held neuron
+        // has no edges into the live graph; Spider links it once released)
+        if (!agentSession && !held && insight.connections?.length) {
           for (const conn of insight.connections) {
             // No usable target: nothing to link. Sending the query anyway failed in
             // the driver ("Expected parameter(s): tgt") and logged a warning per edge.
@@ -359,7 +368,8 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         // embedding until it is released: it must not take a vector-search slot.
         if (held) {
           countHeld('heldWritten');
-          log('summarize', 'info', `held insight (${kind}) ${String(uid).slice(0, 8)}`);
+          if (holdAll) countHeld('heldOnUnknownInsights');
+          log('summarize', 'info', `held insight (${kind || 'unknown origin'}) ${String(uid).slice(0, 8)}`);
         } else {
           log('summarize', 'info', `insight: ${insight.name}`);
           embedNeuron(insight.name, insight.flash_summary, insightNs).catch(e => log('error', 'warn', e.message));
@@ -727,23 +737,24 @@ async function summarizeForTurn(deps, keeper) {
   // launcher lists is known as an agent before it is classed. With the Keeper's
   // agentInsights on, an agent session is summarized like a person's.
   // When a roster did not answer and nothing else says who the session is, the
-  // turn is held too, marked origin 'unknown': a held insight can be released,
-  // one written live cannot be taken back. The session is not flagged, so the
-  // next turn asks again.
+  // session may be a person's: the turn is summarized by the ordinary prompt and
+  // EVERYTHING it offers is held, whatever its kind, marked origin 'unknown'.
+  // A held insight can be released; one written live cannot be taken back. The
+  // kind rule and the agent prompt apply only to a session known to be an agent.
+  // The session is not flagged, so the next turn asks again.
   const roster = await keeper.askRoster(sid);
   const who = keeper.sessionKind(sid, deps.req_body.cwd);
   let agentSession = false;
-  let agentOrigin = 'agent';
+  let holdUnknown = false;
   if (!keeper.agentInsightsEnabled()) {
     if (who.kind === 'agent') agentSession = true;
     else if (roster === 'unknown' && who.why !== 'declared') {
-      agentSession = true;
-      agentOrigin = 'unknown';
+      holdUnknown = true;
       countHeld('heldOnUnknownTurns');
       deps.log('keeper', 'info', `a launcher roster did not answer: turn of ${String(sid).slice(0, 8)} is held as unknown`);
     }
   }
-  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', agentSession, agentOrigin });
+  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', agentSession, holdUnknown });
   return { skipped: false };
 }
 

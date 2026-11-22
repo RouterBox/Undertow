@@ -201,12 +201,18 @@ prompts a few seconds apart look like a conversation whoever sends them.
    substrings). This is for an agent that is on no roster.
 
 **When a roster does not answer** and the session is on its last good list
-neither, nobody can say who the session is. Its turn is then **held as
-unknown**: summarized by the agent rule below and written to the held tier with
-`origin_kind: 'unknown'`. A held insight can be released; one written live
-cannot be taken back. The session is not flagged, so its next turn asks again,
-and a session declared `human` is not affected. With no roster configured at
-all, nothing is unknown: declaration and the directory list decide.
+neither, nobody can say who the session is, and it may be a person's. Its turn
+is then **held as unknown**: summarized by the ordinary prompt, and
+**everything it offers is written to the held tier, whatever its kind**, with
+`origin_kind: 'unknown'` and no `durable_kind`. The durable-kinds rule and the
+agent prompt below apply only to a session known to be an agent. A held insight
+can be released; one written live cannot be taken back. Two things from such a
+turn are not kept: an **update to an existing neuron is not applied** (an update
+cannot be held, it would rewrite a live neuron) and is counted, and a held
+insight gets no connections (Spider links it once it is released). The session
+is not flagged, so its next turn asks again, and a session declared `human` is
+not affected. With no roster configured at all, nothing is unknown: declaration
+and the directory list decide.
 
 Everything else is a human session and behaves exactly as before. A person's
 own session is on no roster, so they can work in any directory without being
@@ -247,8 +253,9 @@ one the first time a session is classed agent, saying by which rule.
 sessions with their `kind` and `why`, and a `held` block of counters since
 the last restart: agent turns summarized, turns where the model offered no
 insight, insights offered, dropped for no durable kind, skipped because the
-name was taken, written to the held tier, turns held as unknown, released,
-and releases refused.
+name was taken, written to the held tier, turns held as unknown with the
+insights held and the updates not applied on those turns, released, and
+releases refused.
 
 **What does not change for an agent session:** its tier, its flashes, pursuit
 detection and train of thought.
