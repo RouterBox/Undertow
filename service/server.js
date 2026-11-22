@@ -25,6 +25,7 @@ import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/go
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
 import { sanitizeNamespace, livePredicate } from './namespaces.js';
+import { embeddingCoverage } from './embedding-coverage.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
 import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
@@ -1442,11 +1443,8 @@ const httpServer = app.listen(PORT, HOST, async () => {
       if (idx.length && dims && dims !== info.dims) {
         log('startup', 'error', `EMBEDDING DIMENSION MISMATCH: neuron_embedding index is ${dims}-dim but provider ${info.provider} (${info.model}) emits ${info.dims}-dim — vector search will silently miss everything. Run: node switch-embeddings.js`);
       }
-      const counts = await runCypher(
-        `MATCH (n:Neuron) RETURN count(n) AS total, count(n.embedding) AS embedded`
-      );
-      const total = counts[0]?.total?.toNumber?.() ?? Number(counts[0]?.total || 0);
-      const embedded = counts[0]?.embedded?.toNumber?.() ?? Number(counts[0]?.embedded || 0);
+      // Live graph only: other namespaces and archived versions are not searched by live recall.
+      const { total, embedded } = await embeddingCoverage(runCypher);
       if (total > 0 && embedded === 0) {
         log('startup', 'error', `NO EMBEDDED NEURONS: ${total} live neurons, zero have embeddings — vector search is returning nothing. Run: node backfill-embeddings.js`);
       } else if (total > 0 && (total - embedded) / total > 0.1) {
