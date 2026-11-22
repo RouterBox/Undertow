@@ -23,7 +23,7 @@ import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo, init
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
-import keeper from './daemons/keeper.js';
+import keeper, { offPlaceGuard } from './daemons/keeper.js';
 import { sanitizeNamespace, livePredicate, nsPredicate, setReservedNamespaces, reservedNamespaceGuard } from './namespaces.js';
 import { embeddingCoverage } from './embedding-coverage.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
@@ -142,6 +142,9 @@ const reservedLoaded = loadConfig()
   .then(c => setReservedNamespaces(c.reservedNamespaces))
   .catch(e => console.error(`[undertow] reservedNamespaces not loaded: ${e.message}`));
 app.use(reservedNamespaceGuard({ log: (...a) => log(...a), ready: reservedLoaded }));
+// Tier 'off' excludes a place entirely: a tool or HTTP call that names an off cwd or an
+// off session is refused here (the hook routes answer an off session themselves).
+app.use(offPlaceGuard({ log: (...a) => log(...a) }));
 
 // --- Undertow Toggle & Config ---
 // Persist toggle state to survive restarts

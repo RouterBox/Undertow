@@ -64,6 +64,29 @@ Every session gets a tier in a lightweight **session ledger** kept by the servic
 | `drone` | Ordinary automation (Producer ticks, bolts, fan-out subagents) | ❌ | ❌ | ✅ read; write → quarantine |
 | `off` | Explicitly excluded | ❌ | ❌ | ❌ |
 
+**`off` excludes a place entirely, hooks and MCP tools alike.** A cwd rule with
+tier `off` (`cwdRules: [{ "pattern": "some-folder", "tier": "off" }]`) is how a
+deployment keeps a whole folder out of Undertow: a second person's workspace, a
+client project. The five hook routes return nothing for such a session, and one
+guard ahead of every other route (`offPlaceGuard` in `keeper.js`) answers 403
+when a request names an off folder (`cwd`) or an off session (`session_id`):
+query, neighbors, stats, patterns, health, logs, the held list, chase, feedback,
+correct, ingest. Every MCP tool call carries `via: "mcp"` and, when the client
+declares it, the folder its session runs in. The built-in `/mcp` endpoint runs
+inside the service and cannot see that folder itself, so the client sends it in
+the `X-Undertow-Cwd` request header; a stdio MCP server started in the session's
+folder sends its own working directory as `caller_cwd` on every call: a field
+only this guard reads, so a session in an ordinary folder sees no difference
+(`cwd` itself feeds project scoring and the query cache). Refusals
+are logged at most once a minute per route, without the folder's path.
+
+**Limit.** The `cwd` is whatever the caller says it is. This stops a session in
+an excluded folder from reading memory through the tools it is given. It does
+not stop a process that calls the HTTP API directly and leaves the `cwd` out,
+and an MCP client that declares no folder is not recognised at all. The real
+separation for a different person is not to give their sessions the MCP server,
+or to run a separate Undertow instance for them.
+
 **Tier assignment, in priority order:**
 
 1. **Explicit contract** — `undertow_tier` in the hook payload, declared as

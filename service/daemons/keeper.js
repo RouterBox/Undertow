@@ -315,6 +315,12 @@ const keeper = {
 
   isConscious(sessionId) { return keeper.tierOf(sessionId) === 'conscious'; },
 
+  /** True when a cwd rule puts this folder at tier 'off' (the place is excluded from Undertow). */
+  cwdIsOff(cwd) { return config.enabled && cwdRuleTier(cwd) === 'off'; },
+
+  /** True when the ledger knows this session and its tier is 'off'. Never creates an entry. */
+  sessionIsOff(sessionId) { return config.enabled && !!sessionId && ledger.get(sessionId)?.tier === 'off'; },
+
   /** Record a fast-pathed (rejected) event for the stats panel. */
   countFastPath(sessionId) {
     stats.fastPathed++;
@@ -520,5 +526,43 @@ const keeper = {
     return { enabled: config.enabled, ledgerSize: ledger.size, byTier, byKind, agentSessions, ...stats, sessions: sessions.slice(0, 50), config };
   },
 };
+
+// Hook routes answer an off session with an empty result themselves.
+const OFF_GUARD_HOOK_ROUTES = ['/undertow/query', '/undertow/session-start', '/undertow/ingest', '/undertow/summarize', '/undertow/rehydrate'];
+
+/**
+ * Express middleware: tier 'off' excludes a place from Undertow entirely, the
+ * MCP tools and the plain HTTP routes as well as the hooks. A request is refused
+ * when the cwd it names (body or query) matches a cwd rule with tier 'off', or
+ * the session_id it names belongs to a ledger entry at tier 'off'. Hook calls
+ * are left to their routes, which already return nothing for an off session; a
+ * tool call to a hook route (via 'mcp') is refused here like any other.
+ * Mount after the JSON body parser. The cwd is whatever the caller sends: this
+ * stops a session in an excluded folder from reading memory through the tools
+ * it is given, not a process that calls the HTTP API and leaves the cwd out.
+ */
+export function offPlaceGuard({ log = () => {}, now = Date.now } = {}) {
+  const lastLogged = new Map(); // route -> time of the last refusal logged (one line a minute per route)
+  return function guard(req, res, next) {
+    // A tool call says so with via 'mcp', or by carrying caller_cwd: the folder
+    // the standalone MCP server reports. caller_cwd is read here and nowhere
+    // else, so sending it changes nothing for a session in an ordinary folder.
+    const via = req.body?.via ?? req.query?.via;
+    const callerCwd = [req.body?.caller_cwd, req.query?.caller_cwd].find(v => typeof v === 'string' && v);
+    if (OFF_GUARD_HOOK_ROUTES.includes(req.path) && via !== 'mcp' && !callerCwd) return next();
+    const sessionId = [req.body?.session_id, req.query?.session_id].find(v => typeof v === 'string' && v);
+    const byCwd = [req.body?.cwd, req.query?.cwd, callerCwd].some(v => typeof v === 'string' && keeper.cwdIsOff(v));
+    const bySession = keeper.sessionIsOff(sessionId);
+    if (!byCwd && !bySession) return next();
+    const t = now();
+    if (t - (lastLogged.get(req.path) ?? -Infinity) >= 60_000) {
+      lastLogged.set(req.path, t);
+      log('keeper', 'warn', `refused: ${req.method} ${req.path} from an excluded place`, {
+        detail: `${byCwd ? 'a cwd rule with tier off matched' : 'session tier off'}${sessionId ? `, session ${String(sessionId).slice(0, 8)}` : ''}`
+      });
+    }
+    return res.status(403).json({ error: 'this place is excluded from Undertow (Keeper tier off): no memory is read or written for it' });
+  };
+}
 
 export default keeper;
