@@ -4,7 +4,7 @@
 
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { getEmbedding, getEmbeddingStatus, setEmbeddingReporter, _resetEmbeddingHealth } from '../embeddings.js';
+import { getEmbedding, getEmbeddingStatus, setEmbeddingReporter, classifyEmbeddingError, _resetEmbeddingHealth } from '../embeddings.js';
 
 const KEYS = ['EMBEDDINGS_PROVIDER', 'GEMINI_API_KEY'];
 const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
@@ -61,7 +61,9 @@ test('a failing provider is reported, and status says degraded with the reason',
   const s = getEmbeddingStatus();
   assert.equal(s.state, 'degraded');
   assert.equal(s.available, false, 'a provider whose calls fail is not "available"');
-  assert.match(s.reason, /402/);
+  assert.equal(s.reason, 'quota', 'status carries a fixed word, not the provider text');
+  assert.ok(!JSON.stringify(s).includes('prepayment'), 'provider text is not in the status at all');
+  assert.match(events[0].msg, /prepayment credits are depleted/, 'the raw text is in the log line');
   assert.equal(s.failedCalls, 1);
   assert.ok(s.lastErrorAt);
 });
@@ -89,6 +91,17 @@ test('a success after failures reports recovery and clears the state', async () 
   assert.equal(s.available, true);
   assert.equal(s.reason, undefined);
   assert.ok(s.lastSuccessAt);
+});
+
+test('classifyEmbeddingError: quota, auth, network, and a fallback', () => {
+  assert.equal(classifyEmbeddingError('[402 Payment Required] Your prepayment credits are depleted'), 'quota');
+  assert.equal(classifyEmbeddingError('[429 Too Many Requests] RESOURCE_EXHAUSTED'), 'quota');
+  assert.equal(classifyEmbeddingError('[403 Forbidden] API key not valid'), 'auth');
+  assert.equal(classifyEmbeddingError('[401 Unauthorized]'), 'auth');
+  assert.equal(classifyEmbeddingError('fetch failed'), 'network');
+  assert.equal(classifyEmbeddingError('connect ETIMEDOUT 142.250.1.1:443'), 'network');
+  assert.equal(classifyEmbeddingError('something nobody expected'), 'error');
+  assert.equal(classifyEmbeddingError(undefined), 'error');
 });
 
 test('the reason never includes the API key', async () => {

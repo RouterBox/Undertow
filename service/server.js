@@ -1330,7 +1330,7 @@ app.get('/undertow/health', async (req, res) => {
     const concentration = diversityCheck[0]?.concentration || 0;
     const alerts = [];
     const embeddingStatus = getEmbeddingStatus();
-    if (embeddingStatus.state === 'degraded') alerts.push('EMBEDDINGS_DEGRADED: ' + embeddingStatus.reason + ' (' + embeddingStatus.failedCalls + ' failed call(s)); vector search is falling back to keywords');
+    if (embeddingStatus.state === 'degraded') alerts.push('EMBEDDINGS_DEGRADED: ' + embeddingStatus.reason + ' (' + embeddingStatus.failedCalls + ' failed call(s)); vector search is falling back to keywords; details are in the service log');
     if (concentration > 0.8) alerts.push('FILTER_BUBBLE: top 10% of neurons account for >' + Math.round(concentration * 100) + '% of retrievals');
     const window = pursuitWindow(pursuitDays);
     if (window.status === 'GRAPH_DYING') alerts.push('GRAPH_DYING: pursuit/dismissal ratio over the last ' + window.days + ' days is ' + window.ratio.toFixed(2) + ' (healthy > 1.0)');

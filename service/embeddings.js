@@ -169,6 +169,19 @@ function recordFailure(message) {
   }
 }
 
+/**
+ * A short fixed word for why calls fail. The health endpoints are
+ * unauthenticated, so they get this and never the provider's own error text,
+ * which stays in the service log.
+ */
+export function classifyEmbeddingError(message) {
+  const m = String(message || '').toLowerCase();
+  if (/\b(402|429)\b|quota|credit|billing|payment|rate limit|resource_exhausted/.test(m)) return 'quota';
+  if (/\b(401|403)\b|api key|api_key|permission|unauthori[sz]ed|unauthenticated|forbidden/.test(m)) return 'auth';
+  if (/fetch failed|econn|enotfound|eai_again|etimedout|timed out|timeout|network|socket/.test(m)) return 'network';
+  return 'error';
+}
+
 /** Forget call health (tests). */
 export function _resetEmbeddingHealth() {
   Object.assign(callHealth, { failures: 0, lastError: null, lastErrorAt: null, lastSuccessAt: null, lastLoggedAt: 0 });
@@ -231,7 +244,7 @@ export function getEmbeddingStatus() {
   const status = { provider: info.provider, model: info.model, available: configured && callHealth.failures === 0, state };
   if (info.provider === 'local' && localLoadError) status.error = localLoadError.split('\n')[0];
   if (callHealth.failures > 0) {
-    status.reason = callHealth.lastError;
+    status.reason = classifyEmbeddingError(callHealth.lastError); // quota | auth | network | error
     status.failedCalls = callHealth.failures;
     status.lastErrorAt = new Date(callHealth.lastErrorAt).toISOString();
   }
