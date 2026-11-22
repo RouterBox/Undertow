@@ -19,7 +19,7 @@ test('connectionTarget reads the usual shapes and rejects the rest', () => {
   assert.equal(connectionTarget(undefined), null);
 });
 
-async function summarizeWith(connections) {
+async function summarizeWith(connections, { existing = null } = {}) {
   const calls = [];
   const logs = [];
   await handleSummarize({
@@ -31,6 +31,8 @@ async function summarizeWith(connections) {
         if (p?.[m[1]] === undefined) throw new Error(`Expected parameter(s): ${m[1]}`);
       }
       calls.push({ q, p });
+      // An edge query returns the linked name when the target exists (all do unless `existing` says otherwise).
+      if (/CREATE \(src\)-\[:SYNAPSE/.test(q)) return !existing || existing.includes(p.tgt) ? [{ linked: p.tgt }] : [];
       return [];
     },
     callAnthropic: async () => ({
@@ -47,7 +49,8 @@ async function summarizeWith(connections) {
   });
   const edges = calls.filter(c => /CREATE \(src\)-\[:SYNAPSE/.test(c.q)).map(c => c.p.tgt);
   const warns = logs.filter(l => l[1] === 'warn').map(l => l[2]);
-  return { edges, warns };
+  const notFound = logs.filter(l => /connection target not found/.test(l[2])).map(l => l[2]);
+  return { edges, warns, notFound };
 }
 
 test('every connection that names a neuron gets an edge query, in any shape', async () => {
@@ -64,6 +67,19 @@ test('a connection that names nothing is skipped without a warning', async () =>
   const { edges, warns } = await summarizeWith([{ edge_type: 'causal', context: 'no target given' }, { target_name: 'A' }]);
   assert.deepEqual(edges, ['A']);
   assert.deepEqual(warns, [], 'no "Expected parameter(s): tgt" from the driver');
+});
+
+test('an insight never links to itself', async () => {
+  const { edges } = await summarizeWith([{ target_name: 'Gate design' }, { target_name: 'A' }]);
+  assert.deepEqual(edges, ['A'], 'the self-link is not sent');
+});
+
+test('a target that does not exist is logged, not silently dropped', async () => {
+  const { edges, notFound, warns } = await summarizeWith([{ target_name: 'A' }, { target_name: 'Made up name' }], { existing: ['A'] });
+  assert.deepEqual(edges, ['A', 'Made up name'], 'both are attempted');
+  assert.equal(notFound.length, 1);
+  assert.match(notFound[0], /connection target not found: "Made up name" \(from "Gate design"\)/);
+  assert.deepEqual(warns, [], 'it is an info line, not a warning');
 });
 
 test('the summarize prompt tells the model what a connection is and what shape it has', async () => {

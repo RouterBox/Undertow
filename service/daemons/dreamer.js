@@ -256,7 +256,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
             // the driver ("Expected parameter(s): tgt") and logged a warning per edge.
             const tgt = connectionTarget(conn);
             if (!tgt) continue;
-            await runCypher(`
+            // An insight never links to itself.
+            if (tgt === insight.name) continue;
+            const linked = await runCypher(`
                 MATCH (src:Neuron {name: $src})
                 WHERE ${nsPredicate('src')}
                 MATCH (tgt:Neuron {name: $tgt})
@@ -265,11 +267,16 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
                   weight: $weight, edge_type: $edgeType,
                   context: $context, created_at: datetime()
                 }]->(tgt)
+                RETURN tgt.name AS linked
               `, {
               src: insight.name, tgt, ns,
               weight: conn.weight || 0.5, edgeType: conn.edge_type || 'associative',
               context: conn.context || ''
-            }).catch(e => log('error', 'warn', e.message));
+            }).catch(e => { log('error', 'warn', e.message); return null; });
+            // The model named a neuron that does not exist here: no edge was made.
+            if (Array.isArray(linked) && linked.length === 0) {
+              log('summarize', 'info', `connection target not found: "${tgt}" (from "${insight.name}")`);
+            }
           }
         }
         log('summarize', 'info', `insight: ${insight.name}`);
