@@ -961,23 +961,25 @@ app.post('/undertow/feedback', async (req, res) => {
       if (ns !== null || !(await isHeld({ runCypher, name: neuron }))) return res.status(404).json({ error: `no live neuron named "${neuron}"` });
       ns = HELD_NAMESPACE;
     }
-    await applyVerdictToNeuron({ runCypher, name: neuron, ns, verdict, note: cleanNote, log });
     // used/useful from a human session is use: a held neuron joins the live graph.
-    // From an agent session, an unknown session or with no session id it stays held.
+    // From an agent session, an unknown session or with no session id it stays held
+    // and the verdict is not applied (an agent must not reward what it wrote).
+    const positive = verdict === 'used' || verdict === 'useful';
+    const may = ns === HELD_NAMESPACE && positive ? await canRelease(keeper, session_id) : null;
+    if (may && !may.ok) {
+      countHeld('releaseRefused');
+      log('keeper', 'info', 'feedback on a held neuron: not released, verdict not applied', { detail: may.reason });
+      return res.json({ status: 'held', neuron, verdict, released: false, reason: may.reason, note: 'this neuron is held (written from an agent session); the verdict was not applied. See GET /undertow/held' });
+    }
+    await applyVerdictToNeuron({ runCypher, name: neuron, ns, verdict, note: cleanNote, log });
     let held = null;
     if (ns === HELD_NAMESPACE) {
       held = { held: true, released: false };
-      if (verdict === 'used' || verdict === 'useful') {
-        const may = await canRelease(keeper, session_id);
-        if (may.ok) {
-          const r = await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log });
-          if (r.released) {
-            held = { held: false, released: true };
-            embedNeuron(r.name, r.flash_summary).catch(e => log('error', 'warn', e.message));
-          }
-        } else {
-          countHeld('releaseRefused');
-          held.reason = may.reason;
+      if (positive) {
+        const r = await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log });
+        if (r.released) {
+          held = { held: false, released: true };
+          embedNeuron(r.name, r.flash_summary).catch(e => log('error', 'warn', e.message));
         }
       }
     }
