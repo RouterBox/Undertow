@@ -21,7 +21,9 @@ NEO4J_USER="${NEO4J_USER:-neo4j}"
 echo "Starting Undertow..."
 
 # Start Neo4j if not running
-if ! docker ps --filter name=neo4j --format '{{.Names}}' | grep -q neo4j; then
+# The name filter matches substrings, so match the whole line: another container
+# whose name merely contains "neo4j" must not count as ours being up.
+if ! docker ps --filter name=neo4j --format '{{.Names}}' | grep -qx neo4j; then
   echo "Starting Neo4j..."
   # NEO4J_AUTH is composed at runtime and scoped to the docker run only.
   docker start neo4j 2>/dev/null || NEO4J_AUTH="$(printf '%s/%s' "$NEO4J_USER" "$NEO4J_PASS")" docker run -d --name neo4j \
