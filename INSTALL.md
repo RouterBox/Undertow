@@ -63,7 +63,7 @@ set -a; source service/.env; set +a
 NEO4J_USER="${NEO4J_USER:-neo4j}"
 
 NEO4J_AUTH="$(printf '%s/%s' "$NEO4J_USER" "$NEO4J_PASS")" docker run -d --name neo4j \
-  -p 7474:7474 -p 7687:7687 \
+  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
   -e NEO4J_AUTH \
   -e NEO4J_PLUGINS='["apoc", "graph-data-science"]' \
   -v neo4j_data:/data \
