@@ -24,7 +24,7 @@ import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
-import { sanitizeNamespace, livePredicate, nsPredicate } from './namespaces.js';
+import { sanitizeNamespace, livePredicate, nsPredicate, setReservedNamespaces, reservedNamespaceGuard } from './namespaces.js';
 import { embeddingCoverage } from './embedding-coverage.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
@@ -136,6 +136,12 @@ try {
 const app = express();
 if (API_TOKEN) app.use(apiTokenGuard(API_TOKEN));
 app.use(express.json({ limit: '1mb' }));
+// A client may not name a namespace the deployment reserves (config reservedNamespaces):
+// such a request is refused here, before any route reads or writes it.
+const reservedLoaded = loadConfig()
+  .then(c => setReservedNamespaces(c.reservedNamespaces))
+  .catch(e => console.error(`[undertow] reservedNamespaces not loaded: ${e.message}`));
+app.use(reservedNamespaceGuard({ log: (...a) => log(...a), ready: reservedLoaded }));
 
 // --- Undertow Toggle & Config ---
 // Persist toggle state to survive restarts
@@ -911,6 +917,10 @@ app.get('/undertow/neuron', async (req, res) => {
     // Neo4j integers arrive as {low, high}; flatten them for JSON consumers.
     const plain = (row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, neo4j.isInt(v) ? v.toNumber() : v]));
     const neuron = plain(matches[0]);
+    if (ns === HELD_NAMESPACE) {
+      const asker = typeof req.query.session_id === 'string' && req.query.session_id ? req.query.session_id.slice(0, 8) : 'not given';
+      log('held', 'info', `held neuron read: ${String(neuron.uid || 'no uid').slice(0, 8)}`, { detail: `session ${asker}` });
+    }
     const connected = (await runCypher(`
       MATCH (n:Neuron {uid: $uid})-[s:SYNAPSE]-(c:Neuron)
       WHERE ${livePredicate('c')}
@@ -1311,6 +1321,9 @@ app.get('/undertow/keeper', (req, res) => {
 app.get('/undertow/held', async (req, res) => {
   try {
     const held = await listHeld({ runCypher, limit: req.query.limit });
+    // Every read of the held tier is logged: how much, and who asked when they say. No names.
+    const asker = typeof req.query.session_id === 'string' && req.query.session_id ? req.query.session_id.slice(0, 8) : 'not given';
+    log('held', 'info', `held list read: ${held.length} returned`, { detail: `limit ${req.query.limit ?? 'default'}, session ${asker}` });
     res.json({
       held, returned: held.length, total: await countHeldNeurons({ runCypher }),
       release: 'POST /undertow/chase {neuron or uid, session_id} or POST /undertow/feedback {neuron, verdict: used|useful, session_id}, where session_id is a human session; read one with GET /undertow/neuron?name=...&namespace=quarantine'

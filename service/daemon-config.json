@@ -60,6 +60,7 @@
       "debounceMs": 2000
     }
   },
+  "reservedNamespaces": [],
   "global": {
     "maxDaemonConcurrency": 3,
     "logDaemonActivity": true

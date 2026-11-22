@@ -129,6 +129,11 @@ test('/mcp held tier: query is marked as a tool call, held items can be listed, 
   assert.deepEqual({ method: calls.at(-1).method, path: calls.at(-1).path, query: calls.at(-1).query }, { method: 'GET', path: '/undertow/held', query: { limit: 5 } });
   await client.callTool({ name: 'undertow_neighbors', arguments: { name: 'x', held: true } });
   assert.equal(calls.at(-1).query.namespace, 'quarantine');
+  // Reads of the held tier are logged with the caller's session id when the caller gives one.
+  await client.callTool({ name: 'undertow_held', arguments: { session_id: 's1' } });
+  assert.equal(calls.at(-1).query.session_id, 's1');
+  await client.callTool({ name: 'undertow_neighbors', arguments: { name: 'x', held: true, session_id: 's1' } });
+  assert.equal(calls.at(-1).query.session_id, 's1');
   await client.callTool({ name: 'undertow_neighbors', arguments: { name: 'x' } });
   assert.equal(calls.at(-1).query.namespace, undefined);
   await client.callTool({ name: 'undertow_chase', arguments: { session_id: 's1', uid: 'abcdef01' } });

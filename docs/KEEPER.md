@@ -321,9 +321,23 @@ held neurons newest first: name, uid, kind, flash summary, the session that
 wrote it, when, and `name_taken` when a live neuron now has the same name.
 Read one in full with `GET /undertow/neuron?name=...&namespace=quarantine`
 (MCP: `undertow_neighbors` with `held: true`). Listing and reading are open
-to any caller. `/undertow/stats`, `/undertow/health` and the boot-time
+to any caller, and every such read is logged (endpoint `held`): how many rows
+or which uid prefix, and the caller's `session_id` when the request gives one.
+The log line carries no names. `/undertow/stats`, `/undertow/health` and the boot-time
 embedding check count the live graph only; stats reports `held` separately.
 `POST /undertow/correct` acts on the live graph unless given a `namespace`.
+
+**Reserved namespaces.** A deployment can keep namespaces for its own use that
+no client may name: list them in `reservedNamespaces` at the top level of
+`service/daemon-config.json` (default `[]`; read at service start), for example
+`["vault-keep"]`. A request that names one, in its body or its query string, is
+refused before any route runs: HTTP 403 with a reason, or an empty result on
+the hook routes (`query`, `session-start`, `ingest`, `summarize`, `rehydrate`),
+where an error body would be ignored. It is never redirected to the live graph,
+and each refusal is logged as a warning. `quarantine` is not reserved: the held
+tier stays readable as described above. The guard covers what clients send; it
+does not hide a reserved namespace from maintenance code or from someone
+querying the database directly.
 
 **Release.** A held neuron joins the live graph when a **human session** uses
 it: `POST /undertow/chase {neuron, session_id}`, or `POST /undertow/feedback`

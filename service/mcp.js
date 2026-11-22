@@ -308,11 +308,12 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
           .boolean()
           .optional()
           .describe('true = read a HELD neuron (one listed by undertow_held) instead of a live one.'),
+        session_id: z.string().optional().describe('Identifier for the calling session/conversation. A read of a held neuron is logged with it.'),
       },
     },
-    async ({ name, uid, limit, held }) => {
+    async ({ name, uid, limit, held, session_id }) => {
       if (!name && !uid) return toolResult({ ok: false, text: 'undertow_neighbors needs a `name` or a `uid`.' });
-      return call('GET', '/undertow/neuron', { query: { name, uid, limit, ...(held ? { namespace: 'quarantine' } : {}) } });
+      return call('GET', '/undertow/neuron', { query: { name, uid, limit, ...(held ? { namespace: 'quarantine', ...(session_id ? { session_id } : {}) } : {}) } });
     }
   );
 
@@ -328,9 +329,10 @@ export function createUndertowMcpServer({ dispatch, version = '0.1.0', allowMuta
         'neuron joins the live graph only when a human session chases it or gives it a used/useful verdict.',
       inputSchema: {
         limit: z.number().int().positive().max(200).optional().describe('Max held neurons to return, newest first (default 50, max 200).'),
+        session_id: z.string().optional().describe('Identifier for the calling session/conversation. Reads of the held tier are logged with it.'),
       },
     },
-    async ({ limit }) => call('GET', '/undertow/held', { query: { limit } })
+    async ({ limit, session_id }) => call('GET', '/undertow/held', { query: { limit, ...(session_id ? { session_id } : {}) } })
   );
 
   server.registerTool(
