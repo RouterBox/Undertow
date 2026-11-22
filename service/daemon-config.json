@@ -41,7 +41,10 @@
       "cwdRules": [
         { "pattern": "agentbox-worktrees", "tier": "drone" }
       ],
-      "agentCwdPatterns": []
+      "agentRosters": [],
+      "agentRosterKinds": ["spawned"],
+      "agentCwdPatterns": [],
+      "agentInsights": false
     },
     "tapestry": {
       "enabled": true,

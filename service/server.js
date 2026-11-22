@@ -25,6 +25,7 @@ import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/go
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
 import { sanitizeNamespace, livePredicate, nsPredicate } from './namespaces.js';
+import { embeddingCoverage } from './embedding-coverage.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
 import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
@@ -821,7 +822,7 @@ app.post('/undertow/chase', async (req, res) => {
       ? (await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} RETURN n.name AS name LIMIT 1`, { name: neuron, ns: null })).length > 0
       : false;
     if (heldUid || (!liveExists && await isHeld({ runCypher, name: neuron }))) {
-      const may = canRelease(keeper, session_id);
+      const may = await canRelease(keeper, session_id);
       if (!may.ok) {
         countHeld('releaseRefused');
         log('keeper', 'info', 'chase of a held neuron: not released', { detail: may.reason });
@@ -967,7 +968,7 @@ app.post('/undertow/feedback', async (req, res) => {
     if (ns === HELD_NAMESPACE) {
       held = { held: true, released: false };
       if (verdict === 'used' || verdict === 'useful') {
-        const may = canRelease(keeper, session_id);
+        const may = await canRelease(keeper, session_id);
         if (may.ok) {
           const r = await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log });
           if (r.released) {
@@ -1529,11 +1530,8 @@ const httpServer = app.listen(PORT, HOST, async () => {
       if (idx.length && dims && dims !== info.dims) {
         log('startup', 'error', `EMBEDDING DIMENSION MISMATCH: neuron_embedding index is ${dims}-dim but provider ${info.provider} (${info.model}) emits ${info.dims}-dim — vector search will silently miss everything. Run: node switch-embeddings.js`);
       }
-      const counts = await runCypher(
-        `MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL RETURN count(n) AS total, count(n.embedding) AS embedded`
-      );
-      const total = counts[0]?.total?.toNumber?.() ?? Number(counts[0]?.total || 0);
-      const embedded = counts[0]?.embedded?.toNumber?.() ?? Number(counts[0]?.embedded || 0);
+      // Live graph only: other namespaces and archived versions are not searched by live recall.
+      const { total, embedded } = await embeddingCoverage(runCypher);
       if (total > 0 && embedded === 0) {
         log('startup', 'error', `NO EMBEDDED NEURONS: ${total} live neurons, zero have embeddings — vector search is returning nothing. Run: node backfill-embeddings.js`);
       } else if (total > 0 && (total - embedded) / total > 0.1) {

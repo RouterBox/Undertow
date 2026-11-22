@@ -721,8 +721,12 @@ async function summarizeForTurn(deps, keeper) {
     deps.log('keeper', 'info', `habituated turn (repeat) - skipped (${String(sid).slice(0, 8)})`);
     return { skipped: true };
   }
-  // Who is on the other end decides what Dreamer may write (see held.js).
-  const agentSession = keeper.sessionKind(sid, deps.req_body.cwd).kind === 'agent';
+  // Who is on the other end decides what Dreamer may write (see held.js). The
+  // rosters are asked first (the Stop response is already sent), so a session a
+  // launcher lists is known as an agent before it is classed. With the Keeper's
+  // agentInsights on, an agent session is summarized like a person's.
+  await keeper.resolveAgent(sid, deps.req_body.cwd);
+  const agentSession = !keeper.agentInsightsEnabled() && keeper.sessionKind(sid, deps.req_body.cwd).kind === 'agent';
   await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', agentSession });
   return { skipped: false };
 }

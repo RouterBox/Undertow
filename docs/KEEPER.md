@@ -175,33 +175,65 @@ mechanism decides what a *conscious* session may write when the one on the
 other end is an agent.
 
 **Who is an agent session** (`keeper.sessionKind`, first match wins). It is a
-declared fact, never inferred from how the session behaves: three varied
+fact someone states, never inferred from how the session behaves: three varied
 prompts a few seconds apart look like a conversation whoever sends them.
 
-1. Declared: `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
+1. **Declared:** `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
    (or `"human"`; `null` clears it). A declaration beats everything below, so
    a person working in a listed directory can declare their session `human`.
-2. Flagged: `keeper.markAgent(sessionId, label)` sets `agentFlag` on the
-   ledger entry. This is the hook for whatever knows which sessions are agents
-   in a deployment.
-3. The session's cwd contains one of `agentCwdPatterns` in the Keeper's
-   daemon-config (case-insensitive substrings). **The list ships empty: a
-   deployment that runs agents must fill it in (or flag or declare them), or
-   every session is treated as human.** Set it with
-   `POST /undertow/daemon-config/keeper {"agentCwdPatterns": ["my-agent-dir"]}`
-   and restart.
+2. **A launcher's roster lists the session id.** A launcher that starts agent
+   sessions publishes a URL returning JSON with the sessions it runs:
+   `{"contexts": [...]}`, `{"sessions": [...]}` or a bare array, each entry
+   with a string `sessionId` (or `session_id`) and optionally `name` and
+   `kind`. An entry that has a `kind` counts only when it is one of
+   `agentRosterKinds`. The Keeper asks at Stop, after the hook response has
+   been sent, and before deciding a release; each roster gets 1.5 seconds and
+   the combined answer is cached for 60. A hit is remembered in the ledger
+   (`keeper.markAgent` sets `agentFlag`), so a later roster outage does not
+   un-flag the session.
+3. **Its cwd contains an entry of `agentCwdPatterns`** (case-insensitive
+   substrings). This is for an agent that is on no roster, and it is the only
+   test left when no roster is configured or one does not answer.
 
-Everything else is a human session and behaves exactly as before.
+Everything else is a human session and behaves exactly as before. A person's
+own session is on no roster, so they can work in any directory without being
+treated as an agent, unless that directory is listed.
+
+**Config** (`daemons.keeper` in `service/daemon-config.json`; read at service
+start, so a change needs a restart):
+
+```json
+{
+  "agentRosters": ["http://127.0.0.1:8080/sessions"],
+  "agentRosterKinds": ["spawned"],
+  "agentCwdPatterns": [],
+  "agentInsights": false
+}
+```
+
+The lists ship empty: **a deployment that runs agents must configure a roster,
+list a directory, or declare the sessions, or every session is treated as
+human.** `agentInsights` is the off switch for this whole mechanism: `false`
+(the default) sends what an agent session writes through the held tier
+described below; `true` summarizes an agent session like a person's, as
+before this mechanism existed.
+
+**Known gaps.** A session that has not yet registered with its launcher is not
+on the roster for its first moments; a turn that ends in that window is
+summarized as a person's would be. If a roster does not answer at a Stop, a
+session not yet flagged is treated as human for that turn unless its cwd is
+listed.
 
 A call from the `undertow_query` MCP tool is the agent asking, not a person
 prompting: it is not counted as a prompt by the Keeper.
 
-**Seeing it.** The first time a session is classed agent the service logs one
-line saying by which rule. `GET /undertow/keeper` lists recent sessions with
-their `kind` and `why`, and a `held` block of counters since the last
-restart: agent turns summarized, turns where the model offered no insight,
-insights offered, dropped for no durable kind, skipped because the name was
-taken, written to the held tier, released, and releases refused.
+**Seeing it.** The service logs one line when a roster flags a session, and
+one the first time a session is classed agent, saying by which rule.
+`GET /undertow/keeper` lists flagged sessions under `agentSessions`, recent
+sessions with their `kind` and `why`, and a `held` block of counters since
+the last restart: agent turns summarized, turns where the model offered no
+insight, insights offered, dropped for no durable kind, skipped because the
+name was taken, written to the held tier, released, and releases refused.
 
 **What does not change for an agent session:** its tier, its flashes, pursuit
 detection, train of thought, and Gobble's ingest.
@@ -243,7 +275,10 @@ embedding check count the live graph only; stats reports `held` separately.
 **Release.** A held neuron joins the live graph when a **human session** uses
 it: `POST /undertow/chase {neuron, session_id}`, or `POST /undertow/feedback`
 with verdict `used` or `useful` and a `session_id`. The session id must be one
-the Keeper knows and classes as human. A chase or verdict from an agent
+the Keeper knows and classes as human, and the rosters are asked first: an
+agent a roster lists cannot release even before its first Stop, and when a
+roster does not answer, a session that is not declared human is refused (try
+again, or declare it). A chase or verdict from an agent
 session, from a session the Keeper has never seen, or with no session id
 releases nothing: the response says the neuron is held and why (a chase
 answers `status: "held"` and rewards nothing). Release sets `namespace` to

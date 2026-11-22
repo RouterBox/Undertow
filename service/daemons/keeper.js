@@ -18,6 +18,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { lookupAgent } from '../agent-roster.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LEDGER_PATH = join(__dirname, '..', 'keeper-ledger.json');
@@ -47,10 +48,17 @@ const defaults = {
   cwdRules: [
     { pattern: 'agentbox-worktrees', tier: 'drone' },
   ],
-  // cwd substrings (case-insensitive) that mark a session as an agent session
-  // whatever its turn-taking looks like - for an agent whose instructions
-  // arrive as ordinary prompts. Empty by default; set per deployment.
+  // Agent sessions (see docs/KEEPER.md). A session is an agent session when a
+  // launcher's roster lists its id, or its cwd contains one of the patterns
+  // below (case-insensitive; for an agent that is on no roster). Never
+  // inferred from behaviour.
+  agentRosters: [],              // URLs, each returning the sessions a launcher runs
+  agentRosterKinds: ['spawned'], // a roster entry with a `kind` counts only if it is one of these
   agentCwdPatterns: [],
+  // false: what Dreamer writes from an agent session goes through the held
+  // tier (durable kinds only, held until a human session uses it).
+  // true: an agent session is summarized like a person's.
+  agentInsights: false,
 };
 
 const VALID_KINDS = new Set(['agent', 'human']);
@@ -315,14 +323,65 @@ const keeper = {
     }
   },
 
+  /** Remember that a session is an agent session (sticky; survives a roster outage). */
+  markAgent(sessionId, label) {
+    const e = getEntry(sessionId, null, null);
+    if (e.agentFlag) return;
+    e.agentFlag = String(label || 'agent');
+    dirty = true;
+    persist();
+    logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} flagged as agent (${e.agentFlag})`);
+  },
+
+  /** Is this an agent session, and why. No side effects, no inference from behaviour. */
+  isAgentSession(sessionId, cwd) {
+    if (!config.enabled) return { agent: false, why: 'keeper disabled' };
+    const e = ledger.get(sessionId);
+    if (e && e.agentFlag) return { agent: true, why: `flagged (${e.agentFlag})` };
+    const where = String(cwd || (e && e.cwd) || '').toLowerCase();
+    for (const p of config.agentCwdPatterns || []) {
+      if (p && where && where.includes(String(p).toLowerCase())) return { agent: true, why: `cwd matches "${p}"` };
+    }
+    return { agent: false, why: 'not flagged' };
+  },
+
+  /**
+   * Ask the configured rosters about a session not yet flagged and remember a
+   * hit. Returns 'flagged' (already known as an agent), 'none' (no roster
+   * configured), or the lookup's 'agent', 'not-listed' or 'unknown' (a roster
+   * did not answer). Waits at most the roster timeout.
+   */
+  async askRoster(sessionId, fetchImpl) {
+    if (ledger.get(sessionId)?.agentFlag) return 'flagged';
+    if (!(config.agentRosters || []).length) return 'none';
+    const found = await lookupAgent(sessionId, { urls: config.agentRosters, kinds: config.agentRosterKinds, ...(fetchImpl ? { fetchImpl } : {}) });
+    if (found.status === 'agent') keeper.markAgent(sessionId, found.label);
+    return found.status;
+  },
+
+  /**
+   * Ask the rosters (askRoster), then answer as isAgentSession does. Call it
+   * only where the hook response has already been sent (Stop).
+   */
+  async resolveAgent(sessionId, cwd, fetchImpl) {
+    if (!config.enabled) return { agent: false, why: 'keeper disabled' };
+    await keeper.askRoster(sessionId, fetchImpl);
+    return keeper.isAgentSession(sessionId, cwd);
+  },
+
+  /** True when an agent session is to be summarized like a person's (config agentInsights); false sends it through the held tier. */
+  agentInsightsEnabled() { return config.agentInsights === true; },
+
   /**
    * Who is on the other end of a session: 'agent' or 'human', and why.
    * Agent sessions keep their flashes; what Dreamer writes from them is held
    * apart (see docs/KEEPER.md, "Agent sessions"). It is a declared fact, never
    * inferred from behaviour. In order:
    *   1. declared with setKind (POST /undertow/keeper {kind})
-   *   2. flagged as an agent (markAgent sets agentFlag on the ledger entry)
+   *   2. flagged as an agent: a launcher's roster listed its id (markAgent)
    *   3. cwd matches one of config.agentCwdPatterns
+   * (2 and 3 are isAgentSession. The rosters are asked by resolveAgent, which
+   * is async: call it first wherever the answer matters.)
    * Anything else is human, which is the behaviour without this feature.
    * The first time a session is classed agent, one log line says by which rule.
    */
@@ -330,29 +389,14 @@ const keeper = {
     if (!config.enabled) return { kind: 'human', why: 'keeper disabled' };
     const e = ledger.get(sessionId);
     if (e && VALID_KINDS.has(e.declaredKind)) return noteKind(e, sessionId, { kind: e.declaredKind, why: 'declared' });
-    if (e && e.agentFlag) return noteKind(e, sessionId, { kind: 'agent', why: 'flagged as an agent' });
-    const where = String(cwd || (e && e.cwd) || '').toLowerCase();
-    for (const p of config.agentCwdPatterns || []) {
-      if (p && where && where.includes(String(p).toLowerCase())) return noteKind(e, sessionId, { kind: 'agent', why: `cwd matches "${p}"` });
-    }
+    const a = keeper.isAgentSession(sessionId, cwd);
+    if (a.agent) return noteKind(e, sessionId, { kind: 'agent', why: a.why });
     return { kind: 'human', why: 'default' };
   },
 
   /** True when the Keeper has a ledger entry for this session (or is disabled). */
   knows(sessionId) {
     return !config.enabled || ledger.has(sessionId);
-  },
-
-  /**
-   * Flag this session as an agent. `label` names the agent.
-   */
-  markAgent(sessionId, label) {
-    if (!config.enabled || !sessionId) return false;
-    const flag = String(label || '').trim().slice(0, 64);
-    if (!flag) return false;
-    const e = getEntry(sessionId, null, null);
-    if (e.agentFlag !== flag) { e.agentFlag = flag; dirty = true; }
-    return true;
   },
 
   /** Manual declaration of who a session is: 'agent' | 'human', or null to clear. */
@@ -378,17 +422,19 @@ const keeper = {
 
   snapshot() {
     const byTier = {};
-    for (const e of ledger.values()) byTier[e.tier] = (byTier[e.tier] || 0) + 1;
+    const agentSessions = {};
     // Who each recent session is, and why (newest first; ids shortened).
     const byKind = { agent: 0, human: 0 };
     const sessions = [];
     for (const [id, e] of ledger) {
+      byTier[e.tier] = (byTier[e.tier] || 0) + 1;
+      if (e.agentFlag) agentSessions[id] = e.agentFlag;
       const k = keeper.sessionKind(id);
       byKind[k.kind] = (byKind[k.kind] || 0) + 1;
       sessions.push({ session: String(id).slice(0, 8), tier: e.tier, kind: k.kind, why: k.why, cwd: e.cwd || null, lastSeen: e.lastSeen || 0 });
     }
     sessions.sort((a, b) => b.lastSeen - a.lastSeen);
-    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, byKind, ...stats, sessions: sessions.slice(0, 50), config };
+    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, byKind, agentSessions, ...stats, sessions: sessions.slice(0, 50), config };
   },
 };
 

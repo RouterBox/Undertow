@@ -61,19 +61,30 @@ export async function isHeld({ runCypher, name }) {
 /**
  * May this caller release a held neuron? Only a session the Keeper knows and
  * classes as human. No session id, an id the Keeper has never seen, or an
- * agent session: no. Returns { ok, reason }.
+ * agent session: no. The launcher rosters are asked first, so an agent a
+ * roster lists cannot release before its first Stop; and when a roster did
+ * not answer, a session that is not declared human is refused (it may be an
+ * agent nobody could vouch for; a person can try again). Returns { ok, reason }.
  * (The id is whatever the caller sent: this stops an agent releasing its own
  * insight through ordinary tool use, not a caller that forges a human id.)
  */
-export function canRelease(keeper, sessionId) {
+export async function canRelease(keeper, sessionId, fetchImpl) {
   if (!sessionId || typeof sessionId !== 'string') {
     return { ok: false, reason: 'no session_id: a held neuron is released only by a human session' };
   }
   if (!keeper.knows(sessionId)) {
     return { ok: false, reason: 'session_id is not a session the Keeper has seen' };
   }
+  const declared = keeper.sessionKind(sessionId);
+  if (declared.why === 'declared') {
+    return declared.kind === 'human' ? { ok: true, reason: null } : { ok: false, reason: 'agent session (declared): an agent cannot release a held neuron' };
+  }
+  const roster = await keeper.askRoster(sessionId, fetchImpl);
   const { kind, why } = keeper.sessionKind(sessionId);
   if (kind !== 'human') return { ok: false, reason: `agent session (${why}): an agent cannot release a held neuron` };
+  if (roster === 'unknown') {
+    return { ok: false, reason: 'a launcher roster did not answer, so this session cannot be confirmed as human: try again, or declare it with POST /undertow/keeper {"kind":"human"}' };
+  }
   return { ok: true, reason: null };
 }
 

@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import keeper from '../daemons/keeper.js';
 import { handleSummarize, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT } from '../daemons/dreamer.js';
 import { handleIngest } from '../daemons/gobble.js';
+import { resetRosterCache } from '../agent-roster.js';
 import { HELD_NAMESPACE, DURABLE_KINDS, durableKind, nodeTypeForKind, isHeld, releaseHeld, canRelease, listHeld, heldCounters } from '../held.js';
 
 // Small thresholds so a test can reach both promotion paths. Session ids are
@@ -42,15 +43,13 @@ test('behaviour never decides: tool-volume and turn-taking promotion both leave 
 
 test('a flagged session is an agent whatever its turn-taking looks like', async () => {
   const sid = id('flagged');
-  assert.equal(keeper.markAgent(sid, 'nightly-worker'), true);
+  keeper.markAgent(sid, 'nightly-worker');
   for (const p of ['first varied prompt about gates', 'second varied prompt about pauses', 'third varied prompt about config']) {
     keeper.recordPrompt(sid, 'C:/work/app', undefined, p);
     await sleep(5);
   }
   assert.equal(keeper.tierOf(sid), 'conscious', 'it looks conversational');
-  assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'flagged as an agent' });
-  assert.equal(keeper.markAgent(id('no-label'), '  '), false, 'an empty label flags nothing');
-  assert.equal(keeper.sessionKind(id('no-label')).kind, 'human');
+  assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'flagged (nightly-worker)' });
 });
 
 test('a cwd on the agent list marks the session as agent, case-insensitively', () => {
@@ -70,7 +69,7 @@ test('a declared kind beats the flag and the cwd list, can be cleared, and rejec
   assert.equal(keeper.setKind(sid, 'human'), true);
   assert.deepEqual(keeper.sessionKind(sid), { kind: 'human', why: 'declared' });
   assert.equal(keeper.setKind(sid, null), true);
-  assert.equal(keeper.sessionKind(sid).why, 'flagged as an agent', 'back to the flag');
+  assert.equal(keeper.sessionKind(sid).why, 'flagged (worker)', 'back to the flag');
   assert.equal(keeper.setKind(sid, 'robot'), false);
   const plain = id('declared-agent');
   keeper.recordPrompt(plain, 'C:/github/elsewhere', 'conscious', 'hello again');
@@ -274,21 +273,53 @@ test('releaseHeld reports released:false and logs nothing when no held neuron ma
   assert.deepEqual(logs, []);
 });
 
-test('only a human session the Keeper knows may release: not an agent, not a stranger, not nobody', () => {
+test('only a human session the Keeper knows may release: not an agent, not a stranger, not nobody', async () => {
   const agent = id('rel-agent');
   keeper.recordPrompt(agent, 'C:/work/app', 'conscious', 'an agent that wrote an insight');
   keeper.markAgent(agent, 'worker');
   const human = id('rel-human');
   keeper.recordPrompt(human, 'C:/work/app', 'conscious', 'a person looking at the held list');
 
-  assert.deepEqual(canRelease(keeper, human), { ok: true, reason: null });
-  const a = canRelease(keeper, agent);
+  assert.deepEqual(await canRelease(keeper, human), { ok: true, reason: null });
+  const a = await canRelease(keeper, agent);
   assert.equal(a.ok, false);
-  assert.match(a.reason, /agent session \(flagged as an agent\)/);
-  assert.equal(canRelease(keeper, undefined).ok, false);
-  assert.match(canRelease(keeper, '').reason, /no session_id/);
-  assert.match(canRelease(keeper, 'made-up-' + run).reason, /not a session the Keeper has seen/);
-  assert.equal(canRelease(keeper, 42).ok, false);
+  assert.match(a.reason, /agent session \(flagged \(worker\)\)/);
+  assert.equal((await canRelease(keeper, undefined)).ok, false);
+  assert.match((await canRelease(keeper, '')).reason, /no session_id/);
+  assert.match((await canRelease(keeper, 'made-up-' + run)).reason, /not a session the Keeper has seen/);
+  assert.equal((await canRelease(keeper, 42)).ok, false);
+});
+
+// Runs with a roster configured; restores the file's Keeper config afterwards.
+test('release asks the roster first: a listed agent that has not hit a Stop cannot release; a roster that does not answer refuses all but a declared human', async () => {
+  const base = { agenticToolEvents: 2, agenticMinHours: 1e-9, minCadenceSeconds: 0.001, agentCwdPatterns: ['AgentPlace'] };
+  keeper.init({ daemonConfig: { ...base, agentRosters: ['http://roster/'] } });
+  try {
+    const listed = id('rel-listed');
+    const person = id('rel-person');
+    const declared = id('rel-declared');
+    for (const s of [listed, person, declared]) keeper.recordPrompt(s, 'C:/work/app', 'conscious', `a prompt from ${s}`);
+    const up = async () => ({ ok: true, json: async () => ({ contexts: [{ name: 'worker-b', sessionId: listed, kind: 'spawned' }] }) });
+    const down = async () => { throw new Error('connection refused'); };
+
+    // Not yet flagged (no Stop has asked the roster): sessionKind alone would say human.
+    assert.equal(keeper.sessionKind(listed).kind, 'human');
+    resetRosterCache();
+    const l = await canRelease(keeper, listed, up);
+    assert.equal(l.ok, false);
+    assert.match(l.reason, /agent session \(flagged \(worker-b\)\)/);
+    assert.deepEqual(await canRelease(keeper, person, up), { ok: true, reason: null }, 'the roster answered and does not list a person');
+
+    resetRosterCache();
+    const p = await canRelease(keeper, person, down);
+    assert.equal(p.ok, false, 'nobody could vouch for the session');
+    assert.match(p.reason, /roster did not answer/);
+    keeper.setKind(declared, 'human');
+    assert.deepEqual(await canRelease(keeper, declared, down), { ok: true, reason: null }, 'a declared human does not need the roster');
+  } finally {
+    resetRosterCache();
+    keeper.init({ daemonConfig: base });
+  }
 });
 
 test('listHeld asks only the held namespace, newest first, with a bounded limit', async () => {
