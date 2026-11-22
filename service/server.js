@@ -19,7 +19,7 @@ import prowler from './daemons/prowler.js';
 import tapestry from './daemons/tapestry.js';
 import wonder from './daemons/wonder.js';
 import janitor from './daemons/janitor.js';
-import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo, initEmbeddings, getEmbeddingStatus } from './embeddings.js';
+import { getEmbedding, isAvailable as embeddingsAvailable, getProviderInfo, initEmbeddings, getEmbeddingStatus, setEmbeddingReporter } from './embeddings.js';
 import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
@@ -188,7 +188,11 @@ async function runCypher(query, params = {}) {
 app.get('/health', async (req, res) => {
   try {
     await runCypher('RETURN 1');
-    res.json({ status: 'ok', neo4j: 'connected', enabled: undertowEnabled, uptime: process.uptime(), embeddings: getEmbeddingStatus() });
+    // "ok" means everything this endpoint knows about works. Failing embeddings
+    // make it "degraded", with the reason, instead of hiding behind "ok".
+    const embeddings = getEmbeddingStatus();
+    const degraded = embeddings.state === 'degraded' ? [`embeddings: ${embeddings.reason}`] : [];
+    res.json({ status: degraded.length ? 'degraded' : 'ok', ...(degraded.length ? { degraded } : {}), neo4j: 'connected', enabled: undertowEnabled, uptime: process.uptime(), embeddings });
   } catch (e) {
     res.status(503).json({ status: 'error', neo4j: 'disconnected', error: e.message });
   }
@@ -1325,6 +1329,8 @@ app.get('/undertow/health', async (req, res) => {
 
     const concentration = diversityCheck[0]?.concentration || 0;
     const alerts = [];
+    const embeddingStatus = getEmbeddingStatus();
+    if (embeddingStatus.state === 'degraded') alerts.push('EMBEDDINGS_DEGRADED: ' + embeddingStatus.reason + ' (' + embeddingStatus.failedCalls + ' failed call(s)); vector search is falling back to keywords; details are in the service log');
     if (concentration > 0.8) alerts.push('FILTER_BUBBLE: top 10% of neurons account for >' + Math.round(concentration * 100) + '% of retrievals');
     const window = pursuitWindow(pursuitDays);
     if (window.status === 'GRAPH_DYING') alerts.push('GRAPH_DYING: pursuit/dismissal ratio over the last ' + window.days + ' days is ' + window.ratio.toFixed(2) + ' (healthy > 1.0)');
@@ -1412,6 +1418,8 @@ const httpServer = app.listen(PORT, HOST, async () => {
   // Local embeddings: load the model now so a missing/unreachable model is one
   // loud startup error (and /health shows it), not a silent per-query null.
   initEmbeddings({ log: (msg) => log('startup', 'error', msg) });
+  // Embedding failures and recoveries go to the service log, not only stderr.
+  setEmbeddingReporter((msg, level = 'error') => log('embeddings', level, msg));
   try {
     await runCypher('RETURN 1');
     const daemonCfg = await loadConfig();
@@ -1441,7 +1449,12 @@ const httpServer = app.listen(PORT, HOST, async () => {
       const embedded = counts[0]?.embedded?.toNumber?.() ?? Number(counts[0]?.embedded || 0);
       if (total > 0 && embedded === 0) {
         log('startup', 'error', `NO EMBEDDED NEURONS: ${total} live neurons, zero have embeddings — vector search is returning nothing. Run: node backfill-embeddings.js`);
+      } else if (total > 0 && (total - embedded) / total > 0.1) {
+        log('startup', 'warn', `NEURONS WITHOUT EMBEDDINGS: ${total - embedded} of ${total} have none and cannot be found by vector search. Run: node backfill-embeddings.js`);
       }
+      // One real call at boot, so /health tells the truth about the provider
+      // within seconds instead of saying "untested" until the first query.
+      if (embeddingsAvailable()) getEmbedding('undertow startup probe').catch(() => {});
     } catch (e) {
       log('startup', 'warn', `embedding sanity check skipped: ${e.message}`);
     }
