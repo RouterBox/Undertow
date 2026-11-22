@@ -225,17 +225,33 @@ ${recentFlashes.length > 0 ? recentFlashes.join('\n') : '[none]'}
 
 Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`, 1000);
 
-  if (!result) return;
+  // One line per summarized turn says what came back: counts and shape only,
+  // never reply text. Without it a reply that fails to parse, or carries no
+  // text at all, looks exactly like a turn with nothing worth keeping.
+  const who = agentSession ? 'agent' : (holdUnknown ? 'unknown' : 'human');
+  if (!result) {
+    log('summarize', 'warn', `reply (${who} turn): none, the model call failed`);
+    return;
+  }
   const message = result.response;
   if (result.model !== SUMMARIZE_MODEL) {
     log('summarize', 'warn', `used fallback model: ${result.model}`);
   }
 
-  const responseText = message.content[0]?.text || '{}';
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  const firstText = blocks[0]?.text;
+  const responseText = firstText || '{}';
+  const replyShape = `blocks [${blocks.map(b => b?.type || '?').join(', ')}], first block text ${typeof firstText === 'string' ? firstText.length : 0} chars, stop_reason ${message.stop_reason || 'unknown'}`;
   try {
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-  } catch {
+    const n = (v) => (Array.isArray(v) ? v.length : 0);
+    const how = !firstText ? 'no text in the first block' : (jsonMatch ? 'parsed' : 'no JSON object');
+    log('summarize', firstText && jsonMatch ? 'info' : 'warn',
+      `reply (${who} turn): ${how}, insights ${n(parsed.insights)}, updates ${n(parsed.updates)}, train ${n(parsed.train_of_thought)}, flash_results ${n(parsed.flash_results)}`,
+      { detail: replyShape });
+  } catch (e) {
+    log('summarize', 'warn', `reply (${who} turn): JSON parse failed`, { detail: `${replyShape}; ${String(e.message).slice(0, 80)}` });
     return;
   }
   } finally {
