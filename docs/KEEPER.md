@@ -75,7 +75,9 @@ correct, ingest. Every MCP tool call carries `via: "mcp"` and, when the client
 declares it, the folder its session runs in. The built-in `/mcp` endpoint runs
 inside the service and cannot see that folder itself, so the client sends it in
 the `X-Undertow-Cwd` request header; a stdio MCP server started in the session's
-folder should send its own working directory as `cwd` on every call. Refusals
+folder sends its own working directory as `caller_cwd` on every call: a field
+only this guard reads, so a session in an ordinary folder sees no difference
+(`cwd` itself feeds project scoring and the query cache). Refusals
 are logged at most once a minute per route, without the folder's path.
 
 **Limit.** The `cwd` is whatever the caller says it is. This stops a session in

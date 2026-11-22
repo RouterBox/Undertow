@@ -125,3 +125,22 @@ test('refusals are logged at most once a minute per route', () => {
   send(guard, req);
   assert.equal(logs.length, 3);
 });
+
+test('caller_cwd (the folder the standalone MCP server reports) is read by the guard, on tool and hook routes alike', () => {
+  init();
+  const guard = offPlaceGuard();
+  // A tool call to the query route from an off folder: no session id, no via, only caller_cwd.
+  const q = send(guard, { method: 'POST', path: '/undertow/query', body: { prompt: 'anything', caller_cwd: OFF_CWD } });
+  assert.equal(q.status, 403);
+  assert.equal(q.nexted, false);
+  // GET tool routes carry it in the query string.
+  for (const path of ['/undertow/neuron', '/undertow/held', '/undertow/stats', '/undertow/logs']) {
+    const r = send(guard, { path, query: { caller_cwd: OFF_CWD } });
+    assert.equal(r.status, 403, path);
+  }
+  // An ordinary or drone folder passes, on hook routes and tool routes.
+  for (const cwd of ['/work/app', DRONE_CWD]) {
+    assert.equal(send(guard, { method: 'POST', path: '/undertow/query', body: { prompt: 'x', caller_cwd: cwd } }).nexted, true);
+    assert.equal(send(guard, { path: '/undertow/stats', query: { caller_cwd: cwd } }).nexted, true);
+  }
+});

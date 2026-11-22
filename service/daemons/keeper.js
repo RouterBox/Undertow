@@ -544,10 +544,14 @@ const OFF_GUARD_HOOK_ROUTES = ['/undertow/query', '/undertow/session-start', '/u
 export function offPlaceGuard({ log = () => {}, now = Date.now } = {}) {
   const lastLogged = new Map(); // route -> time of the last refusal logged (one line a minute per route)
   return function guard(req, res, next) {
+    // A tool call says so with via 'mcp', or by carrying caller_cwd: the folder
+    // the standalone MCP server reports. caller_cwd is read here and nowhere
+    // else, so sending it changes nothing for a session in an ordinary folder.
     const via = req.body?.via ?? req.query?.via;
-    if (OFF_GUARD_HOOK_ROUTES.includes(req.path) && via !== 'mcp') return next();
+    const callerCwd = [req.body?.caller_cwd, req.query?.caller_cwd].find(v => typeof v === 'string' && v);
+    if (OFF_GUARD_HOOK_ROUTES.includes(req.path) && via !== 'mcp' && !callerCwd) return next();
     const sessionId = [req.body?.session_id, req.query?.session_id].find(v => typeof v === 'string' && v);
-    const byCwd = [req.body?.cwd, req.query?.cwd].some(v => typeof v === 'string' && keeper.cwdIsOff(v));
+    const byCwd = [req.body?.cwd, req.query?.cwd, callerCwd].some(v => typeof v === 'string' && keeper.cwdIsOff(v));
     const bySession = keeper.sessionIsOff(sessionId);
     if (!byCwd && !bySession) return next();
     const t = now();
