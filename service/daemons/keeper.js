@@ -47,7 +47,13 @@ const defaults = {
   cwdRules: [
     { pattern: 'agentbox-worktrees', tier: 'drone' },
   ],
+  // cwd substrings (case-insensitive) that mark a session as an agent session
+  // whatever its turn-taking looks like - for an agent whose instructions
+  // arrive as ordinary prompts. Empty by default; set per deployment.
+  agentCwdPatterns: [],
 };
+
+const VALID_KINDS = new Set(['agent', 'human']);
 
 let config = { ...defaults };
 let ledger = new Map(); // sessionId → entry
@@ -103,6 +109,7 @@ function maybePromote(e, sessionId) {
   if (!conversational && !agentic) return false;
   e.tier = 'conscious';
   e.promotedAt = now();
+  e.promotedVia = conversational ? 'turn-taking' : 'agentic';
   stats.promoted++;
   dirty = true;
   logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} promoted to conscious via ${conversational ? 'turn-taking' : 'agentic volume'} (${e.proseTurns} turns, ${e.humanGaps} human gaps, ${e.toolEvents || 0} tool events)`);
@@ -295,6 +302,43 @@ const keeper = {
         logFn('keeper', 'warn', `session ${String(sessionId).slice(0, 8)} gated ${e.gated}x with no promotion (${e.proseTurns} prose turns, ${e.toolEvents || 0} tool events) — if this is a real human, see promoteAfterTurns/agenticToolEvents in daemon-config or set UNDERTOW_DEFAULT_TIER`);
       }
     }
+  },
+
+  /**
+   * Who is on the other end of a session: 'agent' or 'human', and why.
+   * Agent sessions keep their flashes; what Dreamer writes from them is held
+   * apart (see docs/KEEPER.md, "Agent sessions"). In order:
+   *   1. declared with setKind (POST /undertow/keeper {kind})
+   *   2. cwd matches one of config.agentCwdPatterns
+   *   3. promoted by tool volume and still without conversational turn-taking
+   *      (an entry that is conscious, undeclared and non-conversational can only
+   *      have come through the agentic path, so entries promoted before
+   *      promotedVia was recorded are covered too)
+   * Anything else is human, which is today's behaviour.
+   */
+  sessionKind(sessionId, cwd) {
+    if (!config.enabled) return { kind: 'human', why: 'keeper disabled' };
+    const e = ledger.get(sessionId);
+    if (e && VALID_KINDS.has(e.declaredKind)) return { kind: e.declaredKind, why: 'declared' };
+    const where = String(cwd || (e && e.cwd) || '').toLowerCase();
+    for (const p of config.agentCwdPatterns || []) {
+      if (p && where && where.includes(String(p).toLowerCase())) return { kind: 'agent', why: `cwd matches "${p}"` };
+    }
+    if (e && e.tier === 'conscious' && !e.declared) {
+      const conversational = e.proseTurns >= config.promoteAfterTurns && e.humanGaps >= 1;
+      if (!conversational) return { kind: 'agent', why: 'promoted by tool volume' };
+    }
+    return { kind: 'human', why: 'default' };
+  },
+
+  /** Manual declaration of who a session is: 'agent' | 'human', or null to clear. */
+  setKind(sessionId, kind) {
+    if (kind !== null && !VALID_KINDS.has(kind)) return false;
+    const e = getEntry(sessionId, null, null);
+    if (kind === null) delete e.declaredKind; else e.declaredKind = kind;
+    dirty = true;
+    persist();
+    return true;
   },
 
   /** Manual tier override (POST /undertow/keeper). */

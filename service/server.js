@@ -28,6 +28,7 @@ import { sanitizeNamespace, livePredicate } from './namespaces.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
 import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
+import { HELD_NAMESPACE, isHeld, releaseHeld } from './held.js';
 import { importVault, reverseTapestry } from './vault.js';
 import vaultwatch from './daemons/vaultwatch.js';
 import { resolve as pathResolve } from 'path';
@@ -798,6 +799,10 @@ app.post('/undertow/chase', async (req, res) => {
     const { neuron } = req.body;
     if (!neuron) return res.status(400).json({ error: 'neuron name required' });
 
+    // A chase is use: a held neuron (written from an agent session) joins the live graph.
+    const released = await releaseHeld({ runCypher, name: neuron, by: 'chase', log })
+      .catch(e => { log('error', 'warn', e.message); return false; });
+
     // Strong pursuit reward: +15 base_score (vs +10 for normal pursuit)
     const rewarded = await runCypher(`
       MATCH (n:Neuron {name: $name})
@@ -822,7 +827,7 @@ app.post('/undertow/chase', async (req, res) => {
     `, { name: neuron }).catch(e => log('error', 'warn', e.message));
 
     log('chase', 'info', `chased: ${neuron}`, { detail: 'base_score +15, synapses +0.08' });
-    res.json({ status: 'chased', neuron });
+    res.json(released ? { status: 'chased', neuron, released: true } : { status: 'chased', neuron });
   } catch (e) {
     log('chase', 'error', e.message);
     res.status(500).json({ error: e.message });
@@ -914,12 +919,20 @@ app.post('/undertow/feedback', async (req, res) => {
       return res.json({ status: 'recorded', neuron, verdict, session: matchedId, applied: 'at next turn summarize (Dreamer)' });
     }
 
-    const ns = sanitizeNamespace(req.body.namespace) ?? (session_id && sessions.get(session_id)?.namespace) ?? null;
+    let ns = sanitizeNamespace(req.body.namespace) ?? (session_id && sessions.get(session_id)?.namespace) ?? null;
     const exists = await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} RETURN n.name AS name LIMIT 1`, { name: neuron, ns });
-    if (exists.length === 0) return res.status(404).json({ error: `no live neuron named "${neuron}"` });
+    if (exists.length === 0) {
+      // Not in the live graph: it may be a held neuron (written from an agent session).
+      if (ns !== null || !(await isHeld({ runCypher, name: neuron }))) return res.status(404).json({ error: `no live neuron named "${neuron}"` });
+      ns = HELD_NAMESPACE;
+    }
     await applyVerdictToNeuron({ runCypher, name: neuron, ns, verdict, note: cleanNote, log });
+    // used/useful is use: a held neuron joins the live graph.
+    const released = ns === HELD_NAMESPACE && (verdict === 'used' || verdict === 'useful')
+      ? await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log })
+      : false;
     log('feedback', 'info', `explicit feedback applied directly: ${verdict} "${neuron.substring(0, 60)}"`, { detail: 'no matching session' });
-    res.json({ status: 'applied_directly', neuron, verdict, session: null, note: 'no session with this neuron among its surfaced flashes; verdict applied to the neuron directly' });
+    res.json({ status: 'applied_directly', neuron, verdict, session: null, ...(released ? { released: true } : {}), note: 'no session with this neuron among its surfaced flashes; verdict applied to the neuron directly' });
   } catch (e) {
     log('feedback', 'error', e.message);
     res.status(500).json({ error: e.message });
@@ -1234,14 +1247,23 @@ app.get('/undertow/keeper', (req, res) => {
   res.json(keeper.snapshot());
 });
 
-// POST /undertow/keeper — Manual tier override: {"session_id": "...", "tier": "conscious|observer|drone|off|candidate"}
+// POST /undertow/keeper — Manual override: {"session_id": "...", "tier": "conscious|observer|drone|off|candidate"}
+// and/or {"session_id": "...", "kind": "agent|human"} to declare who the session is
+// (an agent session's insights are held; "kind": null clears the declaration).
 app.post('/undertow/keeper', (req, res) => {
-  const { session_id, tier } = req.body || {};
-  if (!session_id || !tier) return res.status(400).json({ error: 'session_id and tier required' });
-  const ok = keeper.setTier(session_id, tier);
-  if (!ok) return res.status(400).json({ error: 'invalid tier' });
-  log('keeper', 'info', `manual override: ${String(session_id).slice(0, 8)} → ${tier}`);
-  res.json({ ok: true, session_id, tier });
+  const { session_id, tier, kind } = req.body || {};
+  if (!session_id || (!tier && kind === undefined)) return res.status(400).json({ error: 'session_id and tier or kind required' });
+  if (tier) {
+    const ok = keeper.setTier(session_id, tier);
+    if (!ok) return res.status(400).json({ error: 'invalid tier' });
+    log('keeper', 'info', `manual override: ${String(session_id).slice(0, 8)} → ${tier}`);
+  }
+  if (kind !== undefined) {
+    const ok = keeper.setKind(session_id, kind);
+    if (!ok) return res.status(400).json({ error: 'invalid kind (agent, human or null)' });
+    log('keeper', 'info', `manual declaration: ${String(session_id).slice(0, 8)} is ${kind ?? 'undeclared'}`);
+  }
+  res.json({ ok: true, session_id, ...(tier ? { tier } : {}), ...(kind !== undefined ? { kind } : {}) });
 });
 
 // GET /undertow/daemon-config — View current daemon configuration

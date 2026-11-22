@@ -1,6 +1,6 @@
 # The Keeper — Session Attachment & Memory Formation Gating
 
-**Status:** designed 2026-08-30; core built 2026-08-31 (`service/daemons/keeper.js` + server gating). Live behavior verified: one-shot sessions fast-pathed, `agentbox-worktrees` cwd rule → drone, human-cadence session promoted to conscious on prompt 3. Ledger persists to `service/keeper-ledger.json`; status at `GET /undertow/keeper`, manual override via `POST /undertow/keeper {session_id, tier}`. Observer writes quarantine via `namespace: 'quarantine'` (excluded from all recall paths). NOT yet done: retro-attach on promotion (Wonder catches up on the next Stop instead), and the machine-wide hooks remain **disabled** in `~/.claude/settings.json` — re-enabling them (from `settings.backupHooks.json`) is the deliberate final switch now that the Keeper makes it safe.
+**Status:** designed 2026-08-30; core built 2026-08-31 (`service/daemons/keeper.js` + server gating). Live behavior verified: one-shot sessions fast-pathed, `agentbox-worktrees` cwd rule → drone, human-cadence session promoted to conscious on prompt 3. Ledger persists to `service/keeper-ledger.json`; status at `GET /undertow/keeper`, manual override via `POST /undertow/keeper {session_id, tier}`. Observer writes quarantine via `namespace: 'quarantine'` (excluded from all recall paths). Agent sessions (built 2026-11-22, see "Agent sessions: held insights" below): Dreamer writes only durable kinds from them, into the same quarantine namespace, released on use. NOT yet done: retro-attach on promotion (Wonder catches up on the next Stop instead), and the machine-wide hooks remain **disabled** in `~/.claude/settings.json` — re-enabling them (from `settings.backupHooks.json`) is the deliberate final switch now that the Keeper makes it safe.
 
 ## The problem, measured
 
@@ -127,7 +127,9 @@ Independent of tiering, the write path gets a constitutional rule: **only
 `conscious` sessions form live memories directly.**
 
 - Every neuron records `origin_session`, `origin_tier` (feeds the planned
-  Source/`DERIVED_FROM` provenance model).
+  Source/`DERIVED_FROM` provenance model). *Built so far:* the insights Dreamer
+  writes record `origin_session` and `origin_kind` (`agent` or `human`);
+  Gobble's neurons do not yet.
 - Writes from `observer`/`drone` sessions land in **quarantine** — a namespace
   (or `tier: T4_quarantine`) that is excluded from flash recall. Quarantined
   neurons that later prove useful (pursued via voluntary queries, or promoted by
@@ -161,6 +163,66 @@ Spider, Janitor, Prowler); at PostToolUse it skips Gobble. A `plumbing` turn ski
 only Wonder's pre-warm, because task notifications often carry real work that
 Dreamer should still process. The flag is per session id and in memory only, so
 parallel turns in one session share it (last prompt wins).
+
+### 5. Agent sessions: held insights
+
+Added 2026-11-22 after an audit of 53 insights Dreamer wrote in one day: all 53
+came from agent sessions (long-running agents promoted to `conscious` by tool
+volume), none from a person. About half were status or chatter, ten were
+already false within a day, two credited the wrong actor, and one of the 53 was
+ever flashed. Tiers decide whether a session is attended to at all; this
+mechanism decides what a *conscious* session may write when the one on the
+other end is an agent.
+
+**Who is an agent session** (`keeper.sessionKind`, first match wins):
+
+1. Declared: `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
+   (or `"human"`; `null` clears it).
+2. The session's cwd contains one of `agentCwdPatterns` in the Keeper's
+   daemon-config (case-insensitive substrings, empty by default). This is for an
+   agent whose orders arrive as ordinary prompts, so its turn-taking looks human.
+3. It was promoted by tool volume (the agentic path) and has not since shown
+   conversational turn-taking (`promoteAfterTurns` prose prompts with a human
+   gap). A person doing deep agentic work becomes `human` again as soon as they
+   take those turns.
+
+Everything else is a human session and behaves exactly as before.
+
+**What does not change for an agent session:** its tier, its flashes, pursuit
+detection, train of thought, and Gobble's ingest.
+
+**What changes, at Stop (Dreamer):**
+
+- **The rule.** An insight is written only if it is one of three kinds and will
+  still be true and useful a month from now: a `lesson` (a root cause or a way
+  something fails, and how to recognise or avoid it), a `procedure` (how to do
+  something that will need doing again), or a `decision` (a design or policy
+  choice with its reason). Never written: the state of work (pull requests,
+  branches, commits, merges, deploys, restarts, queues, to-do lists), a review
+  verdict on one commit, forecasts and plans, anything only true "now". The
+  prompt states this, and the code drops any insight that does not declare one
+  of the three kinds. The kind is stored as `durable_kind`.
+- **Held, not live.** The insight is written into the `quarantine` namespace,
+  which no recall path reads, so it is never flashed. It has no edges: edges do
+  not cross a namespace boundary.
+- **No rewrites.** An agent session does not update (supersede) existing
+  neurons; that would put its text into the live graph past the hold.
+- **No actor names.** The prompt tells the model not to say who did, said or
+  decided something. Who wrote it is recorded by the system instead:
+  `origin_session` (the session id) and `origin_kind: 'agent'`. A person's
+  words relayed inside an agent session are therefore marked as coming from an
+  agent session, and are held like the rest.
+
+**Release.** A held neuron joins the live graph when something uses it:
+`POST /undertow/chase` on its name, or `POST /undertow/feedback` with verdict
+`used` or `useful`. Release sets `namespace` to live, records `released_at`
+and `released_by`, and marks the neuron un-spidered so Spider links it on its
+next run. If a live neuron already has the same name, the held one stays held.
+Held neurons can be read with `GET /undertow/neuron?name=...&namespace=quarantine`.
+
+**Not built:** nothing surfaces held neurons on its own, so one that nobody
+looks up stays held; there is no expiry or sweep of old held neurons yet; and
+two insights about the same event are not detected as duplicates.
 
 ### The voluntary path is how automation participates
 

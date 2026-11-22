@@ -40,7 +40,8 @@
       "habituationMaxPrompts": 30,
       "cwdRules": [
         { "pattern": "agentbox-worktrees", "tier": "drone" }
-      ]
+      ],
+      "agentCwdPatterns": []
     },
     "tapestry": {
       "enabled": true,
