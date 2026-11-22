@@ -59,6 +59,9 @@ const defaults = {
   // tier (durable kinds only, held until a human session uses it).
   // true: an agent session is summarized like a person's.
   agentInsights: false,
+  // false: Gobble writes nothing from an agent session, nor from a session a
+  // configured roster could not answer for. true: such sessions ingest like any other.
+  agentIngest: false,
 };
 
 const VALID_KINDS = new Set(['agent', 'human']);
@@ -73,7 +76,9 @@ let logFn = () => {};
 // In-memory only (turn-scoped; a stale flag surviving a restart would wrongly
 // skip a later Stop). Absent key = the latest prompt was not habituated.
 const turnReasons = new Map();
-let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0 };
+let stats = { fastPathed: 0, promoted: 0, registered: 0, habituated: 0, agentIngestsDropped: 0, unknownIngestsDropped: 0 };
+// Sessions whose first dropped ingest has been logged (PostToolUse fires constantly: one line each).
+const ingestDropLogged = new Set();
 
 // A prompt that is harness plumbing rather than a human thought — task
 // notifications, system reminders — never deserves the involuntary layer.
@@ -402,6 +407,29 @@ const keeper = {
     if (!config.enabled) return { agent: false, why: 'keeper disabled' };
     await keeper.askRoster(sessionId, fetchImpl);
     return keeper.isAgentSession(sessionId, cwd);
+  },
+
+  /**
+   * May Gobble write what this session's tool event produced? Not from an
+   * agent session, and not from a session a configured roster could not answer
+   * for: tool output can carry anything the agent read, and a lost tool-output
+   * episode costs nothing. With no roster configured and no cwd match, or with
+   * config agentIngest on, the answer is yes. Counts each refusal and logs the
+   * first one per session. Call it only after the hook response has been sent.
+   * Returns { write, why }.
+   */
+  async ingestDecision(sessionId, cwd, fetchImpl) {
+    if (!config.enabled || config.agentIngest === true) return { write: true, why: 'not gated' };
+    const roster = await keeper.askRoster(sessionId, fetchImpl);
+    const { agent, why } = keeper.isAgentSession(sessionId, cwd);
+    if (!agent && roster !== 'unknown') return { write: true, why: 'not an agent session' };
+    if (agent) stats.agentIngestsDropped++; else stats.unknownIngestsDropped++;
+    const reason = agent ? `agent session: ${why}` : 'a roster did not answer';
+    if (!ingestDropLogged.has(sessionId)) {
+      ingestDropLogged.add(sessionId);
+      logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)}: ingest not written (${reason}); further drops for this session are counted, not logged`);
+    }
+    return { write: false, why: reason };
   },
 
   /** True when an agent session is to be summarized like a person's (config agentInsights); false sends it through the held tier. */

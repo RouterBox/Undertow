@@ -220,7 +220,8 @@ start, so a change needs a restart):
   "agentRosters": ["http://127.0.0.1:8080/sessions"],
   "agentRosterKinds": ["spawned"],
   "agentCwdPatterns": [],
-  "agentInsights": false
+  "agentInsights": false,
+  "agentIngest": false
 }
 ```
 
@@ -250,7 +251,21 @@ name was taken, written to the held tier, turns held as unknown, released,
 and releases refused.
 
 **What does not change for an agent session:** its tier, its flashes, pursuit
-detection, train of thought, and Gobble's ingest.
+detection and train of thought.
+
+**Gobble writes nothing from an agent session.** A tool event carries whatever
+the agent read: a file, a web page, a message, a notification. Turned into a
+neuron, that text can later be flashed into any other session. So a
+PostToolUse ingest from an agent session is dropped before Gobble sees it, at
+the conscious tier and at the observer tier alike, and so is one from a
+session a configured roster could not answer for: a lost tool-output episode
+costs nothing, and a wrongly kept one cannot be taken back. With no roster
+configured and no cwd match, Gobble behaves as before. `agentIngest: true`
+turns this off. The explicit ingest endpoints (`/undertow/external-ingest`,
+`/undertow/ingest-url`, `/undertow/ingest-file`) are deliberate calls and are
+not gated. `GET /undertow/keeper` counts `agentIngestsDropped` and
+`unknownIngestsDropped`; the log has one line for the first ingest dropped
+from each session.
 
 **What changes, at Stop (Dreamer):**
 

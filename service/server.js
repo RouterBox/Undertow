@@ -297,6 +297,11 @@ app.post('/undertow/ingest', async (req, res) => {
     log('keeper', 'info', `habituated turn (repeat) - skipped ingest (${String(req.body.session_id || 'default').slice(0, 8)})`);
     return;
   }
+  // Gobble writes nothing from an agent session, or from one a configured
+  // roster could not answer for (Keeper config agentIngest). The hook has
+  // already been answered above, so asking the roster delays nothing.
+  const ingest = await keeper.ingestDecision(req.body.session_id || 'default', req.body.cwd);
+  if (!ingest.write) return;
   log('hook', 'info', 'PostToolUse');
 
   try {
