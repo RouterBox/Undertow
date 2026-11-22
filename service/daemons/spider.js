@@ -33,6 +33,15 @@ function truncate(s, n) {
 
 const SWEEP_EDGE_TYPES = ['causal', 'temporal', 'elaborates', 'contradicts', 'contains', 'prerequisite', 'associative'];
 
+// The two Cypher statements GDS projects the graph from. Superseded neurons are
+// archived versions: they are left out of the node set, so every edge that
+// touches one must be left out of the relationship set too. GDS aborts the
+// whole projection on a relationship whose endpoint is not a projected node.
+const GDS_NODE_QUERY =
+  'MATCH (n:Neuron) WHERE (($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns) AND n.superseded IS NULL RETURN id(n) AS id';
+const GDS_REL_QUERY =
+  'MATCH (a:Neuron)-[s:SYNAPSE]-(b:Neuron) WHERE ((($ns IS NULL AND a.namespace IS NULL) OR a.namespace = $ns) AND (($ns IS NULL AND b.namespace IS NULL) OR b.namespace = $ns)) AND a.superseded IS NULL AND b.superseded IS NULL RETURN id(a) AS source, id(b) AS target, s.weight AS weight';
+
 async function recomputeGDS(runCypher, log, ns = null) {
   const countResult = await runCypher(`MATCH (n:Neuron) WHERE ${livePredicate('n')} RETURN count(n) AS count`, { ns }).catch(() => [{ count: 0 }]);
   const nodeCount = countResult[0]?.count?.low ?? countResult[0]?.count ?? 0;
@@ -47,8 +56,8 @@ async function recomputeGDS(runCypher, log, ns = null) {
     // GDS scores must not flow across namespace boundaries.
     await runCypher(`
       CALL gds.graph.project.cypher('${graphName}',
-        'MATCH (n:Neuron) WHERE (($ns IS NULL AND n.namespace IS NULL) OR n.namespace = $ns) AND n.superseded IS NULL RETURN id(n) AS id',
-        'MATCH (a:Neuron)-[s:SYNAPSE]-(b:Neuron) WHERE ((($ns IS NULL AND a.namespace IS NULL) OR a.namespace = $ns) AND (($ns IS NULL AND b.namespace IS NULL) OR b.namespace = $ns)) RETURN id(a) AS source, id(b) AS target, s.weight AS weight',
+        '${GDS_NODE_QUERY}',
+        '${GDS_REL_QUERY}',
         { parameters: { ns: $ns } })
     `, { ns }).catch(e => log('spider', 'warn', `GDS projection failed: ${e.message}`));
     await runCypher(`CALL gds.pageRank.write('${graphName}', { writeProperty: 'pagerank', maxIterations: 20 })`)
@@ -62,6 +71,8 @@ async function recomputeGDS(runCypher, log, ns = null) {
   }
   log('spider', 'info', 'GDS recomputed: pagerank, bridge_score, community_id');
 }
+
+export { recomputeGDS, GDS_NODE_QUERY, GDS_REL_QUERY };
 
 export default {
   name: 'spider',
