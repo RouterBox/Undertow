@@ -122,6 +122,14 @@ function sameFlash(a, b) {
   return short.length >= 20 && long.includes(short);
 }
 
+// The summarize prompt asks for "connections" without spelling out an element
+// shape, so the model picks one: an object with target_name (or target / name),
+// or just the neuron's name as a string. Returns the target name, or null.
+function connectionTarget(conn) {
+  const t = typeof conn === 'string' ? conn : (conn?.target_name ?? conn?.target ?? conn?.name);
+  return typeof t === 'string' && t.trim() ? t.trim() : null;
+}
+
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
   const { session_id, transcript_path, cwd } = req_body;
 
@@ -239,6 +247,10 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         // Create connections for insights
         if (insight.connections?.length) {
           for (const conn of insight.connections) {
+            // No usable target: nothing to link. Sending the query anyway failed in
+            // the driver ("Expected parameter(s): tgt") and logged a warning per edge.
+            const tgt = connectionTarget(conn);
+            if (!tgt) continue;
             await runCypher(`
                 MATCH (src:Neuron {name: $src})
                 WHERE ${nsPredicate('src')}
@@ -249,7 +261,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
                   context: $context, created_at: datetime()
                 }]->(tgt)
               `, {
-              src: insight.name, tgt: conn.target_name, ns,
+              src: insight.name, tgt, ns,
               weight: conn.weight || 0.5, edgeType: conn.edge_type || 'associative',
               context: conn.context || ''
             }).catch(e => log('error', 'warn', e.message));
@@ -619,4 +631,5 @@ async function summarizeForTurn(deps, keeper) {
   return { skipped: false };
 }
 
+export { connectionTarget };
 export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };

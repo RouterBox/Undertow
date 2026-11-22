@@ -1,0 +1,67 @@
+// Dreamer links a new insight to the neurons the model names, whatever shape
+// the model used for a connection, and skips one that names nothing.
+// Uses stubbed runCypher / callAnthropic, so no Neo4j or network is needed.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { handleSummarize, connectionTarget } from '../daemons/dreamer.js';
+
+test('connectionTarget reads the usual shapes and rejects the rest', () => {
+  assert.equal(connectionTarget({ target_name: 'Kettle config' }), 'Kettle config');
+  assert.equal(connectionTarget({ target: 'Kettle config' }), 'Kettle config');
+  assert.equal(connectionTarget({ name: 'Kettle config' }), 'Kettle config');
+  assert.equal(connectionTarget('  Kettle config '), 'Kettle config');
+  assert.equal(connectionTarget({ target_name: '' }), null);
+  assert.equal(connectionTarget({ edge_type: 'causal' }), null);
+  assert.equal(connectionTarget({ target_name: 42 }), null);
+  assert.equal(connectionTarget(null), null);
+  assert.equal(connectionTarget(undefined), null);
+});
+
+async function summarizeWith(connections) {
+  const calls = [];
+  const logs = [];
+  await handleSummarize({
+    req_body: { session_id: 's1' },
+    session: { activeTopics: [], pendingFlashes: [], explicitFeedback: {} },
+    // The real driver rejects a query whose parameter is undefined; do the same.
+    runCypher: async (q, p) => {
+      for (const m of q.matchAll(/\$([a-zA-Z_]+)/g)) {
+        if (p?.[m[1]] === undefined) throw new Error(`Expected parameter(s): ${m[1]}`);
+      }
+      calls.push({ q, p });
+      return [];
+    },
+    callAnthropic: async () => ({
+      model: 'claude-sonnet-5',
+      response: { content: [{ text: JSON.stringify({
+        insights: [{ name: 'Gate design', node_type: 'insight', flash_summary: 'One run at a time', body: 'Two sentences of body. Enough to pass.', connections }],
+        updates: [], train_of_thought: [], flash_results: []
+      }) }] }
+    }),
+    embedNeuron: async () => {}, randomUUID: () => 'u',
+    isDaemonEnabled: () => false, getDaemonConfig: () => ({}),
+    wonder: {}, spider: {}, janitor: {}, prowler: {},
+    log: (...a) => logs.push(a)
+  });
+  const edges = calls.filter(c => /CREATE \(src\)-\[:SYNAPSE/.test(c.q)).map(c => c.p.tgt);
+  const warns = logs.filter(l => l[1] === 'warn').map(l => l[2]);
+  return { edges, warns };
+}
+
+test('every connection that names a neuron gets an edge query, in any shape', async () => {
+  const { edges, warns } = await summarizeWith([
+    { target_name: 'A', edge_type: 'causal', weight: 0.7, context: 'because' },
+    { target: 'B' },
+    'C'
+  ]);
+  assert.deepEqual(edges, ['A', 'B', 'C']);
+  assert.deepEqual(warns, []);
+});
+
+test('a connection that names nothing is skipped without a warning', async () => {
+  const { edges, warns } = await summarizeWith([{ edge_type: 'causal', context: 'no target given' }, { target_name: 'A' }]);
+  assert.deepEqual(edges, ['A']);
+  assert.deepEqual(warns, [], 'no "Expected parameter(s): tgt" from the driver');
+});
