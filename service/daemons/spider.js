@@ -72,6 +72,34 @@ async function recomputeGDS(runCypher, log, ns = null) {
   log('spider', 'info', 'GDS recomputed: pagerank, bridge_score, community_id');
 }
 
+// A neuron is marked spidered after one pass whether or not that pass found it
+// an edge. One that found none is an orphan, and the graph it failed to connect
+// to keeps growing, so it gets another pass after this many days.
+const ORPHAN_RETRY_DAYS = 7;
+
+/**
+ * The next neurons for edge discovery (at most 20): those never spidered,
+ * newest first, then orphans (no SYNAPSE at all) whose last pass is at least
+ * ORPHAN_RETRY_DAYS old, longest-waiting first.
+ */
+async function findUnspidered({ runCypher, ns = null, log = () => {} }) {
+  return runCypher(`
+    MATCH (n:Neuron)
+    WHERE ${livePredicate('n')}
+    AND ((n.spidered IS NULL OR n.spidered = false)
+      OR (NOT (n)-[:SYNAPSE]-()
+          AND (n.spidered_at IS NULL OR n.spidered_at < datetime() - duration({days: $retryDays}))))
+    RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type
+    ORDER BY coalesce(n.spidered, false), n.spidered_at ASC, n.created_at DESC
+    LIMIT 20
+  `, { ns, retryDays: ORPHAN_RETRY_DAYS }).catch(err => {
+    log('spider', 'error', `unspidered query failed: ${err.message}`);
+    return [];
+  });
+}
+
+export { findUnspidered, ORPHAN_RETRY_DAYS };
+
 export { recomputeGDS, GDS_NODE_QUERY, GDS_REL_QUERY };
 
 export default {
@@ -230,18 +258,7 @@ Be conservative. Most pairs are NOT related — an empty array is the correct an
     // --- Phase 1: Edge Discovery ---
     log('spider', 'info', 'phase 1: edge discovery');
 
-    // Find neurons that haven't been spidered yet, or were created since last run
-    const unspidered = await runCypher(`
-      MATCH (n:Neuron)
-      WHERE (n.spidered IS NULL OR n.spidered = false)
-      AND ${livePredicate('n')}
-      RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type
-      ORDER BY n.created_at DESC
-      LIMIT 20
-    `, { ns }).catch(err => {
-      log('spider', 'error', `unspidered query failed: ${err.message}`);
-      return [];
-    });
+    const unspidered = await findUnspidered({ runCypher, ns, log });
 
     if (unspidered.length > 0) {
       // For each unspidered neuron, find potential connections
