@@ -135,7 +135,7 @@ function connectionTarget(conn) {
   return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
-async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
+async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, withholdInsights = false, noteAgentTurn = null }) {
   const { session_id, transcript_path, cwd } = req_body;
 
   // Namespace isolation: writes and reinforcement stay inside the session's
@@ -202,6 +202,18 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // the reply did not mention gets no outcome.
   if (Array.isArray(parsed.flash_results)) {
     for (const entry of evaluated) entry.judged = true;
+  }
+
+  // An agent session with agent insights off (Keeper config agentInsights):
+  // nothing it says becomes a neuron or rewrites one. Judging, feedback, train
+  // of thought and the downstream daemons below run as for any session.
+  if (withholdInsights) {
+    const insights = Array.isArray(parsed.insights) ? parsed.insights.length : 0;
+    const updates = Array.isArray(parsed.updates) ? parsed.updates.length : 0;
+    if (noteAgentTurn) noteAgentTurn({ insights, updates });
+    if (insights || updates) log('summarize', 'info', `agent session: ${insights} insight(s) not written, ${updates} update(s) not applied`);
+    parsed.insights = [];
+    parsed.updates = [];
   }
 
   // Process updates to existing neurons — supersession, not overwrite:
@@ -639,7 +651,11 @@ async function summarizeForTurn(deps, keeper) {
     deps.log('keeper', 'info', `habituated turn (repeat) - skipped (${String(sid).slice(0, 8)})`);
     return { skipped: true };
   }
-  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing' });
+  // An agent session (on a launcher's roster, or by cwd) writes no insights
+  // unless the Keeper's agentInsights is on. The Stop response is already sent.
+  const agent = await keeper.resolveAgent(sid, deps.req_body.cwd);
+  const withholdInsights = agent.agent && !keeper.agentInsightsEnabled();
+  await handleSummarize({ ...deps, skipWonder: reason === 'plumbing', withholdInsights, noteAgentTurn: withholdInsights ? keeper.noteAgentTurn : null });
   return { skipped: false };
 }
 
