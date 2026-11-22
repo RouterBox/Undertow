@@ -31,10 +31,15 @@ PURSUIT DETECTION:
 - "dismissed" = the agent ignored the flash entirely
 - If the agent used information from the flash without quoting it, that's still "pursued"
 
+CONNECTIONS:
+- A connection links a new insight to a neuron that already exists. The only neurons you know exist are the ones named in the injected flashes.
+- target_name must be that neuron's exact name. If you cannot give an exact name, leave connections empty. Never invent a name.
+- Most insights have no connections. That is correct.
+
 Return JSON:
 {
   "insights": [
-    {"name": "2-5 word label", "node_type": "fact|concept|decision|insight", "tier": "T2_working", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "event_date": "YYYY-MM-DD only when the remembered event has a clear date; omit otherwise", "connections": []}
+    {"name": "2-5 word label", "node_type": "fact|concept|decision|insight", "tier": "T2_working", "flash_summary": "one sentence <100 chars", "body": "2-5 sentences of real content", "event_date": "YYYY-MM-DD only when the remembered event has a clear date; omit otherwise", "connections": [{"target_name": "exact name of an existing neuron", "edge_type": "causal|temporal|elaborates|contradicts|contains|prerequisite|associative", "weight": 0.5, "context": "a few words on why they are linked"}]}
   ],
   "updates": [
     {"existing_name": "neuron to update", "flash_summary": "new summary", "body": "new body", "reason": "what changed", "event_date": "YYYY-MM-DD optional"}
@@ -120,6 +125,14 @@ function sameFlash(a, b) {
   if (x === y) return true;
   const [short, long] = x.length <= y.length ? [x, y] : [y, x];
   return short.length >= 20 && long.includes(short);
+}
+
+// The summarize prompt asks for "connections" without spelling out an element
+// shape, so the model picks one: an object with target_name (or target / name),
+// or just the neuron's name as a string. Returns the target name, or null.
+function connectionTarget(conn) {
+  const t = typeof conn === 'string' ? conn : (conn?.target_name ?? conn?.target ?? conn?.name);
+  return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false }) {
@@ -239,7 +252,13 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         // Create connections for insights
         if (insight.connections?.length) {
           for (const conn of insight.connections) {
-            await runCypher(`
+            // No usable target: nothing to link. Sending the query anyway failed in
+            // the driver ("Expected parameter(s): tgt") and logged a warning per edge.
+            const tgt = connectionTarget(conn);
+            if (!tgt) continue;
+            // An insight never links to itself.
+            if (tgt === insight.name) continue;
+            const linked = await runCypher(`
                 MATCH (src:Neuron {name: $src})
                 WHERE ${nsPredicate('src')}
                 MATCH (tgt:Neuron {name: $tgt})
@@ -248,11 +267,16 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
                   weight: $weight, edge_type: $edgeType,
                   context: $context, created_at: datetime()
                 }]->(tgt)
+                RETURN tgt.name AS linked
               `, {
-              src: insight.name, tgt: conn.target_name, ns,
+              src: insight.name, tgt, ns,
               weight: conn.weight || 0.5, edgeType: conn.edge_type || 'associative',
               context: conn.context || ''
-            }).catch(e => log('error', 'warn', e.message));
+            }).catch(e => { log('error', 'warn', e.message); return null; });
+            // The model named a neuron that does not exist here: no edge was made.
+            if (Array.isArray(linked) && linked.length === 0) {
+              log('summarize', 'info', `connection target not found: "${tgt}" (from "${insight.name}")`);
+            }
           }
         }
         log('summarize', 'info', `insight: ${insight.name}`);
@@ -619,4 +643,5 @@ async function summarizeForTurn(deps, keeper) {
   return { skipped: false };
 }
 
+export { connectionTarget };
 export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
