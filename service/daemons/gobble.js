@@ -173,7 +173,7 @@ Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
       log('ingest', 'info', `SUPERSEDED: ${parsed.existing_name}`, {
         detail: `reason: ${parsed.reason || 'not specified'}`
       });
-      embedNeuron(parsed.existing_name, updates.flash_summary || '').catch(e => log('error', 'warn', e.message));
+      if (writeNamespace !== 'quarantine') embedNeuron(parsed.existing_name, updates.flash_summary || '').catch(e => log('error', 'warn', e.message));
     }
     return;
   }
@@ -239,7 +239,9 @@ Response: ${JSON.stringify(tool_response || '').substring(0, 1000)}`);
     }
 
     log('ingest', 'info', `created/updated: ${n.name} (${n.node_type})`);
-    embedNeuron(n.name, n.flash_summary).catch(e => log('error', 'warn', e.message));
+    // A quarantined (held) neuron gets no embedding until it is released, so it
+    // cannot take a vector-search slot from a live one.
+    if (writeNamespace !== 'quarantine') embedNeuron(n.name, n.flash_summary).catch(e => log('error', 'warn', e.message));
   }
 }
 

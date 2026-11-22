@@ -1,6 +1,7 @@
-// Agent sessions: Keeper says who a session is; Dreamer writes only durable
-// kinds from an agent session and holds them in the quarantine namespace; a
-// chase or a used/useful verdict releases a held neuron.
+// Agent sessions: Keeper says who a session is (a declared fact, never
+// behaviour); Dreamer writes only durable kinds from an agent session and holds
+// them in the quarantine namespace; a chase or a used/useful verdict from a
+// human session releases a held neuron.
 // Stubs only: no Neo4j, no Anthropic.
 
 import { test } from 'node:test';
@@ -8,49 +9,48 @@ import assert from 'node:assert/strict';
 
 import keeper from '../daemons/keeper.js';
 import { handleSummarize, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT } from '../daemons/dreamer.js';
-import { HELD_NAMESPACE, DURABLE_KINDS, durableKind, nodeTypeForKind, isHeld, releaseHeld } from '../held.js';
+import { handleIngest } from '../daemons/gobble.js';
+import { HELD_NAMESPACE, DURABLE_KINDS, durableKind, nodeTypeForKind, isHeld, releaseHeld, canRelease, listHeld, heldCounters } from '../held.js';
 
 // Small thresholds so a test can reach both promotion paths. Session ids are
 // unique per run: setKind persists the ledger file.
-keeper.init({ daemonConfig: { agenticToolEvents: 2, agenticMinHours: 1e-9, minCadenceSeconds: 0.001, agentCwdPatterns: ['AgentPlace'] } });
+const keeperLogs = [];
+keeper.init({ log: (...a) => keeperLogs.push(a), daemonConfig: { agenticToolEvents: 2, agenticMinHours: 1e-9, minCadenceSeconds: 0.001, agentCwdPatterns: ['AgentPlace'] } });
 const run = Date.now().toString(36);
 const id = (s) => `held-${s}-${run}`;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ---------- Keeper: who is on the other end ----------
 
-test('a session promoted by tool volume is an agent session', async () => {
-  const sid = id('volume');
-  keeper.recordPrompt(sid, 'C:/work/app', undefined, 'one long instruction to go and do a job');
-  assert.equal(keeper.sessionKind(sid).kind, 'human', 'a candidate is not an agent yet');
+test('behaviour never decides: tool-volume and turn-taking promotion both leave a session human', async () => {
+  const volume = id('volume');
+  keeper.recordPrompt(volume, 'C:/work/app', undefined, 'one long instruction to go and do a job');
   await sleep(5);
-  keeper.recordToolEvent(sid);
-  keeper.recordToolEvent(sid);
-  assert.equal(keeper.tierOf(sid), 'conscious');
-  assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'promoted by tool volume' });
+  keeper.recordToolEvent(volume);
+  keeper.recordToolEvent(volume);
+  assert.equal(keeper.tierOf(volume), 'conscious');
+  assert.deepEqual(keeper.sessionKind(volume), { kind: 'human', why: 'default' });
+
+  const turns = id('turns');
+  for (const p of ['what does the gate do', 'and why is the pause five minutes', 'ok, show me the config']) {
+    keeper.recordPrompt(turns, 'C:/work/app', undefined, p);
+    await sleep(5);
+  }
+  assert.equal(keeper.tierOf(turns), 'conscious');
+  assert.equal(keeper.sessionKind(turns).kind, 'human');
 });
 
-test('a session promoted by turn-taking is a human session', async () => {
-  const sid = id('turns');
-  for (const p of ['what does the gate do', 'and why is the pause five minutes', 'ok, show me the config']) {
+test('a flagged session is an agent whatever its turn-taking looks like', async () => {
+  const sid = id('flagged');
+  assert.equal(keeper.markAgent(sid, 'nightly-worker'), true);
+  for (const p of ['first varied prompt about gates', 'second varied prompt about pauses', 'third varied prompt about config']) {
     keeper.recordPrompt(sid, 'C:/work/app', undefined, p);
     await sleep(5);
   }
-  assert.equal(keeper.tierOf(sid), 'conscious');
-  assert.equal(keeper.sessionKind(sid).kind, 'human');
-});
-
-test('tool-volume promotion followed by real turn-taking becomes human', async () => {
-  const sid = id('volume-then-turns');
-  keeper.recordPrompt(sid, 'C:/work/app', undefined, 'start on the refactor please');
-  await sleep(5);
-  keeper.recordToolEvent(sid);
-  keeper.recordToolEvent(sid);
-  assert.equal(keeper.sessionKind(sid).kind, 'agent');
-  keeper.recordPrompt(sid, 'C:/work/app', undefined, 'that looks wrong, why did you move the helper');
-  await sleep(5);
-  keeper.recordPrompt(sid, 'C:/work/app', undefined, 'fine, keep it but rename the file');
-  assert.equal(keeper.sessionKind(sid).kind, 'human');
+  assert.equal(keeper.tierOf(sid), 'conscious', 'it looks conversational');
+  assert.deepEqual(keeper.sessionKind(sid), { kind: 'agent', why: 'flagged as an agent' });
+  assert.equal(keeper.markAgent(id('no-label'), '  '), false, 'an empty label flags nothing');
+  assert.equal(keeper.sessionKind(id('no-label')).kind, 'human');
 });
 
 test('a cwd on the agent list marks the session as agent, case-insensitively', () => {
@@ -63,19 +63,37 @@ test('a cwd on the agent list marks the session as agent, case-insensitively', (
   assert.equal(keeper.sessionKind(other).kind, 'human');
 });
 
-test('a declared kind wins, can be cleared, and rejects anything else', () => {
+test('a declared kind beats the flag and the cwd list, can be cleared, and rejects anything else', () => {
   const sid = id('declared');
   keeper.recordPrompt(sid, 'C:/github/AgentPlace', 'conscious', 'hello there');
+  keeper.markAgent(sid, 'worker');
   assert.equal(keeper.setKind(sid, 'human'), true);
   assert.deepEqual(keeper.sessionKind(sid), { kind: 'human', why: 'declared' });
   assert.equal(keeper.setKind(sid, null), true);
-  assert.equal(keeper.sessionKind(sid).kind, 'agent', 'back to the cwd rule');
+  assert.equal(keeper.sessionKind(sid).why, 'flagged as an agent', 'back to the flag');
   assert.equal(keeper.setKind(sid, 'robot'), false);
   const plain = id('declared-agent');
   keeper.recordPrompt(plain, 'C:/github/elsewhere', 'conscious', 'hello again');
   keeper.setKind(plain, 'agent');
   assert.deepEqual(keeper.sessionKind(plain), { kind: 'agent', why: 'declared' });
   assert.equal(keeper.sessionKind('never-seen-' + run).kind, 'human');
+});
+
+test('the operator can see who a session is: one log line per rule, and the snapshot lists kind and why', () => {
+  const sid = id('visible');
+  keeper.recordPrompt(sid, 'C:/github/AgentPlace/x', 'conscious', 'working in a listed directory');
+  const before = keeperLogs.length;
+  keeper.sessionKind(sid);
+  keeper.sessionKind(sid);
+  keeper.sessionKind(sid);
+  const lines = keeperLogs.slice(before).filter(l => /is an agent session/.test(l[2]));
+  assert.equal(lines.length, 1, 'logged once, not every turn');
+  assert.match(lines[0][2], /cwd matches "AgentPlace".*its insights are held/);
+  const snap = keeper.snapshot();
+  const row = snap.sessions.find(r => r.session === sid.slice(0, 8) && r.why === 'cwd matches "AgentPlace"');
+  assert.ok(row, 'the snapshot has the session with its kind and why');
+  assert.equal(row.kind, 'agent');
+  assert.ok(snap.byKind.agent >= 1 && snap.byKind.human >= 1);
 });
 
 // ---------- Dreamer: what an agent session may write ----------
@@ -95,6 +113,7 @@ const REPLY = {
 async function summarize({ agentSession, namespace = null, reply = REPLY } = {}) {
   const calls = [];
   const logs = [];
+  const embedded = [];
   let systemPrompt = null;
   await handleSummarize({
     req_body: { session_id: 's1', namespace },
@@ -108,7 +127,7 @@ async function summarize({ agentSession, namespace = null, reply = REPLY } = {})
       return [];
     },
     callAnthropic: async (model, system) => { systemPrompt = system; return { model, response: { content: [{ text: JSON.stringify(reply) }] } }; },
-    embedNeuron: async () => {}, randomUUID: () => 'u',
+    embedNeuron: async (name) => { embedded.push(name); }, randomUUID: () => 'u',
     isDaemonEnabled: () => false, getDaemonConfig: () => ({}),
     wonder: {}, spider: {}, janitor: {}, prowler: {},
     log: (...a) => logs.push(a),
@@ -116,7 +135,7 @@ async function summarize({ agentSession, namespace = null, reply = REPLY } = {})
   });
   const created = calls.filter(c => /CREATE \(n:Neuron/.test(c.q)).map(c => c.p);
   const edges = calls.filter(c => /CREATE \(src\)-\[:SYNAPSE/.test(c.q));
-  return { calls, created, edges, logs, systemPrompt };
+  return { calls, created, edges, logs, systemPrompt, embedded };
 }
 
 test('agent session: only lesson, procedure and decision are written, and they are held', async () => {
@@ -132,7 +151,9 @@ test('agent session: only lesson, procedure and decision are written, and they a
   assert.deepEqual(r.created.map(p => p.type), ['insight', 'insight', 'decision']);
   const dropped = r.logs.filter(l => /insight not written, no durable kind/.test(l[2])).map(l => l[2]);
   assert.equal(dropped.length, 2);
-  assert.ok(dropped.some(m => m.includes('PR 16 sent back')) && dropped.some(m => m.includes('Service restarted')));
+  assert.ok(!r.logs.some(l => /PR 16 sent back|Gate needs a timeout|Restore a backup/.test(JSON.stringify(l))), 'no held or dropped name reaches the log');
+  assert.equal(r.logs.filter(l => /^held insight \((lesson|procedure|decision)\) u$/.test(l[2])).length, 3, 'a held write is logged by kind and uid');
+  assert.equal(r.embedded.length, 0, 'a held insight is not embedded until release');
   assert.deepEqual(r.logs.filter(l => l[1] === 'warn' || l[1] === 'error'), []);
 });
 
@@ -218,23 +239,101 @@ test('durableKind accepts the three kinds only', () => {
 test('releaseHeld moves a held neuron to the live graph and says what released it', async () => {
   const calls = [];
   const logs = [];
-  const released = await releaseHeld({
-    runCypher: async (q, p) => { calls.push({ q, p }); return [{ name: p.name }]; },
+  const r = await releaseHeld({
+    runCypher: async (q, p) => { calls.push({ q, p }); return [{ name: p.name, held_name: p.name, uid: 'abcdef0123', flash_summary: 'f' }]; },
     name: 'Restore a backup', by: 'chase', log: (...a) => logs.push(a)
   });
-  assert.equal(released, true);
-  assert.deepEqual(calls[0].p, { name: 'Restore a backup', held: HELD_NAMESPACE, by: 'chase' });
+  assert.deepEqual(r, { released: true, name: 'Restore a backup', uid: 'abcdef0123', flash_summary: 'f', renamed: false });
+  assert.deepEqual(calls[0].p, { name: 'Restore a backup', uid: null, held: HELD_NAMESPACE, by: 'chase' });
   assert.match(calls[0].q, /n\.namespace = \$held AND n\.superseded IS NULL/);
-  assert.match(calls[0].q, /NOT EXISTS \{\s*MATCH \(l:Neuron \{name: \$name\}\) WHERE l\.namespace IS NULL/, 'a live neuron of the same name blocks the release');
-  assert.match(calls[0].q, /SET n\.namespace = null, n\.released_at = datetime\(\), n\.released_by = \$by, n\.spidered = false/);
+  assert.match(calls[0].q, /n\.namespace = null, n\.released_at = datetime\(\), n\.released_by = \$by, n\.spidered = false/);
   assert.ok(logs.some(l => /held neuron released to the live graph: Restore a backup/.test(l[2])));
 });
 
-test('releaseHeld reports false and logs nothing when no held neuron matched', async () => {
+test('a name a live neuron has since taken does not block release: the held one is renamed', async () => {
+  const calls = [];
+  const r = await releaseHeld({
+    // What Neo4j returns when the CASE renamed it.
+    runCypher: async (q, p) => { calls.push({ q, p }); return [{ name: 'Restore a backup (held abcdef01)', held_name: 'Restore a backup', uid: 'abcdef0123', flash_summary: 'f' }]; },
+    uid: 'ABCDEF01', by: 'chase'
+  });
+  assert.equal(r.released, true);
+  assert.equal(r.renamed, true);
+  assert.equal(r.name, 'Restore a backup (held abcdef01)');
+  assert.doesNotMatch(calls[0].q, /NOT EXISTS/, 'no clause that refuses the release on a collision');
+  assert.match(calls[0].q, /OPTIONAL MATCH \(l:Neuron \{name: n\.name\}\) WHERE l\.namespace IS NULL/);
+  assert.match(calls[0].q, /CASE WHEN taken > 0 THEN n\.name \+ ' \(held ' \+ substring\(coalesce\(n\.uid, ''\), 0, 8\) \+ '\)' ELSE n\.name END/);
+  assert.match(calls[0].q, /toLower\(n\.uid\) STARTS WITH \$uid/, 'released by uid');
+  assert.equal(calls[0].p.uid, 'abcdef01');
+});
+
+test('releaseHeld reports released:false and logs nothing when no held neuron matched', async () => {
   const logs = [];
-  const released = await releaseHeld({ runCypher: async () => [], name: 'Live already', by: 'feedback:used', log: (...a) => logs.push(a) });
-  assert.equal(released, false);
+  const r = await releaseHeld({ runCypher: async () => [], name: 'Live already', by: 'feedback:used', log: (...a) => logs.push(a) });
+  assert.deepEqual(r, { released: false });
   assert.deepEqual(logs, []);
+});
+
+test('only a human session the Keeper knows may release: not an agent, not a stranger, not nobody', () => {
+  const agent = id('rel-agent');
+  keeper.recordPrompt(agent, 'C:/work/app', 'conscious', 'an agent that wrote an insight');
+  keeper.markAgent(agent, 'worker');
+  const human = id('rel-human');
+  keeper.recordPrompt(human, 'C:/work/app', 'conscious', 'a person looking at the held list');
+
+  assert.deepEqual(canRelease(keeper, human), { ok: true, reason: null });
+  const a = canRelease(keeper, agent);
+  assert.equal(a.ok, false);
+  assert.match(a.reason, /agent session \(flagged as an agent\)/);
+  assert.equal(canRelease(keeper, undefined).ok, false);
+  assert.match(canRelease(keeper, '').reason, /no session_id/);
+  assert.match(canRelease(keeper, 'made-up-' + run).reason, /not a session the Keeper has seen/);
+  assert.equal(canRelease(keeper, 42).ok, false);
+});
+
+test('listHeld asks only the held namespace, newest first, with a bounded limit', async () => {
+  const seen = [];
+  const rows = [{ name: 'Restore a backup', uid: 'u1', durable_kind: 'procedure', type: 'insight', flash_summary: 'f', origin_session: 's1', created_at: '2026-11-22T15:00:00Z', name_taken: false }];
+  const out = await listHeld({ runCypher: async (q, p) => { seen.push({ q, p }); return rows; }, limit: '9999' });
+  assert.deepEqual(out, rows);
+  assert.match(seen[0].q, /n\.namespace = \$held AND n\.superseded IS NULL/);
+  assert.match(seen[0].q, /ORDER BY n\.created_at DESC LIMIT toInteger\(\$limit\)/);
+  assert.deepEqual(seen[0].p, { held: HELD_NAMESPACE, limit: 200 });
+  await listHeld({ runCypher: async (q, p) => { seen.push({ q, p }); return []; } });
+  assert.equal(seen[1].p.limit, 50);
+});
+
+test('what an agent session offered, dropped and had held is counted', async () => {
+  const before = heldCounters();
+  await summarize({ agentSession: true });
+  await summarize({ agentSession: true, reply: { insights: [], train_of_thought: [], flash_results: [] } });
+  await summarize({ agentSession: false });
+  await releaseHeld({ runCypher: async () => [{ name: 'x', held_name: 'x', uid: 'u', flash_summary: '' }], name: 'x', by: 'chase' });
+  const after = heldCounters();
+  const d = Object.fromEntries(Object.keys(after).map(k => [k, after[k] - before[k]]));
+  assert.deepEqual(d, {
+    agentTurns: 2, zeroInsightTurns: 1, insightsOffered: 5, droppedNoKind: 2,
+    skippedNameTaken: 0, heldWritten: 3, released: 1, releaseRefused: 0
+  });
+});
+
+test('observer ingest into quarantine is not embedded', async () => {
+  const run1 = async (writeNamespace) => {
+    const embedded = [];
+    await handleIngest({
+      req_body: { session_id: 's1', tool_name: 'Bash', tool_input: { command: 'make deploy-check --all --verbose' }, tool_response: 'x'.repeat(400) },
+      runCypher: async () => [],
+      callAnthropic: async (model) => ({ model, response: { content: [{ text: JSON.stringify({ action: 'create', neuron: { name: 'Deploy check', node_type: 'fact', tier: 'T2_working', flash_summary: 'The deploy check runs all suites', body: 'Two sentences of body. Enough to pass.' } }) }] } }),
+      embedNeuron: async (name) => { embedded.push(name); },
+      getSession: () => ({ activeTopics: [], pendingFlashes: [], currentProject: null }),
+      randomUUID: () => 'u', log: () => {}, writeNamespace
+    });
+    return embedded;
+  };
+  const live = await run1(null);
+  const held = await run1('quarantine');
+  assert.ok(live.length >= 1, 'the stub reply creates a neuron on the live path (otherwise this test proves nothing)');
+  assert.deepEqual(held, []);
 });
 
 test('isHeld asks only the held namespace', async () => {

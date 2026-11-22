@@ -145,7 +145,8 @@ Health check: `curl http://localhost:3030/health`
 | POST /undertow/ingest-file | Ingest a local file |
 | POST /undertow/correct | Agent-initiated memory correction |
 | POST /undertow/chase | Agent-initiated follow-up pursuit |
-| GET /undertow/neuron | Read-only neuron + connected neurons (`?name=` or `?uid=`, `&limit=`) |
+| GET /undertow/neuron | Read-only neuron + connected neurons (`?name=` or `?uid=`, `&limit=`, `&namespace=quarantine` for a held one) |
+| GET /undertow/held | List held neurons (written from agent sessions; never flashed until a human session uses them) |
 | POST /undertow/feedback | Explicit verdict on a surfaced neuron (used/useful/irrelevant/wrong) |
 | GET/POST /undertow/daemon-config | View/update daemon settings |
 

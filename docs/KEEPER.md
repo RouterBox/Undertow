@@ -174,19 +174,34 @@ ever flashed. Tiers decide whether a session is attended to at all; this
 mechanism decides what a *conscious* session may write when the one on the
 other end is an agent.
 
-**Who is an agent session** (`keeper.sessionKind`, first match wins):
+**Who is an agent session** (`keeper.sessionKind`, first match wins). It is a
+declared fact, never inferred from how the session behaves: three varied
+prompts a few seconds apart look like a conversation whoever sends them.
 
 1. Declared: `POST /undertow/keeper {"session_id": "...", "kind": "agent"}`
-   (or `"human"`; `null` clears it).
-2. The session's cwd contains one of `agentCwdPatterns` in the Keeper's
-   daemon-config (case-insensitive substrings, empty by default). This is for an
-   agent whose orders arrive as ordinary prompts, so its turn-taking looks human.
-3. It was promoted by tool volume (the agentic path) and has not since shown
-   conversational turn-taking (`promoteAfterTurns` prose prompts with a human
-   gap). A person doing deep agentic work becomes `human` again as soon as they
-   take those turns.
+   (or `"human"`; `null` clears it). A declaration beats everything below, so
+   a person working in a listed directory can declare their session `human`.
+2. Flagged: `keeper.markAgent(sessionId, label)` sets `agentFlag` on the
+   ledger entry. This is the hook for whatever knows which sessions are agents
+   in a deployment.
+3. The session's cwd contains one of `agentCwdPatterns` in the Keeper's
+   daemon-config (case-insensitive substrings). **The list ships empty: a
+   deployment that runs agents must fill it in (or flag or declare them), or
+   every session is treated as human.** Set it with
+   `POST /undertow/daemon-config/keeper {"agentCwdPatterns": ["my-agent-dir"]}`
+   and restart.
 
 Everything else is a human session and behaves exactly as before.
+
+A call from the `undertow_query` MCP tool is the agent asking, not a person
+prompting: it is not counted as a prompt by the Keeper.
+
+**Seeing it.** The first time a session is classed agent the service logs one
+line saying by which rule. `GET /undertow/keeper` lists recent sessions with
+their `kind` and `why`, and a `held` block of counters since the last
+restart: agent turns summarized, turns where the model offered no insight,
+insights offered, dropped for no durable kind, skipped because the name was
+taken, written to the held tier, released, and releases refused.
 
 **What does not change for an agent session:** its tier, its flashes, pursuit
 detection, train of thought, and Gobble's ingest.
@@ -204,7 +219,10 @@ detection, train of thought, and Gobble's ingest.
   of the three kinds. The kind is stored as `durable_kind`.
 - **Held, not live.** The insight is written into the `quarantine` namespace,
   which no recall path reads, so it is never flashed. It has no edges: edges do
-  not cross a namespace boundary.
+  not cross a namespace boundary. It has no embedding either until it is
+  released, so it cannot take a vector-search slot from a live neuron (the same
+  now holds for observer ingest into quarantine). Its name is not printed in
+  the service log.
 - **No rewrites.** An agent session does not update (supersede) existing
   neurons; that would put its text into the live graph past the hold.
 - **No actor names.** The prompt tells the model not to say who did, said or
@@ -213,16 +231,40 @@ detection, train of thought, and Gobble's ingest.
   words relayed inside an agent session are therefore marked as coming from an
   agent session, and are held like the rest.
 
-**Release.** A held neuron joins the live graph when something uses it:
-`POST /undertow/chase` on its name, or `POST /undertow/feedback` with verdict
-`used` or `useful`. Release sets `namespace` to live, records `released_at`
-and `released_by`, and marks the neuron un-spidered so Spider links it on its
-next run. If a live neuron already has the same name, the held one stays held.
-Held neurons can be read with `GET /undertow/neuron?name=...&namespace=quarantine`.
+**Finding what is held.** `GET /undertow/held` (MCP: `undertow_held`) lists
+held neurons newest first: name, uid, kind, flash summary, the session that
+wrote it, when, and `name_taken` when a live neuron now has the same name.
+Read one in full with `GET /undertow/neuron?name=...&namespace=quarantine`
+(MCP: `undertow_neighbors` with `held: true`). Listing and reading are open
+to any caller. `/undertow/stats`, `/undertow/health` and the boot-time
+embedding check count the live graph only; stats reports `held` separately.
+`POST /undertow/correct` acts on the live graph unless given a `namespace`.
+
+**Release.** A held neuron joins the live graph when a **human session** uses
+it: `POST /undertow/chase {neuron, session_id}`, or `POST /undertow/feedback`
+with verdict `used` or `useful` and a `session_id`. The session id must be one
+the Keeper knows and classes as human. A chase or verdict from an agent
+session, from a session the Keeper has never seen, or with no session id
+releases nothing: the response says the neuron is held and why (a chase
+answers `status: "held"` and rewards nothing). Release sets `namespace` to
+live, records `released_at` and `released_by`, embeds the neuron, and marks
+it un-spidered so Spider links it on its next run.
+
+If a live neuron has taken the name since, a chase by name means the live one.
+Release the held one by uid (`POST /undertow/chase {uid, session_id}`, the uid
+from the listing): it joins the live graph as `<name> (held <first 8 of uid>)`,
+and the response gives the new name.
+
+The limit of this: `session_id` is whatever the caller sends over loopback
+HTTP. It stops an agent releasing its own insight through ordinary tool use;
+it does not stop a caller that deliberately sends a human session's id, or
+that declares itself human through `POST /undertow/keeper`.
 
 **Not built:** nothing surfaces held neurons on its own, so one that nobody
-looks up stays held; there is no expiry or sweep of old held neurons yet; and
-two insights about the same event are not detected as duplicates.
+looks up stays held; there is no expiry or sweep of old held neurons yet; two
+insights about the same event are not detected as duplicates; and train of
+thought is unchanged, so an agent session's topics and temporal edges still go
+to the live graph with no origin recorded (issues #20 and #21).
 
 ### The voluntary path is how automation participates
 

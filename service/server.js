@@ -24,11 +24,11 @@ import { handleQuery, QUERY_SYSTEM_PROMPT } from './daemons/impulse.js';
 import { handleIngest, INGEST_SYSTEM_PROMPT, coerceNodeType } from './daemons/gobble.js';
 import { summarizeForTurn, handleSessionStart, handleRehydrate, SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT } from './daemons/dreamer.js';
 import keeper from './daemons/keeper.js';
-import { sanitizeNamespace, livePredicate } from './namespaces.js';
+import { sanitizeNamespace, livePredicate, nsPredicate } from './namespaces.js';
 import { FEEDBACK_VERDICTS, applyVerdictToNeuron } from './daemons/curated.js';
 import { supersedeNeuron } from './supersede.js';
 import { recordPursuitDay, pursuitWindow, windowStart, ensurePursuitDayConstraint } from './pursuit-day.js';
-import { HELD_NAMESPACE, isHeld, releaseHeld } from './held.js';
+import { HELD_NAMESPACE, isHeld, releaseHeld, canRelease, listHeld, countHeld, heldCounters, countHeldNeurons } from './held.js';
 import { importVault, reverseTapestry } from './vault.js';
 import vaultwatch from './daemons/vaultwatch.js';
 import { resolve as pathResolve } from 'path';
@@ -229,7 +229,11 @@ app.post('/undertow/query', async (req, res) => {
   req.body.namespace = sanitizeNamespace(req.body.namespace);
   // Keeper gate: only conscious sessions get the involuntary flash pipeline,
   // and habituated (repeated loop-tick) prompts get nothing even then.
-  const gate = keeper.recordPrompt(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier, req.body.prompt);
+  // A call from the undertow_query MCP tool (mcp.js marks it) is the agent asking,
+  // not a person prompting: it earns no turn-taking credit and no habituation.
+  const gate = req.body.via === 'mcp'
+    ? { tier: keeper.tierOf(req.body.session_id || 'default'), promoted: false, habituated: false, reason: null }
+    : keeper.recordPrompt(req.body.session_id || 'default', req.body.cwd, req.body.undertow_tier, req.body.prompt);
   const sid = String(req.body.session_id || 'default').slice(0, 8);
   if (gate.habituated) {
     keeper.countFastPath(req.body.session_id || 'default');
@@ -393,7 +397,7 @@ app.post('/undertow/rehydrate', async (req, res) => {
 // Shared data fetcher used by both /undertow/stats and /undertow/stats.html
 async function gatherStats() {
   const [counts, topPursued, topDismissed, decayDistribution, sourceBreakdown, daemonStatsRaw] = await Promise.all([
-    runCypher('MATCH (n:Neuron) RETURN count(n) AS neurons').then(r => r[0]),
+    runCypher('MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL RETURN count(n) AS neurons').then(r => r[0]),
     runCypher(`
       MATCH (n:Neuron) WHERE n.times_surfaced > 0
       RETURN n.name, n.times_pursued, n.times_dismissed,
@@ -409,7 +413,7 @@ async function gatherStats() {
       ORDER BY dismissRate DESC LIMIT 10
     `),
     runCypher(`
-      MATCH (n:Neuron)
+      MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL
       WITH CASE
         WHEN n.decay_score > 80 THEN 'high (>80)'
         WHEN n.decay_score > 40 THEN 'medium (40-80)'
@@ -418,7 +422,7 @@ async function gatherStats() {
       END AS bracket, count(n) AS count
       RETURN bracket, count ORDER BY count DESC
     `),
-    runCypher('MATCH (n:Neuron) RETURN n.source AS source, count(n) AS count ORDER BY count DESC'),
+    runCypher('MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL RETURN n.source AS source, count(n) AS count ORDER BY count DESC'),
     // Per-daemon pursuit/dismissal totals (Item 2: calibration loop)
     runCypher(`
       MATCH (d:DaemonStat)
@@ -429,7 +433,8 @@ async function gatherStats() {
     `)
   ]);
 
-  const synapseCount = await runCypher('MATCH ()-[s:SYNAPSE]->() RETURN count(s) AS synapses').then(r => r[0]);
+  const synapseCount = await runCypher('MATCH (n:Neuron)-[s:SYNAPSE]->(m:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL AND m.namespace IS NULL AND m.superseded IS NULL RETURN count(s) AS synapses').then(r => r[0]);
+  const held = await countHeldNeurons({ runCypher }).catch(() => null);
 
   // Compute pursuit rate per daemon
   const daemonStats = (daemonStatsRaw || []).map(d => {
@@ -448,6 +453,7 @@ async function gatherStats() {
   return {
     neurons: counts.neurons?.low ?? counts.neurons,
     synapses: synapseCount.synapses?.low ?? synapseCount.synapses,
+    held,
     topPursued,
     topDismissed,
     decayDistribution,
@@ -696,6 +702,8 @@ app.post('/undertow/correct', async (req, res) => {
   if (!undertowEnabled) return res.json({ status: 'disabled' });
   try {
     const { neuron, action, flash_summary, body, reason, tier } = req.body;
+    // The live graph unless the caller names a namespace (a held neuron: "quarantine").
+    const ns = sanitizeNamespace(req.body.namespace);
     if (!neuron) return res.status(400).json({ error: 'neuron name required' });
     if (!action) return res.status(400).json({ error: 'action required (update, delete, demote)' });
     if (!reason) return res.status(400).json({ error: 'reason required — explain why this correction is needed' });
@@ -703,6 +711,7 @@ app.post('/undertow/correct', async (req, res) => {
     // Step 1: Investigate — fetch the neuron and its connections
     const existing = await runCypher(`
       MATCH (n:Neuron {name: $name})
+      WHERE ${nsPredicate('n')}
       OPTIONAL MATCH (n)-[s:SYNAPSE]-(connected:Neuron)
       RETURN n.name AS name, n.flash_summary AS flash, n.node_type AS type,
              n.tier AS tier, n.base_score AS score, n.source AS source,
@@ -710,7 +719,7 @@ app.post('/undertow/correct', async (req, res) => {
              n.created_at AS created,
              collect(DISTINCT connected.name) AS connections
       LIMIT 1
-    `, { name: neuron });
+    `, { name: neuron, ns });
 
     if (existing.length === 0) {
       return res.json({ status: 'not_found', neuron });
@@ -732,7 +741,7 @@ app.post('/undertow/correct', async (req, res) => {
           connections: node.connections
         });
       }
-      await runCypher('MATCH (n:Neuron {name: $name}) DETACH DELETE n', { name: neuron });
+      await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')} DETACH DELETE n`, { name: neuron, ns });
       log('correct', 'info', `DELETED: ${neuron}`, { detail: reason });
       return res.json({ status: 'deleted', neuron, reason });
     }
@@ -740,8 +749,9 @@ app.post('/undertow/correct', async (req, res) => {
     if (action === 'demote') {
       await runCypher(`
         MATCH (n:Neuron {name: $name})
+        WHERE ${nsPredicate('n')}
         SET n.tier = 'T3_archive', n.base_score = 10, n.last_surfaced = datetime()
-      `, { name: neuron });
+      `, { name: neuron, ns });
       log('correct', 'info', `DEMOTED: ${neuron} → T3_archive, base_score=10`, { detail: reason });
       return res.json({ status: 'demoted', neuron, reason });
     }
@@ -751,18 +761,19 @@ app.post('/undertow/correct', async (req, res) => {
       // via SUPERSEDES so "what was it before" stays answerable.
       const superseded = await supersedeNeuron({
         runCypher, randomUUID, log,
-        name: neuron, ns: null,
+        name: neuron, ns,
         flash: flash_summary, body: body !== undefined ? body : undefined,
         reason
       });
       if (!superseded) return res.json({ status: 'not_found', neuron });
       if (tier) {
-        await runCypher(`MATCH (n:Neuron {name: $name}) WHERE n.namespace IS NULL AND n.superseded IS NULL SET n.tier = $tier`, { name: neuron, tier });
+        await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} SET n.tier = $tier`, { name: neuron, tier, ns });
       }
       // Re-embed the new version — otherwise vector search keeps matching the
       // stale text and the corrected neuron resurfaces on the old terms.
       let reEmbedded = false;
-      if (flash_summary) {
+      // (A held neuron carries no embedding until it is released.)
+      if (flash_summary && ns !== HELD_NAMESPACE) {
         await embedNeuron(neuron, flash_summary);
         reEmbedded = embeddingsAvailable();
       }
@@ -796,16 +807,36 @@ app.post('/undertow/janitor', async (req, res) => {
 app.post('/undertow/chase', async (req, res) => {
   if (!undertowEnabled) return res.json({ status: 'disabled' });
   try {
-    const { neuron } = req.body;
-    if (!neuron) return res.status(400).json({ error: 'neuron name required' });
+    const { session_id } = req.body;
+    const heldUid = typeof req.body.uid === 'string' && /^[0-9a-f-]{8,36}$/i.test(req.body.uid.trim()) ? req.body.uid.trim().toLowerCase() : null;
+    let neuron = req.body.neuron;
+    if (!neuron && !heldUid) return res.status(400).json({ error: 'neuron name required' });
 
-    // A chase is use: a held neuron (written from an agent session) joins the live graph.
-    const released = await releaseHeld({ runCypher, name: neuron, by: 'chase', log })
-      .catch(e => { log('error', 'warn', e.message); return false; });
+    // A chase by a human session is use: a held neuron (written from an agent
+    // session) joins the live graph. By name when no live neuron has that name
+    // (a chase by name means the live one); by uid, from GET /undertow/held, always.
+    // An agent session, an unknown session or no session id releases nothing.
+    let released = null;
+    const liveExists = neuron
+      ? (await runCypher(`MATCH (n:Neuron {name: $name}) WHERE ${livePredicate('n')} RETURN n.name AS name LIMIT 1`, { name: neuron, ns: null })).length > 0
+      : false;
+    if (heldUid || (!liveExists && await isHeld({ runCypher, name: neuron }))) {
+      const may = canRelease(keeper, session_id);
+      if (!may.ok) {
+        countHeld('releaseRefused');
+        log('keeper', 'info', 'chase of a held neuron: not released', { detail: may.reason });
+        return res.json({ status: 'held', neuron: neuron || null, released: false, reason: may.reason, note: 'this neuron is held (written from an agent session); it was not released or rewarded. See GET /undertow/held' });
+      }
+      released = await releaseHeld({ runCypher, name: heldUid ? null : neuron, uid: heldUid, by: 'chase', log });
+      if (!released.released) return res.status(404).json({ status: 'not_found', error: 'no held neuron matched', neuron: neuron || null });
+      neuron = released.name;
+      embedNeuron(released.name, released.flash_summary).catch(e => log('error', 'warn', e.message));
+    }
 
-    // Strong pursuit reward: +15 base_score (vs +10 for normal pursuit)
+    // Strong pursuit reward: +15 base_score (vs +10 for normal pursuit). Live graph only.
     const rewarded = await runCypher(`
       MATCH (n:Neuron {name: $name})
+      WHERE n.namespace IS NULL AND n.superseded IS NULL
       SET n.times_pursued = n.times_pursued + 1,
           n.base_score = CASE WHEN n.base_score + 15 > 100 THEN 100 ELSE n.base_score + 15 END,
           n.last_surfaced = datetime()
@@ -814,7 +845,7 @@ app.post('/undertow/chase', async (req, res) => {
 
     // MATCH found nothing: don't tell the caller the reward landed.
     if (Array.isArray(rewarded) && rewarded.length === 0) {
-      return res.status(404).json({ status: 'not_found', error: `no neuron named "${neuron}"`, neuron });
+      return res.status(404).json({ status: 'not_found', error: `no live neuron named "${neuron}"`, neuron });
     }
 
     // Per-day counter for the health window (chase is always the live graph)
@@ -823,11 +854,14 @@ app.post('/undertow/chase', async (req, res) => {
     // Strengthen outbound synapses more aggressively (+0.08 vs +0.05 for normal pursuit)
     await runCypher(`
       MATCH (n:Neuron {name: $name})-[s:SYNAPSE]->()
+      WHERE n.namespace IS NULL AND n.superseded IS NULL
       SET s.weight = CASE WHEN s.weight + 0.08 > 0.95 THEN 0.95 ELSE s.weight + 0.08 END
     `, { name: neuron }).catch(e => log('error', 'warn', e.message));
 
     log('chase', 'info', `chased: ${neuron}`, { detail: 'base_score +15, synapses +0.08' });
-    res.json(released ? { status: 'chased', neuron, released: true } : { status: 'chased', neuron });
+    res.json(released
+      ? { status: 'chased', neuron, released: true, ...(released.renamed ? { renamed: true, note: 'a live neuron already had this name; the released neuron carries the name shown here' } : {}) }
+      : { status: 'chased', neuron });
   } catch (e) {
     log('chase', 'error', e.message);
     res.status(500).json({ error: e.message });
@@ -927,12 +961,27 @@ app.post('/undertow/feedback', async (req, res) => {
       ns = HELD_NAMESPACE;
     }
     await applyVerdictToNeuron({ runCypher, name: neuron, ns, verdict, note: cleanNote, log });
-    // used/useful is use: a held neuron joins the live graph.
-    const released = ns === HELD_NAMESPACE && (verdict === 'used' || verdict === 'useful')
-      ? await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log })
-      : false;
-    log('feedback', 'info', `explicit feedback applied directly: ${verdict} "${neuron.substring(0, 60)}"`, { detail: 'no matching session' });
-    res.json({ status: 'applied_directly', neuron, verdict, session: null, ...(released ? { released: true } : {}), note: 'no session with this neuron among its surfaced flashes; verdict applied to the neuron directly' });
+    // used/useful from a human session is use: a held neuron joins the live graph.
+    // From an agent session, an unknown session or with no session id it stays held.
+    let held = null;
+    if (ns === HELD_NAMESPACE) {
+      held = { held: true, released: false };
+      if (verdict === 'used' || verdict === 'useful') {
+        const may = canRelease(keeper, session_id);
+        if (may.ok) {
+          const r = await releaseHeld({ runCypher, name: neuron, by: `feedback:${verdict}`, log });
+          if (r.released) {
+            held = { held: false, released: true };
+            embedNeuron(r.name, r.flash_summary).catch(e => log('error', 'warn', e.message));
+          }
+        } else {
+          countHeld('releaseRefused');
+          held.reason = may.reason;
+        }
+      }
+    }
+    log('feedback', 'info', ns === HELD_NAMESPACE ? `explicit feedback applied directly: ${verdict} on a held neuron` : `explicit feedback applied directly: ${verdict} "${neuron.substring(0, 60)}"`, { detail: 'no matching session' });
+    res.json({ status: 'applied_directly', neuron, verdict, session: null, ...(held || {}), note: 'no session with this neuron among its surfaced flashes; verdict applied to the neuron directly' });
   } catch (e) {
     log('feedback', 'error', e.message);
     res.status(500).json({ error: e.message });
@@ -1244,7 +1293,23 @@ app.post('/undertow/wiki-sync', async (req, res) => {
 
 // GET /undertow/keeper — Keeper ledger snapshot (sessions by tier, fast-path stats)
 app.get('/undertow/keeper', (req, res) => {
-  res.json(keeper.snapshot());
+  res.json({ ...keeper.snapshot(), held: heldCounters() });
+});
+
+// GET /undertow/held — what is held (insights written from agent sessions, and
+// observer ingest), newest first. ?limit=50 (max 200). Read-only and open to any
+// caller; only release is restricted (a chase or used/useful verdict from a human session).
+app.get('/undertow/held', async (req, res) => {
+  try {
+    const held = await listHeld({ runCypher, limit: req.query.limit });
+    res.json({
+      held, returned: held.length, total: await countHeldNeurons({ runCypher }),
+      release: 'POST /undertow/chase {neuron or uid, session_id} or POST /undertow/feedback {neuron, verdict: used|useful, session_id}, where session_id is a human session; read one with GET /undertow/neuron?name=...&namespace=quarantine'
+    });
+  } catch (e) {
+    log('held', 'error', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /undertow/keeper — Manual override: {"session_id": "...", "tier": "conscious|observer|drone|off|candidate"}
@@ -1297,8 +1362,8 @@ app.post('/undertow/daemon-config/:daemon', async (req, res) => {
 app.get('/undertow/health', async (req, res) => {
   try {
     const [neuronCount, synapseCount, diversityCheck, communityHealth, ageDistribution, growthRatio, topRetrieved, pursuitDays] = await Promise.all([
-      runCypher('MATCH (n:Neuron) RETURN count(n) AS count'),
-      runCypher('MATCH ()-[s:SYNAPSE]->() RETURN count(s) AS count'),
+      runCypher('MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL RETURN count(n) AS count'),
+      runCypher('MATCH (n:Neuron)-[s:SYNAPSE]->(m:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL AND m.namespace IS NULL AND m.superseded IS NULL RETURN count(s) AS count'),
       // Filter bubble check: are top neurons dominating retrievals?
       runCypher(`
         MATCH (n:Neuron) WHERE n.times_surfaced > 0
@@ -1318,7 +1383,7 @@ app.get('/undertow/health', async (req, res) => {
       `).catch(() => [{ communities: 0, avgSize: 0, smallest: 0, largest: 0 }]),
       // Age distribution
       runCypher(`
-        MATCH (n:Neuron)
+        MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL
         WITH CASE
           WHEN n.created_at > datetime() - duration('P7D') THEN 'last_7_days'
           WHEN n.created_at > datetime() - duration('P30D') THEN 'last_30_days'
@@ -1465,7 +1530,7 @@ const httpServer = app.listen(PORT, HOST, async () => {
         log('startup', 'error', `EMBEDDING DIMENSION MISMATCH: neuron_embedding index is ${dims}-dim but provider ${info.provider} (${info.model}) emits ${info.dims}-dim — vector search will silently miss everything. Run: node switch-embeddings.js`);
       }
       const counts = await runCypher(
-        `MATCH (n:Neuron) RETURN count(n) AS total, count(n.embedding) AS embedded`
+        `MATCH (n:Neuron) WHERE n.namespace IS NULL AND n.superseded IS NULL RETURN count(n) AS total, count(n.embedding) AS embedded`
       );
       const total = counts[0]?.total?.toNumber?.() ?? Number(counts[0]?.total || 0);
       const embedded = counts[0]?.embedded?.toNumber?.() ?? Number(counts[0]?.embedded || 0);

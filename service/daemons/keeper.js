@@ -142,6 +142,17 @@ function expireOld() {
   }
 }
 
+// One log line the first time a session is classed agent (and again only if
+// the rule changes), so an operator can see why their session is being held.
+function noteKind(e, sessionId, result) {
+  if (e && result.kind === 'agent' && e.kindLogged !== result.why) {
+    e.kindLogged = result.why;
+    dirty = true;
+    logFn('keeper', 'info', `session ${String(sessionId).slice(0, 8)} is an agent session (${result.why}): its insights are held`);
+  }
+  return result;
+}
+
 function cwdRuleTier(cwd) {
   if (!cwd) return null;
   const lower = String(cwd).toLowerCase();
@@ -307,28 +318,41 @@ const keeper = {
   /**
    * Who is on the other end of a session: 'agent' or 'human', and why.
    * Agent sessions keep their flashes; what Dreamer writes from them is held
-   * apart (see docs/KEEPER.md, "Agent sessions"). In order:
+   * apart (see docs/KEEPER.md, "Agent sessions"). It is a declared fact, never
+   * inferred from behaviour. In order:
    *   1. declared with setKind (POST /undertow/keeper {kind})
-   *   2. cwd matches one of config.agentCwdPatterns
-   *   3. promoted by tool volume and still without conversational turn-taking
-   *      (an entry that is conscious, undeclared and non-conversational can only
-   *      have come through the agentic path, so entries promoted before
-   *      promotedVia was recorded are covered too)
-   * Anything else is human, which is today's behaviour.
+   *   2. flagged as an agent (markAgent sets agentFlag on the ledger entry)
+   *   3. cwd matches one of config.agentCwdPatterns
+   * Anything else is human, which is the behaviour without this feature.
+   * The first time a session is classed agent, one log line says by which rule.
    */
   sessionKind(sessionId, cwd) {
     if (!config.enabled) return { kind: 'human', why: 'keeper disabled' };
     const e = ledger.get(sessionId);
-    if (e && VALID_KINDS.has(e.declaredKind)) return { kind: e.declaredKind, why: 'declared' };
+    if (e && VALID_KINDS.has(e.declaredKind)) return noteKind(e, sessionId, { kind: e.declaredKind, why: 'declared' });
+    if (e && e.agentFlag) return noteKind(e, sessionId, { kind: 'agent', why: 'flagged as an agent' });
     const where = String(cwd || (e && e.cwd) || '').toLowerCase();
     for (const p of config.agentCwdPatterns || []) {
-      if (p && where && where.includes(String(p).toLowerCase())) return { kind: 'agent', why: `cwd matches "${p}"` };
-    }
-    if (e && e.tier === 'conscious' && !e.declared) {
-      const conversational = e.proseTurns >= config.promoteAfterTurns && e.humanGaps >= 1;
-      if (!conversational) return { kind: 'agent', why: 'promoted by tool volume' };
+      if (p && where && where.includes(String(p).toLowerCase())) return noteKind(e, sessionId, { kind: 'agent', why: `cwd matches "${p}"` });
     }
     return { kind: 'human', why: 'default' };
+  },
+
+  /** True when the Keeper has a ledger entry for this session (or is disabled). */
+  knows(sessionId) {
+    return !config.enabled || ledger.has(sessionId);
+  },
+
+  /**
+   * Flag this session as an agent. `label` names the agent.
+   */
+  markAgent(sessionId, label) {
+    if (!config.enabled || !sessionId) return false;
+    const flag = String(label || '').trim().slice(0, 64);
+    if (!flag) return false;
+    const e = getEntry(sessionId, null, null);
+    if (e.agentFlag !== flag) { e.agentFlag = flag; dirty = true; }
+    return true;
   },
 
   /** Manual declaration of who a session is: 'agent' | 'human', or null to clear. */
@@ -355,7 +379,16 @@ const keeper = {
   snapshot() {
     const byTier = {};
     for (const e of ledger.values()) byTier[e.tier] = (byTier[e.tier] || 0) + 1;
-    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, ...stats, config };
+    // Who each recent session is, and why (newest first; ids shortened).
+    const byKind = { agent: 0, human: 0 };
+    const sessions = [];
+    for (const [id, e] of ledger) {
+      const k = keeper.sessionKind(id);
+      byKind[k.kind] = (byKind[k.kind] || 0) + 1;
+      sessions.push({ session: String(id).slice(0, 8), tier: e.tier, kind: k.kind, why: k.why, cwd: e.cwd || null, lastSeen: e.lastSeen || 0 });
+    }
+    sessions.sort((a, b) => b.lastSeen - a.lastSeen);
+    return { enabled: config.enabled, ledgerSize: ledger.size, byTier, byKind, ...stats, sessions: sessions.slice(0, 50), config };
   },
 };
 

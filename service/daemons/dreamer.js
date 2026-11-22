@@ -10,7 +10,7 @@ import { coerceNodeType } from './gobble.js';
 import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './curated.js';
 import { gateRun } from '../downstream-gate.js';
 import { recordPursuitDay } from '../pursuit-day.js';
-import { HELD_NAMESPACE, durableKind, nodeTypeForKind } from '../held.js';
+import { HELD_NAMESPACE, durableKind, nodeTypeForKind, countHeld } from '../held.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -280,11 +280,19 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
   // from the live graph, so its insights stay in that namespace.
   const held = agentSession && !ns;
   const insightNs = held ? HELD_NAMESPACE : ns;
+  if (agentSession) {
+    // Counted, not only logged: a turn where the model offered nothing is
+    // otherwise invisible (GET /undertow/keeper shows these).
+    countHeld('agentTurns');
+    countHeld('insightsOffered', parsed.insights?.length || 0);
+    if (!parsed.insights?.length) countHeld('zeroInsightTurns');
+  }
   if (parsed.insights?.length) {
     for (const insight of parsed.insights) {
       const kind = agentSession ? durableKind(insight) : null;
       if (agentSession && !kind) {
-        log('summarize', 'info', `agent session: insight not written, no durable kind: ${insight?.name}`, { detail: `kind: ${insight?.kind ?? 'none'}` });
+        countHeld('droppedNoKind');
+        log('summarize', 'info', 'agent session: insight not written, no durable kind', { detail: `kind: ${insight?.kind ?? 'none'}` });
         continue;
       }
       // A held insight must not take a name a live neuron has, or it could never be released.
@@ -292,7 +300,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
         `MATCH (n:Neuron {name: $name}) WHERE ${nsPredicate('n')}${held ? ' OR n.namespace = $held' : ''} RETURN n.name LIMIT 1`,
         held ? { name: insight.name, ns, held: HELD_NAMESPACE } : { name: insight.name, ns }
       );
+      if (existing.length > 0 && agentSession) countHeld('skippedNameTaken');
       if (existing.length === 0) {
+        const uid = randomUUID();
         const eventDate = typeof insight.event_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(insight.event_date) ? insight.event_date : null;
         await runCypher(`
             CREATE (n:Neuron {
@@ -306,7 +316,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               event_date: CASE WHEN $eventDate IS NULL THEN NULL ELSE date($eventDate) END
             })
           `, {
-          uid: randomUUID(), name: insight.name,
+          uid, name: insight.name,
           type: agentSession ? nodeTypeForKind(kind) : coerceNodeType(insight.node_type, 'insight'),
           tier: insight.tier || 'T2_working', flash: insight.flash_summary,
           body: insight.body || '', ns: insightNs, eventDate,
@@ -344,8 +354,15 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
             }
           }
         }
-        log('summarize', 'info', held ? `held insight (${kind}): ${insight.name}` : `insight: ${insight.name}`);
-        embedNeuron(insight.name, insight.flash_summary).catch(e => log('error', 'warn', e.message));
+        // A held insight is logged by kind and uid, never by name, and gets no
+        // embedding until it is released: it must not take a vector-search slot.
+        if (held) {
+          countHeld('heldWritten');
+          log('summarize', 'info', `held insight (${kind}) ${String(uid).slice(0, 8)}`);
+        } else {
+          log('summarize', 'info', `insight: ${insight.name}`);
+          embedNeuron(insight.name, insight.flash_summary).catch(e => log('error', 'warn', e.message));
+        }
       }
     }
   }
