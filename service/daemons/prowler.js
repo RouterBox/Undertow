@@ -13,6 +13,8 @@
 import { getDaemonConfig } from './loader.js';
 
 const BRAVE_API = 'https://api.search.brave.com/res/v1/web/search';
+import { randomUUID } from 'crypto';
+
 const PERPLEXITY_API = 'https://api.perplexity.ai/chat/completions';
 
 async function braveSearch(query, apiKey) {
@@ -147,7 +149,7 @@ export default {
   /**
    * DOWNSTREAM: Perplexity — only researches genuine technical topics
    */
-  async deepResearch({ topics, runCypher, log }) {
+  async deepResearch({ topics, session, runCypher, embedNeuron, log }) {
     const daemonConfig = getDaemonConfig('prowler');
     const perplexityKey = process.env.PERPLEXITY_API_KEY;
 
@@ -166,12 +168,27 @@ export default {
       return { neurons: 0 };
     }
 
+    // Stop fires after every turn, so the budget is kept on the session: a
+    // topic is tried once, and a session gets maxDeepResearchPerSession tries.
+    const tried = session ? (session.deepResearchTopics ||= []) : [];
+    const budget = (daemonConfig.maxDeepResearchPerSession ?? 2) - tried.length;
+    const researchTopics = researchable.filter(t => !tried.includes(t)).slice(0, Math.max(0, budget));
+    if (researchTopics.length === 0) return { neurons: 0 };
+
     let neuronsCreated = 0;
-    const researchTopics = researchable.slice(0, 2); // Max 2 per session
     log('research', 'info', `deep research: ${researchTopics.length} topics (filtered from ${topics.length})`);
 
     for (const topic of researchTopics) {
+      tried.push(topic);
       try {
+        // Check before the paid call, not after it.
+        const neuronName = `Research: ${topic.substring(0, 40)}`;
+        const existing = await runCypher(
+          'MATCH (n:Neuron {name: $name}) RETURN n.name LIMIT 1',
+          { name: neuronName }
+        );
+        if (existing.length > 0) continue;
+
         const response = await fetch(PERPLEXITY_API, {
           method: 'POST',
           headers: {
@@ -198,25 +215,20 @@ export default {
         const answer = result.choices?.[0]?.message?.content;
         if (!answer || answer.length < 50) continue;
 
-        const neuronName = `Research: ${topic.substring(0, 40)}`;
-        const existing = await runCypher(
-          'MATCH (n:Neuron {name: $name}) RETURN n.name LIMIT 1',
-          { name: neuronName }
-        );
-
-        if (existing.length === 0) {
+        {
           const flash = answer.replace(/[{}[\]]/g, '').substring(0, 100);
           const body = answer.replace(/[{}[\]]/g, '').substring(0, 500);
 
           await runCypher(`
             CREATE (n:Neuron {
-              name: $name, node_type: 'research', tier: 'T2_working',
+              uid: $uid, name: $name, node_type: 'research', tier: 'T2_working',
               flash_summary: $flash, body: $body,
-              source: 'perplexity', base_score: 40, decay_score: 40,
+              source: 'perplexity', project: $project, base_score: 40, decay_score: 40,
               times_surfaced: 0, times_pursued: 0, times_dismissed: 0,
               created_at: datetime(), last_surfaced: datetime()
             })
-          `, { name: neuronName, flash, body });
+          `, { uid: randomUUID(), name: neuronName, flash, body, project: session?.currentProject || 'general' });
+          embedNeuron?.(neuronName, flash)?.catch(e => log('research', 'warn', `embedding failed for "${neuronName}": ${e.message}`));
 
           neuronsCreated++;
           log('research', 'info', `created neuron: ${neuronName}`);
