@@ -183,6 +183,11 @@ function connectionTarget(conn) {
   return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
+// Output limit for the summarize call, and for the single retry after a reply
+// that was cut off at it (stop_reason max_tokens).
+const SUMMARIZE_MAX_TOKENS = 2000;
+const SUMMARIZE_RETRY_MAX_TOKENS = 4000;
+
 async function handleSummarize({ req_body, session, runCypher, callAnthropic, embedNeuron, randomUUID, isDaemonEnabled, getDaemonConfig, wonder, spider, janitor, prowler, log, skipWonder = false, agentSession = false, holdUnknown = false }) {
   const { session_id, transcript_path, cwd } = req_body;
 
@@ -217,13 +222,27 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
   const SUMMARIZE_MODEL = resolveModel('summarize');
   let parsed;
   try {
-  const result = await callAnthropic(SUMMARIZE_MODEL, agentSession ? AGENT_SUMMARIZE_SYSTEM_PROMPT : SUMMARIZE_SYSTEM_PROMPT, `Transcript excerpt (end of turn):
+  const summarizeSystem = agentSession ? AGENT_SUMMARIZE_SYSTEM_PROMPT : SUMMARIZE_SYSTEM_PROMPT;
+  const summarizePrompt = `Transcript excerpt (end of turn):
 ${transcript}
 
 Flashes that were injected this turn:
 ${recentFlashes.length > 0 ? recentFlashes.join('\n') : '[none]'}
 
-Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`, 1000);
+Analyze this turn. Return JSON with insights, train_of_thought, and flash_results.`;
+  let result = await callAnthropic(SUMMARIZE_MODEL, summarizeSystem, summarizePrompt, SUMMARIZE_MAX_TOKENS);
+
+  // A reply cut off at the output limit is not bad JSON, it is half a reply. Say
+  // so and ask once more with room to finish, rather than drop the turn at the
+  // parse below. The turns that hit the limit are the ones with the most in them.
+  if (result?.response?.stop_reason === 'max_tokens') {
+    log('summarize', 'warn', `reply truncated at the ${SUMMARIZE_MAX_TOKENS}-token limit; retrying once with ${SUMMARIZE_RETRY_MAX_TOKENS}`);
+    result = await callAnthropic(SUMMARIZE_MODEL, summarizeSystem, summarizePrompt, SUMMARIZE_RETRY_MAX_TOKENS);
+    if (!result || result.response?.stop_reason === 'max_tokens') {
+      log('summarize', 'error', result ? `reply truncated again at the ${SUMMARIZE_RETRY_MAX_TOKENS}-token limit: turn not summarized` : 'retry after a truncated reply failed: turn not summarized');
+      return;
+    }
+  }
 
   if (!result) return;
   const message = result.response;
