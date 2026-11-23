@@ -183,6 +183,39 @@ function connectionTarget(conn) {
   return typeof t === 'string' && t.trim() ? t.trim() : null;
 }
 
+// The model sometimes returns an insight with a field missing. A missing
+// parameter makes the write throw, so the insight is checked first: no name, or
+// neither a summary nor a body, and there is nothing to write; a missing summary
+// is taken from the first sentence of the body. Returns the insight to write, or
+// null (and says why in the log, without quoting the insight).
+function usableInsight(insight, log) {
+  const name = typeof insight?.name === 'string' ? insight.name.trim() : '';
+  if (!name) {
+    log('summarize', 'warn', 'insight not written: it has no name');
+    return null;
+  }
+  const body = typeof insight.body === 'string' ? insight.body : '';
+  let flash = typeof insight.flash_summary === 'string' ? insight.flash_summary.trim() : '';
+  if (!flash) {
+    flash = firstSentence(body);
+    if (!flash) {
+      log('summarize', 'warn', 'insight not written: it has neither a summary nor a body');
+      return null;
+    }
+    log('summarize', 'info', 'insight had no summary: taken from the first sentence of its body');
+  }
+  return { ...insight, name, body, flash_summary: flash };
+}
+
+// First sentence of a text, on one line, at most 100 characters.
+function firstSentence(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  const m = t.match(/^.*?[.!?](?=\s|$)/);
+  const s = m ? m[0] : t;
+  return s.length > 100 ? `${s.slice(0, 97).trimEnd()}...` : s;
+}
+
 // Output limit for the summarize call, and for the single retry after a reply
 // that was cut off at it (stop_reason max_tokens).
 const SUMMARIZE_MAX_TOKENS = 2000;
@@ -340,7 +373,12 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     if (!parsed.insights?.length) countHeld('zeroInsightTurns');
   }
   if (parsed.insights?.length) {
-    for (const insight of parsed.insights) {
+    for (const offered of parsed.insights) {
+      // One unusable insight, or one failed write, must not cost the turn its
+      // other insights: each is handled on its own.
+      try {
+      const insight = usableInsight(offered, log);
+      if (!insight) continue;
       const kind = agentSession ? durableKind(insight) : null;
       if (agentSession && !kind) {
         countHeld('droppedNoKind');
@@ -428,6 +466,9 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           log('summarize', 'info', `insight: ${insight.name}`);
           embedNeuron(insight.name, insight.flash_summary, insightNs).catch(e => log('error', 'warn', e.message));
         }
+      }
+      } catch (e) {
+        log('summarize', 'error', `insight not written: ${e.message}`);
       }
     }
   }
