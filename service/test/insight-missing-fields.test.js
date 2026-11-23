@@ -17,6 +17,7 @@ const good = (name) => ({
 function harness(insights, { failCreateFor } = {}) {
   const creates = [];
   const logs = [];
+  let dismissals = 0;
   const entry = {
     turn: Date.now(), flashes: ['kettle flash'], sourceNeurons: ['Kettle'],
     neuronDomains: { Kettle: true }, neuronDaemons: { Kettle: 'vector' }
@@ -25,6 +26,7 @@ function harness(insights, { failCreateFor } = {}) {
     req_body: { session_id: 's1' },
     session: { activeTopics: [], pendingFlashes: [entry] },
     runCypher: async (q, p) => {
+      if (/times_dismissed = n\.times_dismissed \+ 1/.test(q)) dismissals++;
       if (/CREATE \(n:Neuron \{/.test(q) && /node_type: \$type/.test(q)) {
         // The real driver rejects a parameter that is undefined.
         for (const [k, v] of Object.entries(p)) if (v === undefined) throw new Error(`Expected parameter(s): ${k}`);
@@ -49,7 +51,7 @@ function harness(insights, { failCreateFor } = {}) {
     log: (endpoint, level, message) => logs.push({ endpoint, level, message })
   };
   const at = level => logs.filter(l => l.endpoint === 'summarize' && l.level === level).map(l => l.message);
-  return { deps, entry, creates, at };
+  return { deps, entry, creates, at, dismissals: () => dismissals };
 }
 
 test('a complete insight is written as the model gave it', async () => {
@@ -101,6 +103,15 @@ test('a write that throws for one insight is logged and does not stop the others
   assert.deepEqual(h.creates.map(c => c.name), ['First', 'Third']);
   assert.equal(h.at('error').length, 1);
   assert.match(h.at('error')[0], /insight not written: write failed/);
+  // The flash outcome is written after the insights, so it used to be lost too.
+  assert.equal(h.dismissals(), 1, 'the flash outcome of the same turn is still recorded');
+});
+
+test('an insight with no summary and no body does not cost the turn its flash outcome', async () => {
+  const h = harness([{ name: 'Just a tag', node_type: 'insight' }]);
+  await handleSummarize(h.deps);
+  assert.equal(h.creates.length, 0);
+  assert.equal(h.dismissals(), 1);
 });
 
 test('an entry in the insights list that is not an object is skipped, not thrown on', async () => {
