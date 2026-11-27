@@ -101,7 +101,8 @@ export async function flagNeuronForReview({ runCypher, name, ns, note, log }) {
 /**
  * Apply a verdict straight to a neuron when no session pursuit pass will see it.
  * Mirrors Dreamer's per-neuron effects in a deliberately small form:
- * pursued => times_pursued +1, base_score +10; dismissed => times_dismissed +1;
+ * pursued => times_pursued +1, base_score +10, last_surfaced = now;
+ * dismissed => times_dismissed +1 (last_surfaced unchanged);
  * wrong additionally flags the neuron for review.
  */
 export async function applyVerdictToNeuron({ runCypher, name, ns, verdict, note, log }) {
@@ -117,11 +118,12 @@ export async function applyVerdictToNeuron({ runCypher, name, ns, verdict, note,
             n.last_surfaced = datetime()
       `, params);
   } else {
+    // last_surfaced is left alone: retrieval reads it as freshness, and a
+    // dismissal must not make a neuron rank as fresh.
     await runCypher(`
         MATCH (n:Neuron {name: $name})
         WHERE ${nsPredicate('n')} AND n.superseded IS NULL
-        SET n.times_dismissed = coalesce(n.times_dismissed, 0) + 1,
-            n.last_surfaced = datetime()
+        SET n.times_dismissed = coalesce(n.times_dismissed, 0) + 1
       `, params);
   }
   // Per-day counter for the health window (live graph only)

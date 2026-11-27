@@ -709,12 +709,13 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
               `, { name: neuronName, otherNeurons: flashEntry.sourceNeurons, ns }).catch(e => log('error', 'warn', e.message));
           }
         } else if (isInDomain) {
-          // FAIR DISMISSAL: Only penalize if neuron is from the same project
+          // FAIR DISMISSAL: Only penalize if neuron is from the same project.
+          // last_surfaced is left alone: retrieval reads it as freshness, so
+          // refreshing it here made a dismissed neuron rank as fresh.
           await runCypher(`
               MATCH (n:Neuron {name: $name})
               WHERE ${nsPredicate('n')}
-              SET n.times_dismissed = n.times_dismissed + 1,
-                  n.last_surfaced = datetime()
+              SET n.times_dismissed = n.times_dismissed + 1
             `, { name: neuronName, ns }).catch(e => log('error', 'warn', e.message));
 
           // Per-daemon dismissal counter (same-domain only — cross-project skips
