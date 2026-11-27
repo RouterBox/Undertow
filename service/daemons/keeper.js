@@ -23,6 +23,22 @@ import { lookupAgent } from '../agent-roster.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // UNDERTOW_KEEPER_LEDGER overrides the ledger file (the test run points it at a temp dir).
 export const LEDGER_PATH = process.env.UNDERTOW_KEEPER_LEDGER || join(__dirname, '..', 'keeper-ledger.json');
+// A test run with no override (e.g. a bare `node --test`, which skips
+// isolate-test-run.js) must neither read nor write the live ledger: keep it in
+// memory only. A test run is detected by NODE_TEST_CONTEXT, which Node's test
+// runner sets in every test child process, or by --test in execArgv (the
+// runner's own process, and --test-isolation=none). Production has neither.
+const IN_TEST_RUN = !!process.env.NODE_TEST_CONTEXT || process.execArgv.includes('--test');
+const LEDGER_IN_MEMORY = IN_TEST_RUN && !process.env.UNDERTOW_KEEPER_LEDGER;
+let ledgerRefusalLogged = false;
+function refuseLedgerFile() {
+  if (!LEDGER_IN_MEMORY) return false;
+  if (!ledgerRefusalLogged) {
+    ledgerRefusalLogged = true;
+    console.warn(`[keeper] test run without UNDERTOW_KEEPER_LEDGER: ledger kept in memory, ${LEDGER_PATH} not read or written`);
+  }
+  return true;
+}
 
 const VALID_TIERS = new Set(['conscious', 'observer', 'drone', 'off']);
 
@@ -133,7 +149,7 @@ function maybePromote(e, sessionId) {
 }
 
 function loadLedger() {
-  if (!existsSync(LEDGER_PATH)) return;
+  if (refuseLedgerFile() || !existsSync(LEDGER_PATH)) return;
   try {
     const raw = JSON.parse(readFileSync(LEDGER_PATH, 'utf8'));
     ledger = new Map(Object.entries(raw.sessions || {}));
@@ -143,6 +159,7 @@ function loadLedger() {
 function persist() {
   if (!dirty) return;
   dirty = false;
+  if (refuseLedgerFile()) return;
   try {
     writeFileSync(LEDGER_PATH, JSON.stringify({ saved_at: new Date().toISOString(), sessions: Object.fromEntries(ledger) }));
   } catch { /* non-fatal */ }
