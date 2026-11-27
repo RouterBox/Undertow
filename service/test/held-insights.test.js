@@ -712,7 +712,7 @@ test('what an agent session offered, dropped and had held is counted', async () 
   const d = Object.fromEntries(Object.keys(after).map(k => [k, after[k] - before[k]]));
   assert.deepEqual(d, {
     agentTurns: 2, zeroInsightTurns: 1, insightsOffered: 5, droppedNoKind: 2,
-    skippedNameTaken: 0, heldWritten: 3, heldOnUnknownTurns: 0, heldOnUnknownInsights: 0,
+    skippedNameTaken: 0, skippedEcho: 0, heldWritten: 3, heldOnUnknownTurns: 0, heldOnUnknownInsights: 0,
     heldUpdates: 0, released: 1, releaseRefused: 0
   });
 });
