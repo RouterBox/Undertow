@@ -122,16 +122,21 @@ const EXCERPT_PROMPT_MAX_CHARS = 1000;
 // Read the current turn out of a Claude Code JSONL transcript: everything since
 // the last real user prompt. Returns { prompt, reply } where reply holds one item
 // per assistant text block ({ text }) or tool call ({ tool }), injected flash
-// blocks stripped. Returns null when the text is not JSONL or holds no messages.
+// blocks stripped, and origin: the turnOrigin Claude Code stamps on the latest
+// prompt line ('human', 'scheduled', 'task_notification', ...; null when absent).
+// Returns null when the text is not JSONL or holds no messages.
 function parseTurn(raw) {
   let prompt = null;
   let reply = [];
+  let origin = null;
   for (const line of String(raw || '').split('\n')) {
     if (!line.trim()) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
     // Only real conversation lines; other envelopes can carry a message too.
     if (!entry || (entry.type !== 'user' && entry.type !== 'assistant')) continue;
+    // Read before the isMeta skip: a scheduled wakeup's prompt line is isMeta.
+    if (entry.type === 'user' && !entry.isSidechain && typeof entry.turnOrigin === 'string') origin = entry.turnOrigin;
     if (entry.isSidechain || entry.isMeta || entry.isCompactSummary) continue;
     const content = entry.message?.content;
     const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
@@ -152,7 +157,7 @@ function parseTurn(raw) {
     }
   }
   if (prompt === null && reply.length === 0) return null;
-  return { prompt, reply };
+  return { prompt, reply, origin };
 }
 
 // Build the judge's excerpt from a Claude Code JSONL transcript: the prompt, the
@@ -174,12 +179,26 @@ function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
 // lines). Tool calls and the user prompt are left out. [] when unknown.
 function assistantParagraphs(raw) {
   const turn = parseTurn(raw);
-  if (!turn) return [];
+  return turn ? paragraphsOf(turn) : [];
+}
+
+function paragraphsOf(turn) {
   return turn.reply
     .filter(r => r.text !== undefined)
     .flatMap(r => r.text.split(/\n\s*\n/))
     .map(p => p.trim())
     .filter(Boolean);
+}
+
+// The paragraphs the restatement check may use: only on a turn no person
+// started (a scheduled wakeup, a task notification). A person's turn that answers
+// by quoting a flashed memory overlaps the neuron too, and that is real use
+// (PR 49 review, 2026-11-27), so it gets [] and the check never runs. A
+// transcript with no turnOrigin also gets []: when unsure, keep the pursuit.
+function restatementParagraphs(raw) {
+  const turn = parseTurn(raw);
+  if (!turn || !turn.origin || turn.origin === 'human') return [];
+  return paragraphsOf(turn);
 }
 
 // --- Summarize handler (Stop hook) ---
@@ -301,6 +320,7 @@ async function recentlyInjected(session, runCypher, ns, log) {
 // the assistant's own text in the turn using the held-insight echo check (echoOf,
 // ECHO_THRESHOLD): a paragraph that echoes the neuron means the pursuit is a
 // restatement, and it is withheld (neutral: neither pursued nor dismissed).
+// Only on a turn no person started (restatementParagraphs).
 // Returns the best { neuron, score } match, or null.
 function restatementOf(neuron, paragraphs) {
   let best = null;
@@ -355,7 +375,7 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
     try {
       const raw = await readFile(transcript_path, 'utf8');
       transcript = buildTranscriptExcerpt(raw) ?? stripUndertowInjections(raw).slice(-2000);
-      paragraphs = assistantParagraphs(raw);
+      paragraphs = restatementParagraphs(raw);
     } catch {
       transcript = '[transcript unavailable]';
     }
@@ -1002,5 +1022,5 @@ async function summarizeForTurn(deps, keeper) {
   return { skipped: false };
 }
 
-export { connectionTarget, echoOf, ECHO_THRESHOLD, restatementOf, assistantParagraphs };
+export { connectionTarget, echoOf, ECHO_THRESHOLD, restatementOf, assistantParagraphs, restatementParagraphs };
 export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
