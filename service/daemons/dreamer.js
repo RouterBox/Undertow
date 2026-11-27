@@ -668,11 +668,15 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           // Consolidation window: only reinforce score/weights once per session per neuron
           const alreadyReinforced = session.pursuedThisSession.has(neuronName);
 
+          // +10 capped at 100, the same cap as chase (chase.js) and explicit
+          // feedback without a session (curated.js applyVerdictToNeuron).
           await runCypher(`
               MATCH (n:Neuron {name: $name})
               WHERE ${nsPredicate('n')}
               SET n.times_pursued = n.times_pursued + 1,
-                  n.base_score = CASE WHEN $reinforce THEN n.base_score + 10 ELSE n.base_score END,
+                  n.base_score = CASE WHEN NOT $reinforce THEN n.base_score
+                                      WHEN n.base_score + 10 > 100 THEN 100
+                                      ELSE n.base_score + 10 END,
                   n.last_surfaced = datetime()
             `, { name: neuronName, reinforce: !alreadyReinforced, ns }).catch(e => log('error', 'warn', e.message));
 
