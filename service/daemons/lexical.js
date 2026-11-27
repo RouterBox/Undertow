@@ -14,7 +14,7 @@ const TTL_MS = 5 * 60 * 1000;
 
 const indexes = new Map(); // nsKey -> { docs, df, avgLen, builtAt }
 
-function tokenize(text) {
+export function tokenize(text) {
   return String(text || '').toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !STOP.has(w));
 }
 

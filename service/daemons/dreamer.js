@@ -11,6 +11,7 @@ import { verdictToOutcome, flagNeuronForReview, applyVerdictToNeuron } from './c
 import { gateRun } from '../downstream-gate.js';
 import { recordPursuitDay } from '../pursuit-day.js';
 import { HELD_NAMESPACE, durableKind, nodeTypeForKind, countHeld, heldUpdateName, packConnections } from '../held.js';
+import { tokenize } from './lexical.js';
 
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are Undertow's turn summarizer. Review what happened and extract ONLY what matters for long-term memory.
@@ -216,6 +217,61 @@ function firstSentence(text) {
   return s.length > 100 ? `${s.slice(0, 97).trimEnd()}...` : s;
 }
 
+// Echo check (issue 38). A held insight is often the model restating a neuron
+// Undertow injected into the same session a minute before. Before a held write,
+// the insight is compared on content with the neurons injected into the session
+// in the last ECHO_WINDOW_MS. Lexical only, so it works when embeddings do not:
+// the share of distinct content words (lexical.js tokenize, over name + summary
+// + body) the two have in common, out of the smaller set (overlap coefficient).
+// Measured on 73 labelled held insights (2026-11-25/26 reviews): the 35 echoes
+// scored 0.375-0.72, the 25 keep/rewrite insights at most 0.188. At 0.5 only
+// 22 of 35 echoes were caught; 0.40 catches 34 with no false skip and leaves a
+// wide gap above the highest new insight. At least ECHO_MIN_SHARED words in
+// common so two short texts cannot match on a handful of words.
+const ECHO_WINDOW_MS = 10 * 60 * 1000;
+const ECHO_THRESHOLD = 0.4;
+const ECHO_MIN_SHARED = 5;
+
+function contentWords(n) {
+  return new Set(tokenize(`${n?.name || ''} ${n?.flash_summary || ''} ${n?.body || ''}`));
+}
+
+// The neuron the insight restates, with its score, or null.
+function echoOf(insight, neurons) {
+  const a = contentWords(insight);
+  let best = null;
+  for (const n of neurons) {
+    const b = contentWords(n);
+    if (!a.size || !b.size) continue;
+    let shared = 0;
+    for (const w of a) if (b.has(w)) shared++;
+    const score = shared / Math.min(a.size, b.size);
+    if (shared >= ECHO_MIN_SHARED && score >= ECHO_THRESHOLD && (!best || score > best.score)) best = { neuron: n, score };
+  }
+  return best;
+}
+
+// Neurons injected into this session in the last ECHO_WINDOW_MS, read with their
+// content. session.pendingFlashes is Impulse's record of each injection (judged
+// or not). On a failed read the check is skipped: an insight is never lost to it.
+async function recentlyInjected(session, runCypher, ns, log) {
+  const since = Date.now() - ECHO_WINDOW_MS;
+  const names = [...new Set((session.pendingFlashes || [])
+    .filter(f => f.turn >= since)
+    .flatMap(f => f.flashNeurons || f.sourceNeurons || []))];
+  if (!names.length) return [];
+  try {
+    return await runCypher(
+      `MATCH (n:Neuron) WHERE n.name IN $names AND ${livePredicate('n')}
+       RETURN n.name AS name, n.uid AS uid, n.flash_summary AS flash_summary, n.body AS body`,
+      { names, ns }
+    ) || [];
+  } catch (e) {
+    log('summarize', 'warn', `echo check skipped: injected neurons could not be read: ${e.message}`);
+    return [];
+  }
+}
+
 // Output limit for the summarize call, and for the single retry after a reply
 // that was cut off at it (stop_reason max_tokens).
 const SUMMARIZE_MAX_TOKENS = 2000;
@@ -373,6 +429,7 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     if (!parsed.insights?.length) countHeld('zeroInsightTurns');
   }
   if (parsed.insights?.length) {
+    const injected = held ? await recentlyInjected(session, runCypher, ns, log) : [];
     for (const offered of parsed.insights) {
       // One unusable insight, or one failed write, must not cost the turn its
       // other insights: each is handled on its own.
@@ -383,6 +440,15 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
       if (agentSession && !kind) {
         countHeld('droppedNoKind');
         log('summarize', 'info', 'agent session: insight not written, no durable kind', { detail: `kind: ${insight?.kind ?? 'none'}` });
+        continue;
+      }
+      // A held insight that restates a neuron just injected into this session is
+      // an echo, not new knowledge: not written. The matched (live) neuron is
+      // logged so the skip can be audited; the insight's own name is not.
+      const echo = held ? echoOf(insight, injected) : null;
+      if (echo) {
+        countHeld('skippedEcho');
+        log('summarize', 'info', `held insight skipped: echo of injected neuron ${echo.neuron.name} (${echo.neuron.uid ?? 'no uid'})`, { detail: `overlap ${echo.score.toFixed(2)}` });
         continue;
       }
       // A held insight must not take a name a live neuron has, or it could never be released.
@@ -853,5 +919,5 @@ async function summarizeForTurn(deps, keeper) {
   return { skipped: false };
 }
 
-export { connectionTarget };
+export { connectionTarget, echoOf, ECHO_THRESHOLD };
 export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };

@@ -25,6 +25,7 @@ const counters = {
   insightsOffered: 0,     // insights the model offered from agent sessions
   droppedNoKind: 0,       // offered without a durable kind: not written
   skippedNameTaken: 0,    // offered, but a live or held neuron already has the name
+  skippedEcho: 0,         // offered, but it restates a neuron injected into the same session minutes before
   heldWritten: 0,         // written into the held tier
   heldOnUnknownTurns: 0,  // ...turns held because a launcher roster did not answer (the session may be a person's)
   heldOnUnknownInsights: 0,    // ...insights of any kind held from such turns
