@@ -119,20 +119,24 @@ Only include memories that are likely relevant to the working directory or recen
 const EXCERPT_MAX_CHARS = 6000;
 const EXCERPT_PROMPT_MAX_CHARS = 1000;
 
-// Build the judge's excerpt from a Claude Code JSONL transcript: everything since
-// the last real user prompt — the prompt, the assistant's text, and one compact line
-// per tool call. The raw tail of the file is envelope lines (attachments, api-request
-// records, session metadata), so slicing it shows the judge none of the reply.
-// Returns null when the text is not JSONL or holds no messages (caller falls back).
-function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
+// Read the current turn out of a Claude Code JSONL transcript: everything since
+// the last real user prompt. Returns { prompt, reply } where reply holds one item
+// per assistant text block ({ text }) or tool call ({ tool }), injected flash
+// blocks stripped, and origin: the turnOrigin Claude Code stamps on the latest
+// prompt line ('human', 'scheduled', 'task_notification', ...; null when absent).
+// Returns null when the text is not JSONL or holds no messages.
+function parseTurn(raw) {
   let prompt = null;
   let reply = [];
+  let origin = null;
   for (const line of String(raw || '').split('\n')) {
     if (!line.trim()) continue;
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
     // Only real conversation lines; other envelopes can carry a message too.
     if (!entry || (entry.type !== 'user' && entry.type !== 'assistant')) continue;
+    // Read before the isMeta skip: a scheduled wakeup's prompt line is isMeta.
+    if (entry.type === 'user' && !entry.isSidechain && typeof entry.turnOrigin === 'string') origin = entry.turnOrigin;
     if (entry.isSidechain || entry.isMeta || entry.isCompactSummary) continue;
     const content = entry.message?.content;
     const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
@@ -145,19 +149,56 @@ function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
     for (const b of blocks) {
       if (b?.type === 'text') {
         const text = stripUndertowInjections(b.text || '').trim();
-        if (text) reply.push(`Assistant: ${text}`);
+        if (text) reply.push({ text });
       } else if (b?.type === 'tool_use') {
         const input = (JSON.stringify(b.input ?? {}) || '').replace(/\s+/g, ' ').substring(0, 120);
-        reply.push(`[tool] ${b.name}: ${input}`);
+        reply.push({ tool: `${b.name}: ${input}` });
       }
     }
   }
   if (prompt === null && reply.length === 0) return null;
-  const head = prompt === null ? '' : `User: ${prompt.substring(0, EXCERPT_PROMPT_MAX_CHARS)}\n`;
-  const body = reply.join('\n');
+  return { prompt, reply, origin };
+}
+
+// Build the judge's excerpt from a Claude Code JSONL transcript: the prompt, the
+// assistant's text, and one compact line per tool call. The raw tail of the file
+// is envelope lines (attachments, api-request records, session metadata), so
+// slicing it shows the judge none of the reply.
+// Returns null when the text is not JSONL or holds no messages (caller falls back).
+function buildTranscriptExcerpt(raw, maxChars = EXCERPT_MAX_CHARS) {
+  const turn = parseTurn(raw);
+  if (!turn) return null;
+  const head = turn.prompt === null ? '' : `User: ${turn.prompt.substring(0, EXCERPT_PROMPT_MAX_CHARS)}\n`;
+  const body = turn.reply.map(r => (r.text !== undefined ? `Assistant: ${r.text}` : `[tool] ${r.tool}`)).join('\n');
   const room = Math.max(0, maxChars - head.length);
   // When it must be cut, keep the END of the reply: that is where the answer is.
   return head + (body.length > room ? body.slice(-room) : body);
+}
+
+// The assistant's own words in the current turn, as paragraphs (split on blank
+// lines). Tool calls and the user prompt are left out. [] when unknown.
+function assistantParagraphs(raw) {
+  const turn = parseTurn(raw);
+  return turn ? paragraphsOf(turn) : [];
+}
+
+function paragraphsOf(turn) {
+  return turn.reply
+    .filter(r => r.text !== undefined)
+    .flatMap(r => r.text.split(/\n\s*\n/))
+    .map(p => p.trim())
+    .filter(Boolean);
+}
+
+// The paragraphs the restatement check may use: only on a turn no person
+// started (a scheduled wakeup, a task notification). A person's turn that answers
+// by quoting a flashed memory overlaps the neuron too, and that is real use
+// (PR 49 review, 2026-11-27), so it gets [] and the check never runs. A
+// transcript with no turnOrigin also gets []: when unsure, keep the pursuit.
+function restatementParagraphs(raw) {
+  const turn = parseTurn(raw);
+  if (!turn || !turn.origin || turn.origin === 'human') return [];
+  return paragraphsOf(turn);
 }
 
 // --- Summarize handler (Stop hook) ---
@@ -272,6 +313,48 @@ async function recentlyInjected(session, runCypher, ns, log) {
   }
 }
 
+// Restatement check (re-flash investigation, 2026-11-27). The judge counts a
+// turn that only restates an injected flash as pursuit, and pursuit rewards the
+// neuron, so a heartbeat session that repeats a flash back keeps it on top. Before
+// an inferred pursuit is applied, the neuron is compared with each paragraph of
+// the assistant's own text in the turn using the held-insight echo check (echoOf,
+// ECHO_THRESHOLD): a paragraph that echoes the neuron means the pursuit is a
+// restatement, and it is withheld (neutral: neither pursued nor dismissed).
+// Only on a turn no person started (restatementParagraphs).
+// Returns the best { neuron, score } match, or null.
+function restatementOf(neuron, paragraphs) {
+  let best = null;
+  for (const p of paragraphs) {
+    const hit = echoOf({ body: p }, [neuron]);
+    if (hit && (!best || hit.score > best.score)) best = hit;
+  }
+  return best;
+}
+
+// The neurons among `names` that the assistant's text restates: Map name ->
+// { neuron, score }. On a failed read the check is skipped (logged), so a pursuit
+// is never lost to it.
+async function restatedNeurons(names, paragraphs, runCypher, ns, log) {
+  const out = new Map();
+  if (!names.length || !paragraphs.length) return out;
+  let rows;
+  try {
+    rows = await runCypher(
+      `MATCH (n:Neuron) WHERE n.name IN $names AND ${nsPredicate('n')}
+       RETURN n.name AS name, n.uid AS uid, n.flash_summary AS flash_summary, n.body AS body`,
+      { names, ns }
+    ) || [];
+  } catch (e) {
+    log('summarize', 'warn', `restatement check skipped: pursued neurons could not be read: ${e.message}`);
+    return out;
+  }
+  for (const n of rows) {
+    const hit = restatementOf(n, paragraphs);
+    if (hit) out.set(n.name, hit);
+  }
+  return out;
+}
+
 // Output limit for the summarize call, and for the single retry after a reply
 // that was cut off at it (stop_reason max_tokens).
 const SUMMARIZE_MAX_TOKENS = 2000;
@@ -287,10 +370,12 @@ async function handleSummarize({ req_body, session, runCypher, callAnthropic, em
 
   // Read transcript if available
   let transcript = '';
+  let paragraphs = [];
   if (transcript_path) {
     try {
       const raw = await readFile(transcript_path, 'utf8');
       transcript = buildTranscriptExcerpt(raw) ?? stripUndertowInjections(raw).slice(-2000);
+      paragraphs = restatementParagraphs(raw);
     } catch {
       transcript = '[transcript unavailable]';
     }
@@ -637,7 +722,13 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     }
 
     // What was actually applied, for the per-flash log below.
-    const applied = new Map(); // entry -> Map(neuron -> 'pursued' | 'dismissed' | 'skipped')
+    // Inferred pursuits (no explicit feedback) that only restate the neuron.
+    const inferredPursued = [...new Set([...outcomes.values()].flatMap(byNeuron => [...byNeuron]
+      .filter(([n, st]) => st === 'pursued' && !verdictToOutcome(session.explicitFeedback?.[n]?.verdict))
+      .map(([n]) => n)))];
+    const restated = await restatedNeurons(inferredPursued, paragraphs, runCypher, ns, log);
+
+    const applied = new Map(); // entry -> Map(neuron -> 'pursued' | 'dismissed' | 'skipped' | 'restated')
     for (const [flashEntry, byNeuron] of outcomes) {
       applied.set(flashEntry, new Map());
 
@@ -662,6 +753,13 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
           }
         }
         const status = fbOutcome ? fbOutcome.status : inferredStatus;
+        const restatement = !fbOutcome && status === 'pursued' ? restated.get(neuronName) : null;
+        if (restatement) {
+          // Neutral: no pursuit reward, no dismissal, no counters.
+          applied.get(flashEntry).set(neuronName, 'restated');
+          log('summarize', 'info', `pursuit withheld: restatement of ${neuronName} (${restatement.neuron.uid ?? 'no uid'})`, { detail: `overlap ${restatement.score.toFixed(2)}` });
+          continue;
+        }
         applied.get(flashEntry).set(neuronName, status === 'pursued' ? 'pursued' : isInDomain ? 'dismissed' : 'skipped');
 
         if (status === 'pursued') {
@@ -748,7 +846,12 @@ Analyze this turn. Return JSON with insights, train_of_thought, and flash_result
     // Log each flash result individually so the monitor shows what happened
     for (const fr of parsed.flash_results) {
       const flashPreview = (fr.flash_text || '').substring(0, 80);
-      if (fr.status === 'pursued') {
+      const frHit = fr.status === 'pursued' ? neuronsFor(fr) : null;
+      const allRestated = frHit && frHit.neurons.length > 0
+        && frHit.neurons.every(n => applied.get(frHit.entry)?.get(n) === 'restated');
+      if (allRestated) {
+        log('summarize', 'info', `pursuit: ○ restatement "${flashPreview}"`, { detail: 'agent restated the flash: not counted as pursuit' });
+      } else if (fr.status === 'pursued') {
         log('summarize', 'info', `pursuit: ✓ "${flashPreview}"`, { detail: 'base_score +10, synapses strengthened' });
       } else {
         const hit = neuronsFor(fr);
@@ -928,5 +1031,5 @@ async function summarizeForTurn(deps, keeper) {
   return { skipped: false };
 }
 
-export { connectionTarget, echoOf, ECHO_THRESHOLD };
+export { connectionTarget, echoOf, ECHO_THRESHOLD, restatementOf, assistantParagraphs, restatementParagraphs };
 export { buildTranscriptExcerpt, summarizeForTurn, SUMMARIZE_SYSTEM_PROMPT, AGENT_SUMMARIZE_SYSTEM_PROMPT, SESSION_START_SYSTEM_PROMPT, handleSummarize, handleSessionStart, handleRehydrate };
