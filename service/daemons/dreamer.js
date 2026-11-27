@@ -856,6 +856,10 @@ Select the most relevant memories for this session.`, 400);
 // --- Rehydrate handler (PostCompact hook) ---
 
 async function handleRehydrate({ req_body, session, runCypher, log }) {
+  // Compaction took earlier flashes out of the context: Impulse may show those
+  // neurons again (it ignores injections at or before this time). pendingFlashes
+  // itself is left alone, since Dreamer may still judge entries in it.
+  session.reflashResetAt = Date.now();
   if (session.activeTopics.length === 0) {
     return { responseJson: {} };
   }

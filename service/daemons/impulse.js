@@ -123,6 +123,21 @@ function markSurfaced({ runCypher, names, ns, log }) {
     `, { names, ns }).catch(e => log('error', 'warn', e.message));
 }
 
+// Re-flash window default (config: impulse.reflashWindowHours), the same 6h as
+// Keeper's habituationHours.
+const DEFAULT_REFLASH_WINDOW_HOURS = 6;
+// pendingFlashes is also read by Dreamer: pursuit judging and the held-insight
+// echo check look back 10 minutes, so entries are always kept at least that long.
+const DREAMER_LOOKBACK_MS = 10 * 60 * 1000;
+
+// Drop pendingFlashes entries older than both the re-flash window and Dreamer's
+// lookback, so the list stops growing. Explicit feedback on a neuron whose entry
+// is gone is applied directly, as it already is for an evicted session.
+function pruneInjections(session, reflashMs) {
+  const cutoff = Date.now() - Math.max(reflashMs, DREAMER_LOOKBACK_MS);
+  session.pendingFlashes = session.pendingFlashes.filter(f => f.turn >= cutoff);
+}
+
 // --- Query handler ---
 
 async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmbedding, embeddingsAvailable, isDaemonEnabled, getDaemonConfig, wonder, prowler, log, flashMode }) {
@@ -402,7 +417,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
   // Combine and deduplicate results — wonder first (pre-warmed), then reactive daemons
   const allResults = [...wonderResults, ...keywordResults, ...lexicalResults, ...subqueryResults, ...expansionResults, ...graphResults, ...temporalResults, ...contradictionResults, ...researchResults];
   const seen = new Set();
-  const unique = allResults.filter(r => {
+  let unique = allResults.filter(r => {
     if (seen.has(r.name)) return false;
     seen.add(r.name);
     return true;
@@ -439,6 +454,33 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
 
   // Re-sort by adjusted score
   unique.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+  // Re-flash suppression: a neuron injected into this session within the window
+  // is still in the agent's context, so the hook does not inject it again.
+  // pendingFlashes is the record of what was injected; a compaction
+  // (handleRehydrate) sets reflashResetAt so earlier injections stop counting.
+  // An explicit undertow_query MCP call (via 'mcp') is answered in full.
+  const reflashMs = (impulseConfig.reflashWindowHours ?? DEFAULT_REFLASH_WINDOW_HOURS) * 3600_000;
+  pruneInjections(session, reflashMs);
+  if (req_body.via !== 'mcp' && reflashMs > 0) {
+    const since = Date.now() - reflashMs;
+    const resetAt = session.reflashResetAt || 0;
+    const shownNames = new Set();
+    const shownUids = new Set();
+    for (const f of session.pendingFlashes) {
+      if (f.turn < since || f.turn <= resetAt) continue;
+      for (const n of f.flashNeurons || f.sourceNeurons || []) shownNames.add(n);
+      for (const u of f.flashUids || []) shownUids.add(u);
+    }
+    const kept = unique.filter(r => !(r.uid && shownUids.has(r.uid)) && !shownNames.has(r.name));
+    if (kept.length < unique.length) {
+      const hours = reflashMs / 3600_000;
+      log('query', 'info', `reflash suppressed: ${unique.length - kept.length} candidate(s) already shown to session ${String(session_id || 'default').slice(0, 8)} within ${hours}h`, {
+        detail: unique.filter(r => !kept.includes(r)).map(r => r.name).join(' | ')
+      });
+      unique = kept;
+    }
+  }
 
   // Track retrieval diversity for health monitoring
   session.retrievalCounts = session.retrievalCounts || {};
@@ -489,6 +531,7 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
       turn: Date.now(),
       flashes: shown.map(r => r.flash),
       flashNeurons: shown.map(r => r.name), // flashes[i] is flashNeurons[i]'s own line
+      flashUids: shown.map(r => r.uid).filter(Boolean),
       sourceNeurons: shown.map(r => r.name),
       neuronDomains: shown.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: shown.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
@@ -560,6 +603,7 @@ Select the candidates worth surfacing (possibly none). Return JSON.`);
       turn: Date.now(),
       flashes: picks.map((p) => `${p.name}: ${p.flash}`),
       flashNeurons: picks.map((p) => p.name), // flashes[i] is flashNeurons[i]'s own line
+      flashUids: picks.map((p) => p.uid).filter(Boolean),
       sourceNeurons: picks.map((p) => p.name),
       neuronDomains: picks.reduce((acc, r) => { acc[r.name] = r.inProject !== false; return acc; }, {}),
       neuronDaemons: picks.reduce((acc, r) => { acc[r.name] = r.daemon || 'impulse'; return acc; }, {})
