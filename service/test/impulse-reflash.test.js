@@ -55,6 +55,14 @@ test('a neuron shown to a session is suppressed on the next hook query within th
   assert.equal(line[2], 'reflash suppressed: 2 candidate(s) already shown to session s1abcdef within 6h');
 });
 
+test('a haiku-mode entry (sourceNeurons only, no flashNeurons) suppresses nothing', async () => {
+  const s = newSession();
+  s.pendingFlashes.push({ turn: Date.now() - 60_000, flashes: ['free text'], sourceNeurons: ['A', 'B'], neuronDomains: {}, neuronDaemons: {} });
+  const out = await query(s, ['A', 'B']);
+  assert.deepEqual(out.shown, ['A', 'B']);
+  assert.equal(suppressedLog(out.logs), undefined, 'no suppression is logged');
+});
+
 test('when every candidate was already shown, nothing is injected', async () => {
   const s = newSession();
   await query(s, ['A']);

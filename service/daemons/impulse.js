@@ -469,7 +469,10 @@ async function handleQuery({ req_body, session, runCypher, callAnthropic, getEmb
     const shownUids = new Set();
     for (const f of session.pendingFlashes) {
       if (f.turn < since || f.turn <= resetAt) continue;
-      for (const n of f.flashNeurons || f.sourceNeurons || []) shownNames.add(n);
+      // Only entries that name the neurons actually shown (raw, curated) count.
+      // A haiku/both entry has only sourceNeurons, every candidate, so it is
+      // not proof any one was shown: under-suppressing is the safe failure.
+      for (const n of f.flashNeurons || []) shownNames.add(n);
       for (const u of f.flashUids || []) shownUids.add(u);
     }
     const kept = unique.filter(r => !(r.uid && shownUids.has(r.uid)) && !shownNames.has(r.name));
