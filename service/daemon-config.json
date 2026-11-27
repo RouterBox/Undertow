@@ -1,5 +1,9 @@
 {
   "daemons": {
+    "impulse": {
+      "enabled": true,
+      "reflashWindowHours": 6
+    },
     "spider": {
       "enabled": true,
       "schedule": "session-end",
