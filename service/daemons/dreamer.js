@@ -223,11 +223,13 @@ function firstSentence(text) {
 // in the last ECHO_WINDOW_MS. Lexical only, so it works when embeddings do not:
 // the share of distinct content words (lexical.js tokenize, over name + summary
 // + body) the two have in common, out of the smaller set (overlap coefficient).
-// A restatement scored 0.6-0.7 on worked examples, a new point on the same
-// topic about 0.3, so the bar is 0.5, with at least ECHO_MIN_SHARED words in
+// Measured on 73 labelled held insights (2026-11-25/26 reviews): the 35 echoes
+// scored 0.375-0.72, the 25 keep/rewrite insights at most 0.188. At 0.5 only
+// 22 of 35 echoes were caught; 0.40 catches 34 with no false skip and leaves a
+// wide gap above the highest new insight. At least ECHO_MIN_SHARED words in
 // common so two short texts cannot match on a handful of words.
 const ECHO_WINDOW_MS = 10 * 60 * 1000;
-const ECHO_THRESHOLD = 0.5;
+const ECHO_THRESHOLD = 0.4;
 const ECHO_MIN_SHARED = 5;
 
 function contentWords(n) {
