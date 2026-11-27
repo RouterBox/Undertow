@@ -3,7 +3,8 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LOG_DIR = join(__dirname, 'logs');
+// UNDERTOW_LOG_DIR overrides the log directory (the test run points it at a temp dir).
+const LOG_DIR = process.env.UNDERTOW_LOG_DIR || join(__dirname, 'logs');
 
 // 24-bit ANSI colors
 const CYAN = '\x1b[36m';

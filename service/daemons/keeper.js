@@ -21,7 +21,8 @@ import { dirname, join } from 'path';
 import { lookupAgent } from '../agent-roster.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const LEDGER_PATH = join(__dirname, '..', 'keeper-ledger.json');
+// UNDERTOW_KEEPER_LEDGER overrides the ledger file (the test run points it at a temp dir).
+export const LEDGER_PATH = process.env.UNDERTOW_KEEPER_LEDGER || join(__dirname, '..', 'keeper-ledger.json');
 
 const VALID_TIERS = new Set(['conscious', 'observer', 'drone', 'off']);
 

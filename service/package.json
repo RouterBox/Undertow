@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test",
+    "test": "node --import ./isolate-test-run.js --test",
     "monitor": "node flash-monitor.js",
     "spider": "curl -X POST http://localhost:3030/undertow/spider",
     "wiki-sync": "curl -X POST http://localhost:3030/undertow/wiki-sync",

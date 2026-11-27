@@ -69,7 +69,8 @@ const HOST = process.env.UNDERTOW_HOST || '127.0.0.1';
 const API_TOKEN = process.env.UNDERTOW_API_TOKEN || '';
 // Mutating MCP tools (spider, ingest, correct action=delete) are off unless explicitly enabled.
 const MCP_ALLOW_MUTATIONS = /^(1|true|yes|on)$/i.test(process.env.UNDERTOW_MCP_ALLOW_MUTATIONS || '');
-const LOG_DIR = join(__dirname, 'logs');
+// UNDERTOW_LOG_DIR overrides the log directory (the test run points it at a temp dir).
+const LOG_DIR = process.env.UNDERTOW_LOG_DIR || join(__dirname, 'logs');
 const LOG_FILE = join(LOG_DIR, `undertow-${new Date().toISOString().split('T')[0]}.log`);
 const NEO4J_URI = process.env.NEO4J_URI || 'bolt://localhost:7687';
 const NEO4J_USER = process.env.NEO4J_USER || 'neo4j';
